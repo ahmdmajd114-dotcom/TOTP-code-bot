@@ -10,6 +10,7 @@
 
 import os
 import re
+import asyncio
 import logging
 import pyotp
 from supabase import create_client, Client
@@ -20,6 +21,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# ------------------------------------------------------------------
+# توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
+# event loop جاهز بالـ Main Thread عبر asyncio.get_event_loop().
+# بايثون 3.14 ألغى هذا السلوك الضمني، فنجهز event loop يدوياً هنا
+# قبل ما تشتغل المكتبة.
+# ------------------------------------------------------------------
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -179,7 +191,36 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"Sent TOTP code to chat_id={chat_id} (account={label})")
 
 
+def start_health_server() -> None:
+    """
+    سيرفر HTTP بسيط جداً بالخلفية، وظيفته الوحيدة الرد بـ 200 OK
+    على أي طلب. هذا يخلي Render يفتح بورت (متطلب أساسي عندهم)
+    ويخلي خدمات مثل cron-job.org تكدر توصله فتبقيه صاحي (keep-alive).
+    ما إله أي علاقة بمنطق البوت نفسه.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            pass  # تجاهل لوغات HTTP الروتينية عشان ما تغرق لوغات البوت
+
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health check server running on port {port}")
+
+
 def main() -> None:
+    start_health_server()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # فقط تحديثات business_message — نستثني الرسائل العادية بالكامل
