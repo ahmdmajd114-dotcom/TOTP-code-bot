@@ -15,6 +15,7 @@ import logging
 import pyotp
 from supabase import create_client, Client
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -231,6 +232,33 @@ def generate_totp_code(secret: str) -> str:
     return totp.now()
 
 
+async def show_typing_then_wait(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    business_connection_id: str,
+    seconds: float,
+) -> None:
+    """
+    يعرض مؤشر 'يكتب...' طول فترة الانتظار قبل الرد، عشان يبين طبيعي.
+    مؤشر الكتابة بتليجرام يختفي تلقائياً بعد 5 ثواني، فنجدده كل 4
+    ثواني لحد ما تخلص فترة الانتظار كاملة.
+    """
+    elapsed = 0.0
+    interval = 4.0
+    while elapsed < seconds:
+        try:
+            await context.bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+                business_connection_id=business_connection_id,
+            )
+        except Exception:
+            logger.exception("Failed to send typing action")
+        step = min(interval, seconds - elapsed)
+        await asyncio.sleep(step)
+        elapsed += step
+
+
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> bool:
     """يعالج أوامر الأونر: /addaccount و /link. يرجع True اذا كانت الرسالة أمر تم التعامل معه."""
 
@@ -315,7 +343,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             code = generate_totp_code(secret)
             reply = f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريباً"
 
-            await asyncio.sleep(REPLY_DELAY_SECONDS)
+            await show_typing_then_wait(
+                context, chat_id, bm.business_connection_id, REPLY_DELAY_SECONDS
+            )
             await context.bot.send_message(
                 business_connection_id=bm.business_connection_id,
                 chat_id=chat_id,
@@ -331,7 +361,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     faq_matches = find_faq_matches(text)
     faq_replies = filter_recent_repeats(chat_id, faq_matches)
     if faq_replies:
-        await asyncio.sleep(REPLY_DELAY_SECONDS)
+        await show_typing_then_wait(
+            context, chat_id, bm.business_connection_id, REPLY_DELAY_SECONDS
+        )
         for reply_text in faq_replies:
             await context.bot.send_message(
                 business_connection_id=bm.business_connection_id,
