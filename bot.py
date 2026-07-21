@@ -56,6 +56,81 @@ CODE_KEYWORDS = [
     "كود", "رمز", "code", "otp",
 ]
 
+# ------------------------------------------------------------------
+# نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط
+# كل عنصر: (اسم الفئة، قائمة كلمات مفتاحية، نص الرد)
+# الترتيب هنا يحدد أولوية الفحص، وأيضاً ترتيب الرد اذا انطبقت اكثر
+# من فئة بنفس الرسالة — الفحص يصير بترتيب ظهور الكلمة داخل النص
+# نفسه، مو بترتيب هذي القائمة (شوف find_faq_matches بالأسفل).
+# ------------------------------------------------------------------
+FAQ_RULES = [
+    (
+        "سلام",
+        ["السلام عليكم", "سلام عليكم"],
+        "وعليكم السلام ورحمة الله وبركاته أهلا وسهلا",
+    ),
+    (
+        "ترحيب",
+        ["هلا", "مرحبا", "مرحبتين", "هاي"],
+        "أهلا وسهلا",
+    ),
+    (
+        "شكر",
+        ["شكرا", "شكراً", "مشكور", "تسلم", "يعطيك العافية", "الله يعطيك العافية"],
+        "أهلا وسهلا",
+    ),
+    (
+        "chatgpt",
+        ["chatgpt", "chat gpt", "جات", "چات", "جي بي تي", "شات جي بي تي", "شات"],
+        "بلي موجود هاي الباقات المتوفرة Chat GPT\n"
+        "اشتراك خاص شهرين 39\n"
+        "اشتراك شهر مشترك 8\n"
+        "شهرين مشترك 15",
+    ),
+    (
+        "طرق_الدفع",
+        ["طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع"],
+        "طرق الدفع\n"
+        "رقم زين كاش التالي\n"
+        "07818103404\n\n"
+        "ورقم السوبر كي الرقم التالي\n"
+        "917390524895\n"
+        "باسم احمد عبد الماجد",
+    ),
+    (
+        "دفع_رصيد",
+        ["رصيد", "كارت الرصيد", "كارت رصيد"],
+        "تمام لا بأس رصيد اثير (زين)",
+    ),
+    (
+        "anki",
+        ["انكي", "anki"],
+        "متوفر تنزيل تطبيق بواسطة حساب اب ستور سعره 5 يبقى موجود دائمي (الا اذا حذفته)",
+    ),
+    (
+        "freenote",
+        ["فرينوت", "freenote", "free note"],
+        "متوفر سعره 5 حساب مُفعل المدة سنة",
+    ),
+    (
+        "goodnote",
+        ["گودنوت", "كودنوت", "كود نوت", "goodnote", "good note"],
+        "بلي موجود سعره 5 مدة سنة حساب تسجلوا يمكم",
+    ),
+    (
+        "canva",
+        ["كانفا", "canva"],
+        "نعم متوفر اشتراك سنة سعره 25 الف",
+    ),
+    (
+        "تليجرام_مميز",
+        ["تلي مميز", "تليجرام مميز", "تليكرام مميز"],
+        "متوفر تلث اشهر ب 25 وسنة ب55 الف",
+    ),
+]
+
+REPLY_DELAY_SECONDS = 8
+
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
 
@@ -64,6 +139,28 @@ def is_code_request(text: str) -> bool:
     """يتحقق اذا الرسالة تحتوي كلمة مفتاحية لطلب كود."""
     normalized = text.strip().lower()
     return any(keyword in normalized for keyword in CODE_KEYWORDS)
+
+
+def find_faq_matches(text: str) -> list[str]:
+    """
+    يفحص النص عن كل الفئات المطابقة، ويرجع الردود بترتيب ظهور
+    الكلمة المفتاحية داخل الرسالة نفسها (مو بترتيب القائمة).
+    كل فئة تنطبق مرة وحدة بس حتى لو تكررت كلماتها بالرسالة.
+    """
+    normalized = text.strip().lower()
+    matches = []  # (موقع الظهور بالنص، اسم الفئة، الرد)
+
+    for category, keywords, reply in FAQ_RULES:
+        best_position = None
+        for kw in keywords:
+            pos = normalized.find(kw.lower())
+            if pos != -1 and (best_position is None or pos < best_position):
+                best_position = pos
+        if best_position is not None:
+            matches.append((best_position, category, reply))
+
+    matches.sort(key=lambda m: m[0])
+    return [reply for _, _, reply in matches]
 
 
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
@@ -171,24 +268,37 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # اذا مو أمر، خلها تمر عادي (مثلاً حجي عادي وياك نفسك ما نتدخل فيه)
         return
 
-    # 2) اذا الرسالة من الزبون — تحقق اذا يطلب كود
+    # 2) اذا الرسالة من الزبون — تحقق اذا يطلب كود (حصري للمرتبطين بـ /link)
     if is_code_request(text):
         result = get_secret_for_chat(chat_id)
-        if result is None:
-            # ما عنده حساب مربوط — ما نرد بشي (أو ممكن نرد رسالة عامة لو تريد)
-            logger.info(f"Code requested by unlinked chat_id={chat_id}")
+        if result is not None:
+            secret, label = result
+            code = generate_totp_code(secret)
+            reply = f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريباً"
+
+            await asyncio.sleep(REPLY_DELAY_SECONDS)
+            await context.bot.send_message(
+                business_connection_id=bm.business_connection_id,
+                chat_id=chat_id,
+                text=reply,
+            )
+            logger.info(f"Sent TOTP code to chat_id={chat_id} (account={label})")
             return
+        else:
+            # ما عنده حساب مربوط — ما نرد بكود، نكمل نفحص FAQ تحسباً
+            logger.info(f"Code requested by unlinked chat_id={chat_id}")
 
-        secret, label = result
-        code = generate_totp_code(secret)
-        reply = f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريباً"
-
-        await context.bot.send_message(
-            business_connection_id=bm.business_connection_id,
-            chat_id=chat_id,
-            text=reply,
-        )
-        logger.info(f"Sent TOTP code to chat_id={chat_id} (account={label})")
+    # 3) الردود التلقائية (FAQ) — مفتوحة لأي زبون، بدون شرط ربط
+    faq_replies = find_faq_matches(text)
+    if faq_replies:
+        await asyncio.sleep(REPLY_DELAY_SECONDS)
+        for reply_text in faq_replies:
+            await context.bot.send_message(
+                business_connection_id=bm.business_connection_id,
+                chat_id=chat_id,
+                text=reply_text,
+            )
+        logger.info(f"Sent {len(faq_replies)} FAQ reply(ies) to chat_id={chat_id}")
 
 
 def start_health_server() -> None:
