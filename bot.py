@@ -130,6 +130,7 @@ FAQ_RULES = [
 ]
 
 REPLY_DELAY_SECONDS = 8
+REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة — نفس الفئة ما تتكرر لنفس الزبون خلالها
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
@@ -141,10 +142,10 @@ def is_code_request(text: str) -> bool:
     return any(keyword in normalized for keyword in CODE_KEYWORDS)
 
 
-def find_faq_matches(text: str) -> list[str]:
+def find_faq_matches(text: str) -> list[tuple[str, str]]:
     """
-    يفحص النص عن كل الفئات المطابقة، ويرجع الردود بترتيب ظهور
-    الكلمة المفتاحية داخل الرسالة نفسها (مو بترتيب القائمة).
+    يفحص النص عن كل الفئات المطابقة، ويرجع (اسم الفئة، الرد) بترتيب
+    ظهور الكلمة المفتاحية داخل الرسالة نفسها (مو بترتيب القائمة).
     كل فئة تنطبق مرة وحدة بس حتى لو تكررت كلماتها بالرسالة.
     """
     normalized = text.strip().lower()
@@ -160,7 +161,45 @@ def find_faq_matches(text: str) -> list[str]:
             matches.append((best_position, category, reply))
 
     matches.sort(key=lambda m: m[0])
-    return [reply for _, _, reply in matches]
+    return [(category, reply) for _, category, reply in matches]
+
+
+def filter_recent_repeats(chat_id: int, matches: list[tuple[str, str]]) -> list[str]:
+    """
+    يشيل من قائمة الردود أي فئة تم الرد عليها لنفس الزبون خلال آخر ساعة
+    (محفوظ بقاعدة Supabase، يضل ثابت حتى لو انعاد تشغيل البوت)،
+    ويحدّث توقيت الفئات الجديدة اللي راح نرد عليها الحين.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=REPEAT_COOLDOWN_SECONDS)
+    replies_to_send = []
+
+    for category, reply in matches:
+        existing = (
+            supabase.table("faq_reply_log")
+            .select("last_sent_at")
+            .eq("chat_id", chat_id)
+            .eq("category", category)
+            .execute()
+        )
+
+        should_send = True
+        if existing.data:
+            last_sent_at = datetime.fromisoformat(existing.data[0]["last_sent_at"])
+            if last_sent_at > cutoff:
+                should_send = False
+
+        if not should_send:
+            continue  # اترك هذي الفئة، رد عليها قريباً
+
+        replies_to_send.append(reply)
+        supabase.table("faq_reply_log").upsert(
+            {"chat_id": chat_id, "category": category, "last_sent_at": now.isoformat()}
+        ).execute()
+
+    return replies_to_send
 
 
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
@@ -289,7 +328,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.info(f"Code requested by unlinked chat_id={chat_id}")
 
     # 3) الردود التلقائية (FAQ) — مفتوحة لأي زبون، بدون شرط ربط
-    faq_replies = find_faq_matches(text)
+    faq_matches = find_faq_matches(text)
+    faq_replies = filter_recent_repeats(chat_id, faq_matches)
     if faq_replies:
         await asyncio.sleep(REPLY_DELAY_SECONDS)
         for reply_text in faq_replies:
