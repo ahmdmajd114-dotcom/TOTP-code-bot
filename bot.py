@@ -130,7 +130,9 @@ FAQ_RULES = [
     ),
 ]
 
-REPLY_DELAY_SECONDS = 8
+SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
+PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
+TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
 REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة — نفس الفئة ما تتكرر لنفس الزبون خلالها
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
@@ -232,16 +234,15 @@ def generate_totp_code(secret: str) -> str:
     return totp.now()
 
 
-async def show_typing_then_wait(
+async def _show_typing(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     business_connection_id: str,
     seconds: float,
 ) -> None:
     """
-    يعرض مؤشر 'يكتب...' طول فترة الانتظار قبل الرد، عشان يبين طبيعي.
-    مؤشر الكتابة بتليجرام يختفي تلقائياً بعد 5 ثواني، فنجدده كل 4
-    ثواني لحد ما تخلص فترة الانتظار كاملة.
+    يعرض مؤشر 'يكتب...' طول المدة المحددة. مؤشر الكتابة بتليجرام
+    يختفي تلقائياً بعد 5 ثواني، فنجدده كل 4 ثواني لحد ما تخلص المدة.
     """
     elapsed = 0.0
     interval = 4.0
@@ -257,6 +258,41 @@ async def show_typing_then_wait(
         step = min(interval, seconds - elapsed)
         await asyncio.sleep(step)
         elapsed += step
+
+
+async def human_like_reply_sequence(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    business_connection_id: str,
+    message_id: int,
+) -> None:
+    """
+    يحاكي تسلسل رد إنسان حقيقي، بالترتيب الزمني التالي:
+    1) 5 ثواني: البوت "ما يشوف" الرسالة بعد (ما يسوي شي)
+    2) بعد الـ5 ثواني: تنعلّم الرسالة كمقروءة (✓✓ زرقاء تظهر عند الزبون)
+    3) 3 ثواني: صمت بعد علامة الصح، قبل ما يبدأ الكتابة
+    4) 6 ثواني: يظهر مؤشر 'يكتب...'
+    بعدها الكود المستدعي يرسل الرد الفعلي.
+    المجموع: 5 + 3 + 6 = 14 ثانية قبل وصول الرد.
+    """
+    # 1) فترة قبل الرؤية
+    await asyncio.sleep(SEEN_DELAY_SECONDS)
+
+    # 2) علّم الرسالة كمقروءة
+    try:
+        await context.bot.read_business_message(
+            business_connection_id=business_connection_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except Exception:
+        logger.exception("Failed to mark business message as read")
+
+    # 3) صمت قبل الكتابة
+    await asyncio.sleep(PRE_TYPING_PAUSE_SECONDS)
+
+    # 4) مؤشر الكتابة
+    await _show_typing(context, chat_id, business_connection_id, TYPING_DURATION_SECONDS)
 
 
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> bool:
@@ -335,17 +371,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # اذا مو أمر، خلها تمر عادي (مثلاً حجي عادي وياك نفسك ما نتدخل فيه)
         return
 
-    # علّم رسالة الزبون كمقروءة فوراً (✓✓ زرقاء) — قبل أي تأخير أو رد،
-    # عشان يحس إنها انشافت مباشرة زي لو انت شخصياً فتحت المحادثة
-    try:
-        await context.bot.read_business_message(
-            business_connection_id=bm.business_connection_id,
-            chat_id=chat_id,
-            message_id=bm.message_id,
-        )
-    except Exception:
-        logger.exception("Failed to mark business message as read")
-
     # 2) اذا الرسالة من الزبون — تحقق اذا يطلب كود (حصري للمرتبطين بـ /link)
     if is_code_request(text):
         result = get_secret_for_chat(chat_id)
@@ -354,8 +379,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             code = generate_totp_code(secret)
             reply = f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريباً"
 
-            await show_typing_then_wait(
-                context, chat_id, bm.business_connection_id, REPLY_DELAY_SECONDS
+            await human_like_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
             )
             await context.bot.send_message(
                 business_connection_id=bm.business_connection_id,
@@ -372,8 +397,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     faq_matches = find_faq_matches(text)
     faq_replies = filter_recent_repeats(chat_id, faq_matches)
     if faq_replies:
-        await show_typing_then_wait(
-            context, chat_id, bm.business_connection_id, REPLY_DELAY_SECONDS
+        await human_like_reply_sequence(
+            context, chat_id, bm.business_connection_id, bm.message_id
         )
         for reply_text in faq_replies:
             await context.bot.send_message(
