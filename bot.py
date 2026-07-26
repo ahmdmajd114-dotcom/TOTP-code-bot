@@ -130,9 +130,9 @@ FAQ_RULES = [
     ),
 ]
 
-SEEN_DELAY_SECONDS = 4       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
+SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
 PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
-TYPING_DURATION_SECONDS = 4   # مدة ظهور "يكتب..." قبل إرسال الرد
+TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
 REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة — نفس الفئة ما تتكرر لنفس الزبون خلالها
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
@@ -351,6 +351,32 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
     return False
 
 
+async def notify_owner(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    customer_name: str,
+    customer_username: str | None,
+    customer_message: str,
+    bot_reply: str,
+) -> None:
+    """
+    يرسل تنبيه حقيقي (بإشعار عادي) للأونر يوضح اسم الزبون، chat_id،
+    شنو كتب، وشنو رد البوت — لأن ردود البوت نفسها ما توصل إشعار
+    (لأنها تنرسل بحساب الأونر نفسه عبر business_connection_id).
+    """
+    username_part = f" (@{customer_username})" if customer_username else ""
+    notification = (
+        f"📨 رسالة من: {customer_name}{username_part}\n"
+        f"chat_id: {chat_id}\n\n"
+        f"💬 كتب:\n{customer_message}\n\n"
+        f"🤖 رد البوت:\n{bot_reply}"
+    )
+    try:
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text=notification)
+    except Exception:
+        logger.exception("Failed to notify owner")
+
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل الرسائل الجاية عن طريق Telegram Business (محادثتك الشخصية)."""
     bm = update.business_message
@@ -360,6 +386,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = bm.chat.id
     text = bm.text
     sender_id = bm.from_user.id if bm.from_user else None
+
+    # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
+    customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
+    customer_username = bm.chat.username
 
     is_from_owner = sender_id == OWNER_USER_ID
 
@@ -388,6 +418,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text=reply,
             )
             logger.info(f"Sent TOTP code to chat_id={chat_id} (account={label})")
+            await notify_owner(context, chat_id, customer_name, customer_username, text, reply)
             return
         else:
             # ما عنده حساب مربوط — ما نرد بكود، نكمل نفحص FAQ تحسباً
@@ -407,6 +438,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text=reply_text,
             )
         logger.info(f"Sent {len(faq_replies)} FAQ reply(ies) to chat_id={chat_id}")
+        combined_reply = "\n---\n".join(faq_replies)
+        await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
 
 
 def start_health_server() -> None:
