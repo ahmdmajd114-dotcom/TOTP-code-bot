@@ -130,9 +130,9 @@ FAQ_RULES = [
     ),
 ]
 
-SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
+SEEN_DELAY_SECONDS = 4       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
 PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
-TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
+TYPING_DURATION_SECONDS = 4   # مدة ظهور "يكتب..." قبل إرسال الرد
 REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة — نفس الفئة ما تتكرر لنفس الزبون خلالها
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
