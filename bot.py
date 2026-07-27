@@ -2,7 +2,7 @@
 بوت خدمة الزبائن (TOTP + ردود FAQ) — يرد على رسائل حسابك الشخصي
 (Telegram Business) تلقائياً، باستخدام ذكاء اصطناعي (Groq) لفهم قصد
 الزبون الحقيقي من رسالته، بدل مطابقة كلمات مفتاحية بسيطة.
- 
+
 الفكرة:
 - كل رسالة زبون تُبعث لـ Groq عشان يحدد القصد (تحية، سؤال شراء، طلب كود...)
 - الرد المُرسل يكون دائماً من نص جاهز مسبقاً (FAQ_RULES) — الذكاء الاصطناعي
@@ -12,7 +12,7 @@
 - أنت (owner) تضيف حساب جديد بأمر /addaccount
 - أنت تربط زبون معين بحساب معين بأمر /link داخل محادثته
 """
- 
+
 import os
 import re
 import json
@@ -29,7 +29,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
- 
+
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
 # event loop جاهز بالـ Main Thread عبر asyncio.get_event_loop().
@@ -40,13 +40,13 @@ try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
- 
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
- 
+
 # ------------------------------------------------------------------
 # إعدادات (من Environment Variables)
 # ------------------------------------------------------------------
@@ -56,9 +56,9 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
- 
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
- 
+
 # ------------------------------------------------------------------
 # نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط
 # كل عنصر: (اسم الفئة، قائمة كلمات مفتاحية للتوضيح فقط، نص الرد)
@@ -131,20 +131,20 @@ FAQ_RULES = [
         "متوفر تلث اشهر ب 25 وسنة ب55 الف",
     ),
 ]
- 
+
 SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
 PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
 TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
- 
+
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
- 
+
 # كل الفئات الممكنة اللي الذكاء الاصطناعي يختار منها — تُبنى تلقائياً
 # من أسماء الفئات بـ FAQ_RULES، بالإضافة لفئتين خاصتين:
 # "طلب_كود" (الزبون يطلب الكود فعلاً الحين) و "لا_شي" (ما فيه قصد واضح).
 FAQ_CATEGORY_NAMES = [category for category, _, _ in FAQ_RULES]
 ALL_CATEGORIES = FAQ_CATEGORY_NAMES + ["طلب_كود", "لا_شي"]
- 
+
 CLASSIFIER_SYSTEM_PROMPT = (
     "أنت مصنف نية (intent classifier) لبوت رد تلقائي على تيليجرام بمتجر عراقي "
     "يبيع اشتراكات واشياء رقمية. تجيك رسالة زبون بالعربي (لهجة عراقية) أو الإنكليزي، "
@@ -183,12 +183,13 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "رسالة: 'اريد جات' أو 'اريد چات' → chatgpt (طلب شراء/استفسار فوري)\n"
     "رسالة: 'عندي مشكلة، جي بي تي زين' → لا_شي (يذكر ChatGPT بسياق شكوى، مو طلب شراء)\n\n"
     "اذا الرسالة فيها اكثر من قصد واحد حقيقي وحالي بنفس الوقت (مثلا تحية + "
-    "سؤال شراء)، ارجع الفئتين مفصولتين بفاصلة، بترتيب ظهورهن بالرسالة. "
+    "سؤال شراء)، ارجع الفئتين مفصولتين بفاصلة إنكليزية عادية \",\" فقط "
+    "(وليس الفاصلة العربية \"،\")، بترتيب ظهورهن بالرسالة. "
     "رجاءا استخدم فقط أسماء الفئات المذكورة اعلاه بالضبط كما هي، بدون أي "
     "كلام او علامات ترقيم اضافية."
 )
- 
- 
+
+
 async def classify_intent(text: str) -> list[str]:
     """
     يبعث نص الزبون لـ Groq (نموذج مجاني وسريع) عشان يحدد القصد،
@@ -220,25 +221,30 @@ async def classify_intent(text: str) -> list[str]:
     except Exception:
         logger.exception("Groq classification failed")
         return ["لا_شي"]
- 
-    candidates = [c.strip() for c in raw.split(",")]
+
+    # Groq أحياناً يرجع الفئات مفصولة بفاصلة عربية "،" بدل الفاصلة
+    # الإنكليزية العادية "," — نطبّع النص أول (نحول الفاصلة العربية
+    # لإنكليزية) قبل التقسيم، حتى ما تنكسر عملية الفصل.
+    normalized_raw = raw.replace("،", ",")
+    candidates = [c.strip().strip(".") for c in normalized_raw.split(",")]
+    candidates = [c for c in candidates if c]  # شيل أي عنصر فاضي
     valid = [c for c in candidates if c in ALL_CATEGORIES]
- 
+
     if not valid:
         logger.warning(f"Groq returned unrecognized category: {raw!r}")
         return ["لا_شي"]
- 
+
     return valid
- 
- 
+
+
 def get_reply_for_category(category: str) -> str | None:
     """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/لا_شي)."""
     for cat_name, _, reply in FAQ_RULES:
         if cat_name == category:
             return reply
     return None
- 
- 
+
+
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
     """يرجع (secret, label) للحساب المربوط بهذا الزبون، أو None اذا مو مربوط."""
     link_res = (
@@ -249,7 +255,7 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
     )
     if not link_res.data:
         return None
- 
+
     account_id = link_res.data[0]["account_id"]
     acc_res = (
         supabase.table("totp_accounts")
@@ -259,15 +265,15 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
     )
     if not acc_res.data:
         return None
- 
+
     return acc_res.data[0]["secret"], acc_res.data[0].get("label") or ""
- 
- 
+
+
 def generate_totp_code(secret: str) -> str:
     totp = pyotp.TOTP(secret)
     return totp.now()
- 
- 
+
+
 async def _show_typing(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -292,8 +298,8 @@ async def _show_typing(
         step = min(interval, seconds - elapsed)
         await asyncio.sleep(step)
         elapsed += step
- 
- 
+
+
 async def human_like_reply_sequence(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -311,7 +317,7 @@ async def human_like_reply_sequence(
     """
     # 1) فترة قبل الرؤية
     await asyncio.sleep(SEEN_DELAY_SECONDS)
- 
+
     # 2) علّم الرسالة كمقروءة
     try:
         await context.bot.read_business_message(
@@ -321,17 +327,17 @@ async def human_like_reply_sequence(
         )
     except Exception:
         logger.exception("Failed to mark business message as read")
- 
+
     # 3) صمت قبل الكتابة
     await asyncio.sleep(PRE_TYPING_PAUSE_SECONDS)
- 
+
     # 4) مؤشر الكتابة
     await _show_typing(context, chat_id, business_connection_id, TYPING_DURATION_SECONDS)
- 
- 
+
+
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> bool:
     """يعالج أوامر الأونر: /addaccount و /link. يرجع True اذا كانت الرسالة أمر تم التعامل معه."""
- 
+
     # /addaccount <link_code> <secret> [label]
     add_match = ADD_PATTERN.match(text.strip())
     if add_match:
@@ -351,7 +357,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 text=f"⚠️ فشلت الاضافة — تأكد ان رمز الربط '{link_code}' غير مستخدم سابقاً.\n{e}",
             )
         return True
- 
+
     # /link <link_code>  (يُرسل داخل محادثة الزبون نفسه)
     link_match = LINK_PATTERN.match(text.strip())
     if link_match:
@@ -368,23 +374,23 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 text=f"⚠️ ما لكيت حساب برمز الربط '{link_code}'. تأكد أضفته بـ /addaccount أول.",
             )
             return True
- 
+
         account_id = acc_res.data[0]["id"]
         label = acc_res.data[0].get("label") or ""
- 
+
         supabase.table("totp_links").upsert(
             {"chat_id": chat_id, "account_id": account_id}
         ).execute()
- 
+
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
             text=f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).",
         )
         return True
- 
+
     return False
- 
- 
+
+
 async def notify_owner(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -409,24 +415,24 @@ async def notify_owner(
         await context.bot.send_message(chat_id=OWNER_USER_ID, text=notification)
     except Exception:
         logger.exception("Failed to notify owner")
- 
- 
+
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل الرسائل الجاية عن طريق Telegram Business (محادثتك الشخصية)."""
     bm = update.business_message
     if not bm or not bm.text:
         return
- 
+
     chat_id = bm.chat.id
     text = bm.text
     sender_id = bm.from_user.id if bm.from_user else None
- 
+
     # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
- 
+
     is_from_owner = sender_id == OWNER_USER_ID
- 
+
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة
     if is_from_owner:
         handled = await handle_owner_command(update, context, chat_id, text)
@@ -434,17 +440,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         # اذا مو أمر، خلها تمر عادي (مثلاً حجي عادي وياك نفسك ما نتدخل فيه)
         return
- 
+
     # 2) نبعث الرسالة للذكاء الاصطناعي (Groq) عشان يحدد القصد الحقيقي
     categories = await classify_intent(text)
     logger.info(f"Intent classification for chat_id={chat_id}: {categories}")
- 
+
     replies_to_send: list[str] = []
- 
+
     for category in categories:
         if category == "لا_شي":
             continue
- 
+
         if category == "طلب_كود":
             # طلب كود فعلي — الشرط الأساسي يضل الربط المسبق بـ /link
             result = get_secret_for_chat(chat_id)
@@ -456,15 +462,15 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 logger.info(f"Code requested by unlinked chat_id={chat_id} — ignored")
             continue
- 
+
         # فئة FAQ عادية — نرسل نصها الجاهز فقط (الذكاء الاصطناعي لا يكتب رد حر)
         reply_text = get_reply_for_category(category)
         if reply_text:
             replies_to_send.append(reply_text)
- 
+
     if not replies_to_send:
         return
- 
+
     await human_like_reply_sequence(
         context, chat_id, bm.business_connection_id, bm.message_id
     )
@@ -477,8 +483,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info(f"Sent {len(replies_to_send)} reply(ies) to chat_id={chat_id}")
     combined_reply = "\n---\n".join(replies_to_send)
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
- 
- 
+
+
 def start_health_server() -> None:
     """
     سيرفر HTTP بسيط جداً بالخلفية، وظيفته الوحيدة الرد بـ 200 OK
@@ -488,37 +494,36 @@ def start_health_server() -> None:
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import threading
- 
+
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
- 
+
         def log_message(self, format, *args):
             pass  # تجاهل لوغات HTTP الروتينية عشان ما تغرق لوغات البوت
- 
+
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info(f"Health check server running on port {port}")
- 
- 
+
+
 def main() -> None:
     start_health_server()
- 
+
     app = Application.builder().token(BOT_TOKEN).build()
- 
+
     # فقط تحديثات business_message — نستثني الرسائل العادية بالكامل
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
- 
+
     app.run_polling(
         allowed_updates=["business_message", "business_connection", "edited_business_message"]
     )
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
