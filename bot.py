@@ -1,21 +1,23 @@
 """
 بوت خدمة الزبائن (TOTP + ردود FAQ) — يرد على رسائل حسابك الشخصي
-(Telegram Business) تلقائياً، باستخدام ذكاء اصطناعي (Groq) لفهم قصد
-الزبون الحقيقي من رسالته، بدل مطابقة كلمات مفتاحية بسيطة.
+(Telegram Business) تلقائياً.
 
 الفكرة:
-- كل رسالة زبون تُبعث لـ Groq عشان يحدد القصد (تحية، سؤال شراء، طلب كود...)
-- الرد المُرسل يكون دائماً من نص جاهز مسبقاً (FAQ_RULES) — الذكاء الاصطناعي
-  يصنّف فقط، ولا يكتب رد حر بنفسه.
-- طلب الكود (TOTP) يبقى حصري للزبائن المربوطين مسبقاً بأمر /link من الأونر،
-  حتى لو الذكاء الاصطناعي تأكد انه طلب فعلي.
+- الأساس مطابقة كلمات مفتاحية مباشرة (سريع وموثوق، بدون ذكاء اصطناعي)
+  لكل الفئات: سلام، ترحيب، شكر، طرق الدفع، وكل المنتجات.
+- الذكاء الاصطناعي (Groq) يتفعل بس بحالة وحدة: لما الرسالة فيها ذكر
+  chatgpt + كلمة شكوى بنفس الوقت، عشان يميز هل هذا طلب شراء فعلي أو
+  شكوى بمشكلة باشتراك موجود اصلا. لو شكوى، البوت يسكت وينبه الأونر.
+- منع تكرار نفس رد الـ FAQ لنفس الزبون خلال ساعة (ما عدا الكود).
+- طلب الكود (TOTP) حصري للزبائن المربوطين مسبقاً بأمر /link من الأونر،
+  وله نظام عداد محاولات منفصل (ريستارت بعد 3، توقف بعد 5).
 - أنت (owner) تضيف حساب جديد بأمر /addaccount
 - أنت تربط زبون معين بحساب معين بأمر /link داخل محادثته
+- أنت تصفر عداد محاولات الكود بأمر /resetcode داخل محادثة الزبون
 """
 
 import os
 import re
-import json
 import asyncio
 import logging
 import pyotp
@@ -61,46 +63,73 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ------------------------------------------------------------------
-# ذاكرة مؤقتة (بذاكرة البرنامج، تنمحي عند اعادة تشغيل البوت) —
-# تحفظ آخر رسالة توصل من كل زبون، عشان نقدر نمررها كسياق لـ Groq
-# وقت تصنيف رسائل متابعة قصيرة وغامضة مثل "كم سعره؟" أو "متوفر؟"
-# اللي ما تحدد المنتج المقصود الا بالرجوع للرسالة اللي قبلها.
+# منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
+# القديم. مخزن بذاكرة البرنامج (ينمحي عند اعادة تشغيل البوت، وهذا
+# مقبول). المفتاح: (chat_id, category) → آخر وقت انبعث فيه هذا الرد.
 # ------------------------------------------------------------------
-LAST_MESSAGE_CACHE: dict[int, str] = {}
-LAST_MESSAGE_CACHE_MAX_SIZE = 2000  # حد أعلى بسيط لمنع تضخم الذاكرة
+FAQ_REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة
+_faq_reply_log: dict[tuple[int, str], datetime] = {}
 
-# آخر وقت أبلغنا فيه الأونر إن Groq غير متوفر — نستخدمه لمنع إزعاجه
-# برسالة مكررة كل رسالة زبون توصل أثناء فترة انقطاع Groq الواحدة
-_LAST_AI_FAILURE_NOTIFICATION: datetime | None = None
-AI_FAILURE_NOTIFICATION_COOLDOWN_MINUTES = 60
+
+def should_send_faq_reply(chat_id: int, category: str) -> bool:
+    """
+    يتحقق هل نرسل رد هذي الفئة لهذا الزبون الحين، أو انتظرناها خلال
+    آخر ساعة (ونتجاهلها منعا للتكرار). يحدّث الطابع الزمني لو رح نرسل.
+    """
+    key = (chat_id, category)
+    now = datetime.now(timezone.utc)
+    last_sent = _faq_reply_log.get(key)
+
+    if last_sent is not None and (now - last_sent) < timedelta(seconds=FAQ_REPEAT_COOLDOWN_SECONDS):
+        return False
+
+    _faq_reply_log[key] = now
+    return True
+
 
 # ------------------------------------------------------------------
-# نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط
-# كل عنصر: (اسم الفئة، قائمة كلمات مفتاحية، نص الرد)
-# القصد الأساسي يتحدد عن طريق تصنيف الذكاء الاصطناعي (classify_intent).
-# الكلمات المفتاحية هنا تستخدم بطريقتين: (1) لاختيار نص الرد الجاهز بعد
-# ما الذكاء الاصطناعي يحدد الفئة، (2) كـ احتياط (fallback) للمطابقة
-# المباشرة اذا فشل الاتصال بـ Groq بالكامل (بدل ما البوت يسكت تماماً).
+# نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط. الأساس هو
+# مطابقة الكلمات المفتاحية مباشرة (بدون ذكاء اصطناعي) — نفس الأسلوب
+# الموثوق اللي كان يشتغل بالنظام القديم. كل عنصر: (اسم الفئة، قائمة
+# كلمات مفتاحية واسعة، نص الرد). الكلمات المفتاحية كثيرة عمداً لتغطية
+# أكبر قدر من الصياغات واللهجات والأخطاء الإملائية الشائعة.
 # ------------------------------------------------------------------
 FAQ_RULES = [
     (
         "سلام",
-        ["السلام عليكم", "سلام عليكم"],
-        "وعليكم السلام ورحمة الله وبركاته أهلا وسهلا",
+        [
+            "السلام عليكم", "سلام عليكم", "سلامو عليكم", "سلامة عليكم",
+            "السلام عليكم ورحمة الله", "assalamu alaikum", "salam alaikum",
+        ],
+        "وعليكم السلام ورحمة الله وبركاته اهلا وسهلا",
     ),
     (
         "ترحيب",
-        ["هلا", "مرحبا", "مرحبتين", "هاي"],
-        "أهلا وسهلا",
+        [
+            "هلا", "مرحبا", "مرحبتين", "هاي", "هلو", "hi", "hello", "hey",
+            "هلابيك", "هلا بيك", "صباح الخير", "مساء الخير", "شلونك",
+            "شلونكم", "اهلين", "مرحب",
+        ],
+        "اهلا وسهلا",
     ),
     (
         "شكر",
-        ["شكرا", "شكراً", "مشكور", "تسلم", "يعطيك العافية", "الله يعطيك العافية"],
-        "أهلا وسهلا",
+        [
+            "شكرا", "شكراً", "شكرا جزيلا", "شكرا جزيلاً", "مشكور", "مشكورين",
+            "تسلم", "تسلمين", "يعطيك العافية", "الله يعطيك العافية",
+            "عاشت ايدك", "عاشت ايدج", "ما قصرت", "ما قصرتوا", "يسلمو",
+            "يسلمولي", "الله يخليك", "الله يخليج", "تسلملي", "مشكوره",
+            "ثانكيو", "thanks", "thank you", "thx",
+        ],
+        "اهلا وسهلا",
     ),
     (
         "chatgpt",
-        ["chatgpt", "chat gpt", "جات", "چات", "جي بي تي", "شات جي بي تي", "شات"],
+        [
+            "chatgpt", "chat gpt", "جات", "چات", "جي بي تي", "شات جي بي تي",
+            "شات", "چات جي بي تي", "شات جيبيتي", "جيبيتي", "gpt",
+            "open ai", "openai", "اوبن اي اي", "چاتجيبيتي", "جاتي",
+        ],
         "بلي موجود هاي الباقات المتوفرة Chat GPT\n"
         "اشتراك خاص شهرين 39\n"
         "اشتراك شهر مشترك 8\n"
@@ -108,7 +137,11 @@ FAQ_RULES = [
     ),
     (
         "طرق_الدفع",
-        ["طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع"],
+        [
+            "طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع", "وين ادفع",
+            "شلون الدفع", "طرق التسديد", "كيفية الدفع", "شنو طرق الدفع",
+            "زين كاش", "سوبر كي", "زد كاش",
+        ],
         "طرق الدفع\n"
         "رقم زين كاش التالي\n"
         "07818103404\n\n"
@@ -118,34 +151,51 @@ FAQ_RULES = [
     ),
     (
         "دفع_رصيد",
-        ["رصيد", "كارت الرصيد", "كارت رصيد"],
+        [
+            "رصيد", "كارت الرصيد", "كارت رصيد", "بالرصيد", "ادفع رصيد",
+            "اثير", "كروت رصيد", "كارت اثير",
+        ],
         "تمام لا بأس رصيد اثير (زين)",
     ),
     (
         "anki",
-        ["انكي", "anki"],
+        ["انكي", "anki", "آنكي", "انچي"],
         "متوفر تنزيل تطبيق بواسطة حساب اب ستور سعره 5 يبقى موجود دائمي (الا اذا حذفته)",
     ),
     (
         "freenote",
-        ["فرينوت", "freenote", "free note"],
+        ["فرينوت", "freenote", "free note", "فري نوت"],
         "متوفر سعره 5 حساب مُفعل المدة سنة",
     ),
     (
         "goodnote",
-        ["گودنوت", "كودنوت", "كود نوت", "goodnote", "good note"],
+        [
+            "گودنوت", "كودنوت", "كود نوت", "goodnote", "good note",
+            "جودنوت", "غودنوت",
+        ],
         "بلي موجود سعره 5 مدة سنة حساب تسجلوا يمكم",
     ),
     (
         "canva",
-        ["كانفا", "canva"],
+        ["كانفا", "canva", "كنفا"],
         "نعم متوفر اشتراك سنة سعره 25 الف",
     ),
     (
         "تليجرام_مميز",
-        ["تلي مميز", "تليجرام مميز", "تليكرام مميز"],
+        [
+            "تلي مميز", "تليجرام مميز", "تليكرام مميز", "تليجرام بريميوم",
+            "telegram premium", "premium",
+        ],
         "متوفر تلث اشهر ب 25 وسنة ب55 الف",
     ),
+]
+
+# كلمات تدل على وجود شكوى/مشكلة تقنية — تستخدم مع كلمات chatgpt عشان
+# نقرر هل نفعّل فحص الذكاء الاصطناعي (شوف classify_chatgpt_context)
+COMPLAINT_KEYWORDS = [
+    "مشكلة", "مشكله", "ما يشتغل", "خربان", "وقف", "ما يفتح",
+    "خطأ", "غلط", "ما يدخل", "ما يقبل", "طلع", "طلعت", "رفض", "عطل",
+    "معطل", "خرب",
 ]
 
 SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
@@ -156,168 +206,69 @@ LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
 RESETCODE_PATTERN = re.compile(r"^/resetcode$", re.IGNORECASE)
 
-# كل الفئات الممكنة اللي الذكاء الاصطناعي يختار منها — تُبنى تلقائياً
-# من أسماء الفئات بـ FAQ_RULES، بالإضافة لثلاث فئات خاصة:
-# "طلب_كود" (الزبون يطلب الكود فعلاً الحين لأول مرة)،
-# "مشكلة_كود" (الزبون يقول الكود السابق ما اشتغل / صار خطأ)،
-# و"لا_شي" (ما فيه قصد واضح).
-FAQ_CATEGORY_NAMES = [category for category, _, _ in FAQ_RULES]
-ALL_CATEGORIES = FAQ_CATEGORY_NAMES + ["طلب_كود", "مشكلة_كود", "لا_شي"]
+# كلمات مفتاحية لطلب الكود
+CODE_REQUEST_KEYWORDS = [
+    "كود", "رمز", "code", "otp", "الكود", "الرمز",
+]
 
 CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تلقائياً بعد هالمدة
 
-CLASSIFIER_SYSTEM_PROMPT = (
-    "مصنف نية لبوت متجر عراقي (اشتراكات رقمية). صنّف رسالة الزبون لفئة واحدة "
-    "بالضبط من هذي القائمة، بدون شرح:\n\n"
-    + "\n".join(f"- {c}" for c in ALL_CATEGORIES)
-    + "\n\n"
-    "قواعد:\n"
-    "- سلام = 'السلام عليكم' فقط. ترحيب = تحية عادية بدون طلب. شكر = اي "
-    "صيغة شكر/دعاء (شكرا، تسلم، عاشت ايدك، الله يعطيك العافية).\n"
-    "- chatgpt/anki/freenote/goodnote/canva/تليجرام_مميز = اي اهتمام "
-    "بشراء هذا المنتج بالتحديد: طلب شراء مباشر، سؤال عن السعر، او سؤال "
-    "توفر (موجود؟ متوفر؟ اكو؟). كلها نفس الفئة. لو الرسالة فيها كلمة "
-    "شكوى (مشكلة، ما يشتغل، خربان، وقف، ما يفتح، خطأ) مع اسم المنتج، "
-    "فهذا اشتراك موجود وبيه عطل — صنفها لا_شي دائما، مو طلب شراء.\n"
-    "- طلب_كود = طلب صريح وفوري للكود الحين لأول مرة. يشمل جمل كاملة "
-    "(ابعثلي الكود، ودني اسجل هسه) وأيضا كلمة وحدة لحالها بلا فعل "
-    "(كود / رمز / code) — بمحادثة دعم فني، كلمة 'كود' لحالها تعني طلب "
-    "الكود دائما. لو فيه اشارة زمنية مستقبلية (باجر، بعدين، بوقتها، لما، "
-    "اذا احتجته) أو الرسالة سؤال عن آلية العمل (شلون افعل الرمز؟)، صنفها "
-    "لا_شي مو طلب_كود.\n"
-    "- مشكلة_كود = فقط لو وصلتك ملاحظة 'انبعث كود قريبا' والزبون يقول "
-    "الكود فشل (ما صار، صار خطأ، ما يفتح، رفضه).\n"
-    "- لا_شي = اي شي ثاني، شكوى، او كلام عام.\n\n"
-    "لو وصلتك ملاحظة برسالة الزبون السابقة، واستخدمها لفهم اسئلة متابعة "
-    "قصيرة غامضة (مثل: كم سعره؟ متوفر؟ شلون اشتريه؟) وتحديد المنتج "
-    "المقصود منها، وصنفها على هذا الاساس.\n\n"
-    "امثلة:\n"
-    "'باجر اسجل وبوكتها اريد الكود' → لا_شي (مستقبلي)\n"
-    "'شلون افعل الرمز؟' → لا_شي (سؤال آلية)\n"
-    "'ابعثلي الكود الحين' → طلب_كود\n"
-    "'كود' → طلب_كود (كلمة وحدة لحالها = طلب فوري)\n"
-    "'اريد جات' → chatgpt\n"
-    "'اشتراك جات موجود؟' → chatgpt (سؤال توفر = نفس فئة الشراء)\n"
-    "'عندي مشكلة بجات' → لا_شي (شكوى مو شراء)\n"
-    "مع ملاحظة كود سابق: 'ما صار' → مشكلة_كود\n"
-    "مع ملاحظة 'رسالة الزبون قبل هذي كانت: عندي مشكلة باشتراك جات': "
-    "'كم سعره' → لا_شي (السياق يوضح انه سؤال متابعة على مشكلة، مو شراء)\n"
-    "مع ملاحظة 'رسالة الزبون قبل هذي كانت: اريد انكي': "
-    "'كم سعره' → anki (السياق يوضح المنتج المقصود)\n\n"
-    "لو اكثر من قصد حقيقي بنفس الرسالة، ارجعهم مفصولين بفاصلة انكليزية "
-    "\",\" فقط (مو '،') بترتيب ظهورهم. استخدم فقط اسماء الفئات اعلاه "
-    "بالضبط، بدون اي كلام اضافي."
+# ------------------------------------------------------------------
+# طبقة الذكاء الاصطناعي — محدودة جداً ومستخدمة بس بحالة وحدة:
+# لما الرسالة فيها كلمة مفتاحية لـ chatgpt، نحتاج نميز هل هذا طلب
+# شراء/سؤال سعر فعلي، أو شكوى بمشكلة باشتراك موجود اصلا (يوقف الرد،
+# وينبه الأونر). كل باقي التصنيف يعتمد على الكلمات المفتاحية مباشرة.
+# ------------------------------------------------------------------
+CHATGPT_CONTEXT_PROMPT = (
+    "رسالة زبون بمتجر عراقي تحتوي ذكر ChatGPT (جات/چات/جي بي تي). "
+    "حدد هل هذي شكوى بمشكلة باشتراك ChatGPT موجود اصلا عنده، او طلب "
+    "شراء/سؤال سعر/توفر فعلي. رد بكلمة وحدة بالضبط: 'شكوى' او 'شراء'. "
+    "امثلة: 'عندي مشكلة بجات' → شكوى. 'جات ما يشتغل' → شكوى. "
+    "'اريد جات' → شراء. 'اشتراك جات موجود؟' → شراء. "
+    "'كم سعر جات' → شراء."
 )
 
 
-async def classify_intent(
-    text: str, recent_code_sent: bool = False, previous_message: str | None = None
-) -> tuple[list[str], bool]:
+async def classify_chatgpt_context(text: str) -> str:
     """
-    يبعث نص الزبون لـ Groq (نموذج مجاني وسريع) عشان يحدد القصد.
-
-    يرجع (categories, ai_failed):
-    - categories: قائمة أسماء فئات من ALL_CATEGORIES.
-    - ai_failed: True اذا فشل الاتصال بالكامل (429 مستمر، خطأ شبكة، إلخ)
-      ولازم نستخدم المصنف الاحتياطي بالكلمات المفتاحية بدلاً منه.
-      False اذا Groq رد بنجاح (حتى لو رد لا_شي فعلياً كتصنيف صحيح).
-
-    recent_code_sent: اذا True، معناته انبعث كود لهذا الزبون قريباً — نمرر
-    هذي المعلومة كسياق للنموذج حتى يقدر يفهم رسائل مثل "ما صار" كإشارة
-    لمشكلة بالكود السابق (فئة مشكلة_كود) بدل ما يصنفها لا_شي.
-
-    previous_message: آخر رسالة سابقة من نفس الزبون (لو موجودة بالذاكرة
-    المؤقتة) — تساعد النموذج يفهم رسائل متابعة قصيرة وغامضة مثل
-    "كم سعره؟" اللي محتاجة سياق الرسالة اللي قبلها لتحديد المنتج المقصود.
+    يستخدم الذكاء الاصطناعي (Groq) بس لتمييز شكوى عن شراء وقت وجود
+    ذكر لـ chatgpt بالرسالة. يرجع 'شكوى' او 'شراء' (افتراضي 'شراء' لو
+    فشل الاتصال، عشان البوت يرد بأسعار chatgpt بدل ما يسكت — الاحتمال
+    الأكثر شيوعاً هو طلب شراء فعلي).
     """
-    context_notes = []
-    if recent_code_sent:
-        context_notes.append("انبعث كود لهذا الزبون قبل قليل")
-    if previous_message:
-        context_notes.append(f"رسالة الزبون قبل هذي كانت: '{previous_message}'")
-
-    user_content = text
-    if context_notes:
-        note_line = "[ملاحظة: " + " | ".join(context_notes) + "]\n"
-        user_content = note_line + text
-
-    request_payload = {
-        "model": GROQ_MODEL,
-        "temperature": 0,
-        "max_tokens": 60,
-        "messages": [
-            {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    }
-
-    # نحاول مرتين: لو المحاولة الأولى فشلت بـ 429 (تجاوز الحد المسموح
-    # بالدقيقة)، ننتظر شوي ونعيد المحاولة مرة وحدة قبل ما نستسلم —
-    # هذا يعالج الحالات العابرة (burst قصير)، مو تجاوز الحد اليومي الكامل.
-    raw = None
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=request_payload,
-                )
-            if resp.status_code == 429 and attempt == 0:
-                logger.warning("Groq rate-limited (429) — retrying once after short delay")
-                await asyncio.sleep(2.0)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            raw = data["choices"][0]["message"]["content"].strip()
-            break
-        except Exception:
-            logger.exception("Groq classification failed")
-            break  # فشل غير 429 (مثل timeout) — لا داعي نعيد المحاولة
-
-    if raw is None:
-        # فشل حقيقي بالاتصال — نعلم الطالب يستخدم المصنف الاحتياطي
-        return ["لا_شي"], True
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "temperature": 0,
+                    "max_tokens": 10,
+                    "messages": [
+                        {"role": "system", "content": CHATGPT_CONTEXT_PROMPT},
+                        {"role": "user", "content": text},
+                    ],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+        if "شكوى" in raw:
+            return "شكوى"
+        return "شراء"
+    except Exception:
+        logger.exception("Groq chatgpt-context check failed — defaulting to شراء")
+        return "شراء"
 
 
-    # Groq أحياناً يرجع الفئات مفصولة بفاصلة عربية "،" بدل الفاصلة
-    # الإنكليزية العادية "," — نطبّع النص أول (نحول الفاصلة العربية
-    # لإنكليزية) قبل التقسيم، حتى ما تنكسر عملية الفصل.
-    normalized_raw = raw.replace("،", ",")
-    candidates = [c.strip().strip(".") for c in normalized_raw.split(",")]
-    candidates = [c for c in candidates if c]  # شيل أي عنصر فاضي
-    valid = [c for c in candidates if c in ALL_CATEGORIES]
-
-    if not valid:
-        logger.warning(f"Groq returned unrecognized category: {raw!r}")
-        return ["لا_شي"], False  # Groq رد فعلياً، بس رده مو مفهوم — هذا مو فشل اتصال
-
-    return valid, False
-
-
-def get_reply_for_category(category: str) -> str | None:
-    """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/لا_شي)."""
-    for cat_name, _, reply in FAQ_RULES:
-        if cat_name == category:
-            return reply
-    return None
-
-
-# كلمات مفتاحية بسيطة لطلب الكود — تستخدم بس بالمسار الاحتياطي
-# (fallback) لما Groq يفشل بالكامل، عشان طلب الكود الأساسي يضل يشتغل.
-FALLBACK_CODE_KEYWORDS = ["كود", "رمز", "code", "otp"]
-
-
-def classify_intent_fallback(text: str) -> list[str]:
+def keyword_match_categories(text: str) -> list[str]:
     """
-    مصنف احتياطي بسيط (بدون ذكاء اصطناعي) يعتمد على مطابقة كلمات
-    مفتاحية مباشرة — يشتغل بس لما classify_intent (عن طريق Groq) يفشل
-    بالكامل (429 مستمر، مشكلة شبكة، إلخ)، عشان البوت يضل يجاوب على
-    أسئلة FAQ الأساسية بدل ما يسكت تماماً. أقل دقة من الذكاء الاصطناعي
-    (ما يفهم السياق أو الفرق بين الشكوى والشراء)، بس أفضل من لا شي.
+    المصنف الأساسي — مطابقة كلمات مفتاحية مباشرة (بدون ذكاء اصطناعي).
+    يرجع قائمة فئات مرتبة حسب موقع ظهور الكلمة المفتاحية بالرسالة.
     """
     normalized = text.strip().lower()
     matches: list[tuple[int, str]] = []  # (موقع الظهور، اسم الفئة)
@@ -331,15 +282,54 @@ def classify_intent_fallback(text: str) -> list[str]:
         if best_position is not None:
             matches.append((best_position, category))
 
-    for kw in FALLBACK_CODE_KEYWORDS:
+    for kw in CODE_REQUEST_KEYWORDS:
         pos = normalized.find(kw.lower())
         if pos != -1:
             matches.append((pos, "طلب_كود"))
             break  # فئة وحدة كافية لطلب الكود
 
     matches.sort(key=lambda m: m[0])
-    categories = [category for _, category in matches]
-    return categories if categories else ["لا_شي"]
+    return [category for _, category in matches]
+
+
+def has_complaint_keyword(text: str) -> bool:
+    normalized = text.strip().lower()
+    return any(kw in normalized for kw in COMPLAINT_KEYWORDS)
+
+
+async def classify_intent(text: str) -> tuple[list[str], bool]:
+    """
+    المصنف الرئيسي المستخدم بكل رسالة. الأساس مطابقة كلمات مفتاحية
+    مباشرة (سريع وموثوق، بدون ذكاء اصطناعي). الذكاء الاصطناعي يتفعل
+    بس لو الرسالة تحتوي كلمة مفتاحية لـ chatgpt، عشان يميز شكوى عن
+    شراء (شي ما تقدر الكلمات المفتاحية وحدها تميزه بدقة).
+
+    يرجع (categories, is_chatgpt_complaint):
+    - categories: قائمة فئات (ممكن فيها "شكوى_منتج" اذا كانت شكوى
+      chatgpt — هذي فئة خاصة تخلي البوت يسكت وينبه الأونر).
+    - is_chatgpt_complaint: True لو الذكاء الاصطناعي أكد انها شكوى.
+    """
+    categories = keyword_match_categories(text)
+
+    if "chatgpt" in categories and has_complaint_keyword(text):
+        # فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة — هذا بالضبط الحالة
+        # اللي تحتاج فهم AI للتمييز (الكلمات المفتاحية وحدها ما تكفي)
+        verdict = await classify_chatgpt_context(text)
+        if verdict == "شكوى":
+            # نشيل chatgpt من الفئات ونضيف فئة خاصة "شكوى_منتج"
+            categories = [c for c in categories if c != "chatgpt"]
+            categories.append("شكوى_منتج")
+            return categories, True
+
+    return categories, False
+
+
+def get_reply_for_category(category: str) -> str | None:
+    """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/شكوى)."""
+    for cat_name, _, reply in FAQ_RULES:
+        if cat_name == category:
+            return reply
+    return None
 
 
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
@@ -441,27 +431,21 @@ def reset_retry_state(chat_id: int) -> None:
     ).execute()
 
 
-def was_code_recently_sent(chat_id: int) -> bool:
-    """يتحقق اذا انبعث كود لهذا الزبون خلال آخر فترة قصيرة (نفس نافذة التصفير)."""
-    state = _get_retry_state(chat_id)
-    return state["attempt_count"] > 0
-
-
 RESTART_MESSAGE = (
-    "🔄 يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
+    "يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
     "جرب تسوي التالي: احذف الحساب من تطبيق المصادقة (Authenticator) "
     "وابدأ عملية التسجيل من جديد من الأول، وبعدها راسلني وبعطيك كود جديد."
 )
 
 STOPPED_MESSAGE = (
-    "⚠️ يبدو انه فيه مشكلة مستمرة، حولت طلبك لصاحب المتجر مباشرة "
+    "يبدو انه فيه مشكلة مستمرة، حولت طلبك لصاحب المتجر مباشرة "
     "وراح يتواصل معك قريباً."
 )
 
 
-def process_code_request(chat_id: int, is_retry: bool) -> tuple[str | None, bool]:
+def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     """
-    يقرر شنو الرد المناسب لطلب كود (أول مرة أو مشكلة_كود)، حسب حالة العداد.
+    يقرر شنو الرد المناسب لطلب كود، حسب حالة عداد المحاولات.
 
     يرجع (نص الرد أو None، هل نبعث تنبيه خاص "توقف" للأونر).
     نص الرد يكون: كود فعلي، أو رسالة ريستارت، أو None لو نوقف كلياً.
@@ -477,19 +461,19 @@ def process_code_request(chat_id: int, is_retry: bool) -> tuple[str | None, bool
 
     secret, label = result
 
-    # لو كنا ننتظر تأكيد الريستارت، وهذي رسالة جديدة (طلب_كود أو مشكلة_كود)
-    # تعتبر تأكيد ضمني للريستارت → نبعث كود (محاولة 4) ونطفي علامة الانتظار
+    # لو كنا ننتظر تأكيد الريستارت، وهذي رسالة جديدة تطلب كود تعتبر
+    # تأكيد ضمني للريستارت → نبعث كود (محاولة 4) ونطفي علامة الانتظار
     if awaiting_restart:
         code = generate_totp_code(secret)
         _save_retry_state(chat_id, attempt_count=4, awaiting_restart=False)
-        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
 
     new_count = attempt_count + 1
 
     if new_count <= 2:
         code = generate_totp_code(secret)
         _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
-        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
 
     if new_count == 3:
         _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=True)
@@ -498,7 +482,7 @@ def process_code_request(chat_id: int, is_retry: bool) -> tuple[str | None, bool
     if new_count == 5:
         code = generate_totp_code(secret)
         _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
-        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
 
     # new_count >= 6 (أو أي حالة بعد المحاولة الخامسة) — نوقف ونبلغ الأونر
     _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
@@ -678,83 +662,57 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         handled = await handle_owner_command(update, context, chat_id, text)
         if handled:
             return
-        # اذا مو أمر، خلها تمر عادي (مثلاً حجي عادي وياك نفسك ما نتدخل فيه)
         return
 
-    # 2) نبعث الرسالة للذكاء الاصطناعي (Groq) عشان يحدد القصد الحقيقي
-    #    نمرر معلومة "هل انبعث كود قريباً" + "آخر رسالة سابقة" كسياق،
-    #    عشان يفهم "ما صار" و اسئلة المتابعة القصيرة ("كم سعره؟") صح
-    recent_code = was_code_recently_sent(chat_id)
-    previous_message = LAST_MESSAGE_CACHE.get(chat_id)
-    categories, ai_failed = await classify_intent(
-        text, recent_code_sent=recent_code, previous_message=previous_message
-    )
-
-    if ai_failed:
-        # Groq فشل بالكامل (429 مستمر أو مشكلة اتصال) — نستخدم المصنف
-        # الاحتياطي البسيط بالكلمات المفتاحية بدل ما البوت يسكت تماماً
-        categories = classify_intent_fallback(text)
-        logger.warning(
-            f"Groq unavailable — used keyword fallback for chat_id={chat_id}: {categories}"
-        )
-
-        global _LAST_AI_FAILURE_NOTIFICATION
-        now = datetime.now(timezone.utc)
-        should_notify_ai_down = (
-            _LAST_AI_FAILURE_NOTIFICATION is None
-            or (now - _LAST_AI_FAILURE_NOTIFICATION)
-            > timedelta(minutes=AI_FAILURE_NOTIFICATION_COOLDOWN_MINUTES)
-        )
-        if should_notify_ai_down:
-            _LAST_AI_FAILURE_NOTIFICATION = now
-            try:
-                await context.bot.send_message(
-                    chat_id=OWNER_USER_ID,
-                    text=(
-                        "⚠️ تنبيه: الذكاء الاصطناعي (Groq) غير متوفر حالياً "
-                        "(احتمال تجاوز الحد اليومي المجاني). البوت يستخدم "
-                        "النظام الاحتياطي بالكلمات المفتاحية مؤقتاً — دقة "
-                        "أقل من المعتاد."
-                    ),
-                )
-            except Exception:
-                logger.exception("Failed to notify owner about AI fallback")
-    else:
-        logger.info(f"Intent classification for chat_id={chat_id}: {categories}")
-
-    # نحدّث الذاكرة المؤقتة بالرسالة الحالية عشان تصير "الرسالة السابقة"
-    # لأي رسالة جاية بعدها من نفس الزبون
-    LAST_MESSAGE_CACHE[chat_id] = text
-    if len(LAST_MESSAGE_CACHE) > LAST_MESSAGE_CACHE_MAX_SIZE:
-        # نشيل أقدم عنصر بشكل بسيط لمنع تضخم الذاكرة بلا حدود
-        oldest_key = next(iter(LAST_MESSAGE_CACHE))
-        del LAST_MESSAGE_CACHE[oldest_key]
+    # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
+    #    يتفعل بس لو فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة
+    categories, is_chatgpt_complaint = await classify_intent(text)
+    logger.info(f"Classification for chat_id={chat_id}: {categories}")
 
     replies_to_send: list[str] = []
     should_notify_stopped = False
+    should_notify_complaint = False
 
     for category in categories:
-        if category == "لا_شي":
+        if category == "شكوى_منتج":
+            # شكوى مؤكدة (AI) بمشكلة باشتراك chatgpt موجود اصلا — البوت
+            # ما يرد، بس ينبه الأونر يتدخل شخصياً
+            should_notify_complaint = True
             continue
 
-        if category in ("طلب_كود", "مشكلة_كود"):
-            # طلب كود (أول مرة أو بعد مشكلة) — الشرط الأساسي يضل الربط
-            # المسبق بـ /link، وبعده عداد المحاولات يقرر شنو الرد بالضبط
-            reply_text, stopped = process_code_request(chat_id, is_retry=(category == "مشكلة_كود"))
+        if category == "طلب_كود":
+            # طلب كود — الشرط الأساسي يضل الربط المسبق بـ /link، وبعده
+            # عداد المحاولات (process_code_request) يقرر شنو الرد بالضبط
+            reply_text, stopped = process_code_request(chat_id)
             if reply_text:
                 replies_to_send.append(reply_text)
             if stopped:
                 should_notify_stopped = True
             continue
 
-        # فئة FAQ عادية — نرسل نصها الجاهز فقط (الذكاء الاصطناعي لا يكتب رد حر)
+        # فئة FAQ عادية — منع تكرار نفس الرد لنفس الزبون خلال ساعة
+        if not should_send_faq_reply(chat_id, category):
+            continue
         reply_text = get_reply_for_category(category)
         if reply_text:
             replies_to_send.append(reply_text)
 
+    if should_notify_complaint:
+        complaint_notification = (
+            f"تنبيه: شكوى محتملة باشتراك ChatGPT\n"
+            f"الزبون: {customer_name}" + (f" (@{customer_username})" if customer_username else "") + "\n"
+            f"chat_id: {chat_id}\n\n"
+            f"كتب: {text}\n\n"
+            f"البوت ما رد تلقائياً — يحتاج تدخلك المباشر."
+        )
+        try:
+            await context.bot.send_message(chat_id=OWNER_USER_ID, text=complaint_notification)
+        except Exception:
+            logger.exception("Failed to send complaint notification to owner")
+
     if should_notify_stopped:
         stopped_notification = (
-            f"🚨 توقف الرد التلقائي على الكود!\n"
+            f"توقف الرد التلقائي على الكود!\n"
             f"الزبون: {customer_name}" + (f" (@{customer_username})" if customer_username else "") + "\n"
             f"chat_id: {chat_id}\n\n"
             f"طلب الكود عدة مرات وقال انه ما يشتغل، وتجاوز الحد المسموح "
