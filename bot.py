@@ -20,6 +20,7 @@ import asyncio
 import logging
 import pyotp
 import httpx
+from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 from telegram import Update
 from telegram.constants import ChatAction
@@ -138,12 +139,17 @@ TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال 
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
+RESETCODE_PATTERN = re.compile(r"^/resetcode$", re.IGNORECASE)
 
 # كل الفئات الممكنة اللي الذكاء الاصطناعي يختار منها — تُبنى تلقائياً
-# من أسماء الفئات بـ FAQ_RULES، بالإضافة لفئتين خاصتين:
-# "طلب_كود" (الزبون يطلب الكود فعلاً الحين) و "لا_شي" (ما فيه قصد واضح).
+# من أسماء الفئات بـ FAQ_RULES، بالإضافة لثلاث فئات خاصة:
+# "طلب_كود" (الزبون يطلب الكود فعلاً الحين لأول مرة)،
+# "مشكلة_كود" (الزبون يقول الكود السابق ما اشتغل / صار خطأ)،
+# و"لا_شي" (ما فيه قصد واضح).
 FAQ_CATEGORY_NAMES = [category for category, _, _ in FAQ_RULES]
-ALL_CATEGORIES = FAQ_CATEGORY_NAMES + ["طلب_كود", "لا_شي"]
+ALL_CATEGORIES = FAQ_CATEGORY_NAMES + ["طلب_كود", "مشكلة_كود", "لا_شي"]
+
+CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تلقائياً بعد هالمدة
 
 CLASSIFIER_SYSTEM_PROMPT = (
     "أنت مصنف نية (intent classifier) لبوت رد تلقائي على تيليجرام بمتجر عراقي "
@@ -169,7 +175,11 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "هذا المنتج بالتحديد (ونفس قاعدة الشكوى اعلاه تنطبق عليهم: ذكر مشكلة "
     "بمنتج موجود اصلا يعني لا_شي، مو طلب شراء).\n"
     "- طلب_كود: الزبون يطلب كود الدخول / رمز التحقق الحين بشكل فعلي، واضح، وحالي "
-    "(مثل: ابعثلي الكود، ودني اسجل هسه، ارسل الكود).\n"
+    "لأول مرة (مثل: ابعثلي الكود، ودني اسجل هسه، ارسل الكود).\n"
+    "- مشكلة_كود: تُستخدم فقط اذا انبعث كود لهذا الزبون قريبا (بينوصلك هذا "
+    "بملاحظة خاصة بالرسالة)، والزبون يقول الكود ما اشتغل / ما صار / صار "
+    "خطأ / ما يفتح / مقبول غلط / رفضه — أي إشارة انه الكود السابق فشل ولازم "
+    "كود جديد. لا تستخدم هذي الفئة اذا ما فيه ملاحظة تدل على ارسال كود سابق.\n"
     "- لا_شي: أي رسالة ما تنطبق بوضوح وبشكل مباشر وحالي على فئة اعلاه، "
     "بما فيها اي شكوى او مشكلة تقنية بمنتج مشترك فيه الزبون مسبقا.\n\n"
     "قاعدة مهمة جداً حول الوقت والتردد: صنّف طلب_كود فقط اذا كان الطلب "
@@ -188,7 +198,9 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "رسالة: 'ابعثلي الكود الحين لو سمحت' → طلب_كود (طلب فوري وصريح)\n"
     "رسالة: 'اريد جات' أو 'اريد چات' → chatgpt (طلب شراء/استفسار فوري)\n"
     "رسالة: 'عندي مشكلة، جي بي تي زين' → لا_شي (يذكر ChatGPT بسياق شكوى، مو طلب شراء)\n"
-    "رسالة: 'عندي مشكلة باشتراك جات' → لا_شي (كلمة 'مشكلة' + منتج موجود اصلا = شكوى، مو طلب شراء جديد)\n\n"
+    "رسالة: 'عندي مشكلة باشتراك جات' → لا_شي (كلمة 'مشكلة' + منتج موجود اصلا = شكوى، مو طلب شراء جديد)\n"
+    "مثال لما توصلك ملاحظة 'انبعث كود لهذا الزبون قبل قليل': رسالة الزبون "
+    "'ما صار' أو 'صار خطأ' أو 'ما يفتح الكود' → مشكلة_كود\n\n"
     "اذا الرسالة فيها اكثر من قصد واحد حقيقي وحالي بنفس الوقت (مثلا تحية + "
     "سؤال شراء)، ارجع الفئتين مفصولتين بفاصلة إنكليزية عادية \",\" فقط "
     "(وليس الفاصلة العربية \"،\")، بترتيب ظهورهن بالرسالة. "
@@ -197,13 +209,23 @@ CLASSIFIER_SYSTEM_PROMPT = (
 )
 
 
-async def classify_intent(text: str) -> list[str]:
+async def classify_intent(text: str, recent_code_sent: bool = False) -> list[str]:
     """
     يبعث نص الزبون لـ Groq (نموذج مجاني وسريع) عشان يحدد القصد،
     ويرجع قائمة أسماء فئات من ALL_CATEGORIES (ممكن تكون فئة واحدة أو أكثر).
     اذا فشل الاتصال أو الرد غير مفهوم، يرجع ["لا_شي"] احتياطيا (البوت ما يرد
     بدل ما يرد غلط).
+
+    recent_code_sent: اذا True، معناته انبعث كود لهذا الزبون قريباً — نمرر
+    هذي المعلومة كسياق للنموذج حتى يقدر يفهم رسائل مثل "ما صار" كإشارة
+    لمشكلة بالكود السابق (فئة مشكلة_كود) بدل ما يصنفها لا_شي.
     """
+    user_content = text
+    if recent_code_sent:
+        user_content = (
+            "[ملاحظة: انبعث كود لهذا الزبون قبل قليل]\n" + text
+        )
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -218,7 +240,7 @@ async def classify_intent(text: str) -> list[str]:
                     "max_tokens": 60,
                     "messages": [
                         {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-                        {"role": "user", "content": text},
+                        {"role": "user", "content": user_content},
                     ],
                 },
             )
@@ -279,6 +301,140 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
 def generate_totp_code(secret: str) -> str:
     totp = pyotp.TOTP(secret)
     return totp.now()
+
+
+# ------------------------------------------------------------------
+# نظام تتبع محاولات الكود الفاشلة (code_retry_tracker بقاعدة Supabase)
+# التسلسل المتفق عليه لما الزبون يقول "ما صار" بشكل متكرر:
+#   محاولة 1، 2  → كود جديد تلقائياً
+#   محاولة 3     → رسالة "سوي ريستارت" بدون كود
+#   بعد تأكيد الريستارت → كود (تعتبر محاولة 4)
+#   محاولة 5     → كود أخير
+#   محاولة 6+    → توقف، تنبيه للأونر فقط، بدون كود
+# العداد يصفر تلقائياً بعد CODE_RETRY_RESET_HOURS ساعة من آخر محاولة.
+# ------------------------------------------------------------------
+
+
+def _get_retry_state(chat_id: int) -> dict:
+    """يرجع حالة العداد الحالية لهذا الزبون، أو حالة ابتدائية اذا ما موجودة."""
+    res = (
+        supabase.table("code_retry_tracker")
+        .select("attempt_count, last_attempt_at, awaiting_restart_confirmation")
+        .eq("chat_id", chat_id)
+        .execute()
+    )
+    if not res.data:
+        return {
+            "attempt_count": 0,
+            "last_attempt_at": None,
+            "awaiting_restart_confirmation": False,
+        }
+
+    row = res.data[0]
+    last_attempt_at = row.get("last_attempt_at")
+
+    # تصفير تلقائي بعد مرور CODE_RETRY_RESET_HOURS من آخر محاولة
+    if last_attempt_at:
+        last_dt = datetime.fromisoformat(last_attempt_at)
+        if datetime.now(timezone.utc) - last_dt > timedelta(hours=CODE_RETRY_RESET_HOURS):
+            return {
+                "attempt_count": 0,
+                "last_attempt_at": None,
+                "awaiting_restart_confirmation": False,
+            }
+
+    return {
+        "attempt_count": row.get("attempt_count", 0),
+        "last_attempt_at": last_attempt_at,
+        "awaiting_restart_confirmation": row.get("awaiting_restart_confirmation", False),
+    }
+
+
+def _save_retry_state(chat_id: int, attempt_count: int, awaiting_restart: bool) -> None:
+    supabase.table("code_retry_tracker").upsert(
+        {
+            "chat_id": chat_id,
+            "attempt_count": attempt_count,
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            "awaiting_restart_confirmation": awaiting_restart,
+        }
+    ).execute()
+
+
+def reset_retry_state(chat_id: int) -> None:
+    """يصفر عداد المحاولات يدوياً (يستخدمه أمر owner /resetcode)."""
+    supabase.table("code_retry_tracker").upsert(
+        {
+            "chat_id": chat_id,
+            "attempt_count": 0,
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            "awaiting_restart_confirmation": False,
+        }
+    ).execute()
+
+
+def was_code_recently_sent(chat_id: int) -> bool:
+    """يتحقق اذا انبعث كود لهذا الزبون خلال آخر فترة قصيرة (نفس نافذة التصفير)."""
+    state = _get_retry_state(chat_id)
+    return state["attempt_count"] > 0
+
+
+RESTART_MESSAGE = (
+    "🔄 يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
+    "جرب تسوي التالي: احذف الحساب من تطبيق المصادقة (Authenticator) "
+    "وابدأ عملية التسجيل من جديد من الأول، وبعدها راسلني وبعطيك كود جديد."
+)
+
+STOPPED_MESSAGE = (
+    "⚠️ يبدو انه فيه مشكلة مستمرة، حولت طلبك لصاحب المتجر مباشرة "
+    "وراح يتواصل معك قريباً."
+)
+
+
+def process_code_request(chat_id: int, is_retry: bool) -> tuple[str | None, bool]:
+    """
+    يقرر شنو الرد المناسب لطلب كود (أول مرة أو مشكلة_كود)، حسب حالة العداد.
+
+    يرجع (نص الرد أو None، هل نبعث تنبيه خاص "توقف" للأونر).
+    نص الرد يكون: كود فعلي، أو رسالة ريستارت، أو None لو نوقف كلياً.
+    """
+    state = _get_retry_state(chat_id)
+    attempt_count = state["attempt_count"]
+    awaiting_restart = state["awaiting_restart_confirmation"]
+
+    result = get_secret_for_chat(chat_id)
+    if result is None:
+        # مو مربوط اصلاً — نفس السلوك القديم، تجاهل صامت
+        return None, False
+
+    secret, label = result
+
+    # لو كنا ننتظر تأكيد الريستارت، وهذي رسالة جديدة (طلب_كود أو مشكلة_كود)
+    # تعتبر تأكيد ضمني للريستارت → نبعث كود (محاولة 4) ونطفي علامة الانتظار
+    if awaiting_restart:
+        code = generate_totp_code(secret)
+        _save_retry_state(chat_id, attempt_count=4, awaiting_restart=False)
+        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+
+    new_count = attempt_count + 1
+
+    if new_count <= 2:
+        code = generate_totp_code(secret)
+        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
+        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+
+    if new_count == 3:
+        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=True)
+        return RESTART_MESSAGE, False
+
+    if new_count == 5:
+        code = generate_totp_code(secret)
+        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
+        return f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا", False
+
+    # new_count >= 6 (أو أي حالة بعد المحاولة الخامسة) — نوقف ونبلغ الأونر
+    _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
+    return None, True
 
 
 async def _show_typing(
@@ -395,6 +551,15 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    # /resetcode  (يُرسل داخل محادثة الزبون نفسه — يصفر عداد محاولات الكود)
+    if RESETCODE_PATTERN.match(text.strip()):
+        reset_retry_state(chat_id)
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text="✅ تم تصفير عداد محاولات الكود لهذا الزبون، راح يقدر يطلب كود من جديد بشكل طبيعي.",
+        )
+        return True
+
     return False
 
 
@@ -449,31 +614,45 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # 2) نبعث الرسالة للذكاء الاصطناعي (Groq) عشان يحدد القصد الحقيقي
-    categories = await classify_intent(text)
+    #    نمرر معلومة "هل انبعث كود قريباً" كسياق، عشان يفهم "ما صار" صح
+    recent_code = was_code_recently_sent(chat_id)
+    categories = await classify_intent(text, recent_code_sent=recent_code)
     logger.info(f"Intent classification for chat_id={chat_id}: {categories}")
 
     replies_to_send: list[str] = []
+    should_notify_stopped = False
 
     for category in categories:
         if category == "لا_شي":
             continue
 
-        if category == "طلب_كود":
-            # طلب كود فعلي — الشرط الأساسي يضل الربط المسبق بـ /link
-            result = get_secret_for_chat(chat_id)
-            if result is not None:
-                secret, label = result
-                code = generate_totp_code(secret)
-                replies_to_send.append(f"🔐 الكود: {code}\n⏱️ صالح لمدة 30 ثانية تقريبا")
-                logger.info(f"Sent TOTP code to chat_id={chat_id} (account={label})")
-            else:
-                logger.info(f"Code requested by unlinked chat_id={chat_id} — ignored")
+        if category in ("طلب_كود", "مشكلة_كود"):
+            # طلب كود (أول مرة أو بعد مشكلة) — الشرط الأساسي يضل الربط
+            # المسبق بـ /link، وبعده عداد المحاولات يقرر شنو الرد بالضبط
+            reply_text, stopped = process_code_request(chat_id, is_retry=(category == "مشكلة_كود"))
+            if reply_text:
+                replies_to_send.append(reply_text)
+            if stopped:
+                should_notify_stopped = True
             continue
 
         # فئة FAQ عادية — نرسل نصها الجاهز فقط (الذكاء الاصطناعي لا يكتب رد حر)
         reply_text = get_reply_for_category(category)
         if reply_text:
             replies_to_send.append(reply_text)
+
+    if should_notify_stopped:
+        stopped_notification = (
+            f"🚨 توقف الرد التلقائي على الكود!\n"
+            f"الزبون: {customer_name}" + (f" (@{customer_username})" if customer_username else "") + "\n"
+            f"chat_id: {chat_id}\n\n"
+            f"طلب الكود عدة مرات وقال انه ما يشتغل، وتجاوز الحد المسموح "
+            f"للمحاولات التلقائية. يحتاج تدخلك المباشر."
+        )
+        try:
+            await context.bot.send_message(chat_id=OWNER_USER_ID, text=stopped_notification)
+        except Exception:
+            logger.exception("Failed to send stopped-retry notification to owner")
 
     if not replies_to_send:
         return
