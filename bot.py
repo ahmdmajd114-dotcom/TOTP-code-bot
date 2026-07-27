@@ -56,7 +56,7 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])  # الـ Telegram User ID تب
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -69,12 +69,18 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 LAST_MESSAGE_CACHE: dict[int, str] = {}
 LAST_MESSAGE_CACHE_MAX_SIZE = 2000  # حد أعلى بسيط لمنع تضخم الذاكرة
 
+# آخر وقت أبلغنا فيه الأونر إن Groq غير متوفر — نستخدمه لمنع إزعاجه
+# برسالة مكررة كل رسالة زبون توصل أثناء فترة انقطاع Groq الواحدة
+_LAST_AI_FAILURE_NOTIFICATION: datetime | None = None
+AI_FAILURE_NOTIFICATION_COOLDOWN_MINUTES = 60
+
 # ------------------------------------------------------------------
 # نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط
-# كل عنصر: (اسم الفئة، قائمة كلمات مفتاحية للتوضيح فقط، نص الرد)
-# الكلمات المفتاحية هنا مو مستخدمة للمطابقة المباشرة بعد الآن —
-# القصد يتحدد عن طريق تصنيف الذكاء الاصطناعي (classify_intent)،
-# وبعدها يُختار نص الرد المطابق من هذي القائمة عن طريق اسم الفئة.
+# كل عنصر: (اسم الفئة، قائمة كلمات مفتاحية، نص الرد)
+# القصد الأساسي يتحدد عن طريق تصنيف الذكاء الاصطناعي (classify_intent).
+# الكلمات المفتاحية هنا تستخدم بطريقتين: (1) لاختيار نص الرد الجاهز بعد
+# ما الذكاء الاصطناعي يحدد الفئة، (2) كـ احتياط (fallback) للمطابقة
+# المباشرة اذا فشل الاتصال بـ Groq بالكامل (بدل ما البوت يسكت تماماً).
 # ------------------------------------------------------------------
 FAQ_RULES = [
     (
@@ -201,12 +207,15 @@ CLASSIFIER_SYSTEM_PROMPT = (
 
 async def classify_intent(
     text: str, recent_code_sent: bool = False, previous_message: str | None = None
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """
-    يبعث نص الزبون لـ Groq (نموذج مجاني وسريع) عشان يحدد القصد،
-    ويرجع قائمة أسماء فئات من ALL_CATEGORIES (ممكن تكون فئة واحدة أو أكثر).
-    اذا فشل الاتصال أو الرد غير مفهوم، يرجع ["لا_شي"] احتياطيا (البوت ما يرد
-    بدل ما يرد غلط).
+    يبعث نص الزبون لـ Groq (نموذج مجاني وسريع) عشان يحدد القصد.
+
+    يرجع (categories, ai_failed):
+    - categories: قائمة أسماء فئات من ALL_CATEGORIES.
+    - ai_failed: True اذا فشل الاتصال بالكامل (429 مستمر، خطأ شبكة، إلخ)
+      ولازم نستخدم المصنف الاحتياطي بالكلمات المفتاحية بدلاً منه.
+      False اذا Groq رد بنجاح (حتى لو رد لا_شي فعلياً كتصنيف صحيح).
 
     recent_code_sent: اذا True، معناته انبعث كود لهذا الزبون قريباً — نمرر
     هذي المعلومة كسياق للنموذج حتى يقدر يفهم رسائل مثل "ما صار" كإشارة
@@ -227,30 +236,47 @@ async def classify_intent(
         note_line = "[ملاحظة: " + " | ".join(context_notes) + "]\n"
         user_content = note_line + text
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "temperature": 0,
-                    "max_tokens": 60,
-                    "messages": [
-                        {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_content},
-                    ],
-                },
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        logger.exception("Groq classification failed")
-        return ["لا_شي"]
+    request_payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0,
+        "max_tokens": 60,
+        "messages": [
+            {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+    }
+
+    # نحاول مرتين: لو المحاولة الأولى فشلت بـ 429 (تجاوز الحد المسموح
+    # بالدقيقة)، ننتظر شوي ونعيد المحاولة مرة وحدة قبل ما نستسلم —
+    # هذا يعالج الحالات العابرة (burst قصير)، مو تجاوز الحد اليومي الكامل.
+    raw = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                )
+            if resp.status_code == 429 and attempt == 0:
+                logger.warning("Groq rate-limited (429) — retrying once after short delay")
+                await asyncio.sleep(2.0)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data["choices"][0]["message"]["content"].strip()
+            break
+        except Exception:
+            logger.exception("Groq classification failed")
+            break  # فشل غير 429 (مثل timeout) — لا داعي نعيد المحاولة
+
+    if raw is None:
+        # فشل حقيقي بالاتصال — نعلم الطالب يستخدم المصنف الاحتياطي
+        return ["لا_شي"], True
+
 
     # Groq أحياناً يرجع الفئات مفصولة بفاصلة عربية "،" بدل الفاصلة
     # الإنكليزية العادية "," — نطبّع النص أول (نحول الفاصلة العربية
@@ -262,9 +288,9 @@ async def classify_intent(
 
     if not valid:
         logger.warning(f"Groq returned unrecognized category: {raw!r}")
-        return ["لا_شي"]
+        return ["لا_شي"], False  # Groq رد فعلياً، بس رده مو مفهوم — هذا مو فشل اتصال
 
-    return valid
+    return valid, False
 
 
 def get_reply_for_category(category: str) -> str | None:
@@ -273,6 +299,42 @@ def get_reply_for_category(category: str) -> str | None:
         if cat_name == category:
             return reply
     return None
+
+
+# كلمات مفتاحية بسيطة لطلب الكود — تستخدم بس بالمسار الاحتياطي
+# (fallback) لما Groq يفشل بالكامل، عشان طلب الكود الأساسي يضل يشتغل.
+FALLBACK_CODE_KEYWORDS = ["كود", "رمز", "code", "otp"]
+
+
+def classify_intent_fallback(text: str) -> list[str]:
+    """
+    مصنف احتياطي بسيط (بدون ذكاء اصطناعي) يعتمد على مطابقة كلمات
+    مفتاحية مباشرة — يشتغل بس لما classify_intent (عن طريق Groq) يفشل
+    بالكامل (429 مستمر، مشكلة شبكة، إلخ)، عشان البوت يضل يجاوب على
+    أسئلة FAQ الأساسية بدل ما يسكت تماماً. أقل دقة من الذكاء الاصطناعي
+    (ما يفهم السياق أو الفرق بين الشكوى والشراء)، بس أفضل من لا شي.
+    """
+    normalized = text.strip().lower()
+    matches: list[tuple[int, str]] = []  # (موقع الظهور، اسم الفئة)
+
+    for category, keywords, _ in FAQ_RULES:
+        best_position = None
+        for kw in keywords:
+            pos = normalized.find(kw.lower())
+            if pos != -1 and (best_position is None or pos < best_position):
+                best_position = pos
+        if best_position is not None:
+            matches.append((best_position, category))
+
+    for kw in FALLBACK_CODE_KEYWORDS:
+        pos = normalized.find(kw.lower())
+        if pos != -1:
+            matches.append((pos, "طلب_كود"))
+            break  # فئة وحدة كافية لطلب الكود
+
+    matches.sort(key=lambda m: m[0])
+    categories = [category for _, category in matches]
+    return categories if categories else ["لا_شي"]
 
 
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
@@ -619,10 +681,41 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     #    عشان يفهم "ما صار" و اسئلة المتابعة القصيرة ("كم سعره؟") صح
     recent_code = was_code_recently_sent(chat_id)
     previous_message = LAST_MESSAGE_CACHE.get(chat_id)
-    categories = await classify_intent(
+    categories, ai_failed = await classify_intent(
         text, recent_code_sent=recent_code, previous_message=previous_message
     )
-    logger.info(f"Intent classification for chat_id={chat_id}: {categories}")
+
+    if ai_failed:
+        # Groq فشل بالكامل (429 مستمر أو مشكلة اتصال) — نستخدم المصنف
+        # الاحتياطي البسيط بالكلمات المفتاحية بدل ما البوت يسكت تماماً
+        categories = classify_intent_fallback(text)
+        logger.warning(
+            f"Groq unavailable — used keyword fallback for chat_id={chat_id}: {categories}"
+        )
+
+        global _LAST_AI_FAILURE_NOTIFICATION
+        now = datetime.now(timezone.utc)
+        should_notify_ai_down = (
+            _LAST_AI_FAILURE_NOTIFICATION is None
+            or (now - _LAST_AI_FAILURE_NOTIFICATION)
+            > timedelta(minutes=AI_FAILURE_NOTIFICATION_COOLDOWN_MINUTES)
+        )
+        if should_notify_ai_down:
+            _LAST_AI_FAILURE_NOTIFICATION = now
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=(
+                        "⚠️ تنبيه: الذكاء الاصطناعي (Groq) غير متوفر حالياً "
+                        "(احتمال تجاوز الحد اليومي المجاني). البوت يستخدم "
+                        "النظام الاحتياطي بالكلمات المفتاحية مؤقتاً — دقة "
+                        "أقل من المعتاد."
+                    ),
+                )
+            except Exception:
+                logger.exception("Failed to notify owner about AI fallback")
+    else:
+        logger.info(f"Intent classification for chat_id={chat_id}: {categories}")
 
     # نحدّث الذاكرة المؤقتة بالرسالة الحالية عشان تصير "الرسالة السابقة"
     # لأي رسالة جاية بعدها من نفس الزبون
@@ -726,4 +819,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
