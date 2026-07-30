@@ -22,14 +22,18 @@ import asyncio
 import logging
 import pyotp
 import httpx
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    CommandHandler,
     filters,
 )
 
@@ -60,7 +64,48 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
+# مسار ملف مفاتيح حساب خدمة Google (Service Account) — ملف JSON خارجي
+# لا ينرفع لـ Git إطلاقاً (مضاف لـ .gitignore). المسار الافتراضي
+# /etc/secrets/google_service_account.json يطابق طريقة Render لتخزين
+# "Secret Files" — لو تستضيف بمكان ثاني، بدّل GOOGLE_SERVICE_ACCOUNT_FILE
+GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
+    "GOOGLE_SERVICE_ACCOUNT_FILE", "/etc/secrets/google_service_account.json"
+)
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]  # الـ ID تبع الشيت (من رابطه)
+GOOGLE_SHEET_WORKSHEET_NAME = os.environ.get("GOOGLE_SHEET_WORKSHEET_NAME", "Sheet1")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ------------------------------------------------------------------
+# اتصال Google Sheets (gspread) — يُبنى مرة وحدة عند بدء تشغيل البوت.
+# لو فشل الاتصال (ملف مفقود، صلاحيات ناقصة، إلخ)، البوت يضل يشتغل
+# عادي بكل شي ثاني، بس ميزة تسجيل الدفع تتعطل وتنبهك بذلك بدل ما يكرش.
+# ------------------------------------------------------------------
+_google_sheet = None
+
+
+def get_google_sheet():
+    """يرجع كائن الشيت (worksheet) جاهز للكتابة، أو None لو فشل الاتصال."""
+    global _google_sheet
+    if _google_sheet is not None:
+        return _google_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        _google_sheet = spreadsheet.worksheet(GOOGLE_SHEET_WORKSHEET_NAME)
+        logger.info("Google Sheets connection established successfully")
+        return _google_sheet
+    except Exception:
+        logger.exception("Failed to connect to Google Sheets")
+        return None
+
 
 # ------------------------------------------------------------------
 # منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
@@ -88,6 +133,24 @@ def should_send_faq_reply(chat_id: int, category: str) -> bool:
 
 
 # ------------------------------------------------------------------
+# حالة مؤقتة (بذاكرة البرنامج) لكل عملية تسجيل دفع جارية — المفتاح
+# هو message_id تبع رسالة الصورة المحولة بمحادثتك مع البوت. تنمحي
+# فور التثبيت أو الإلغاء، أو عند اعادة تشغيل البوت (مقبول).
+#
+# كل عنصر: {
+#   "customer_name": str, "customer_username": str | None,
+#   "customer_chat_id": int,       # chat_id تبع الزبون الأصلي (Business)
+#   "product": str | None,
+#   "payments": list[tuple[str, int]],  # [(طريقة الدفع، المبلغ), ...]
+#   "pending_method": str | None,       # طريقة دفع اخترناها وننتظر مبلغها
+#   "pending_amount": int,              # المبلغ المتراكم بالضغط قبل التثبيت
+#   "awaiting_manual_amount": bool,     # ننتظر رقم يدوي مكتوب كرسالة نصية
+# }
+# ------------------------------------------------------------------
+_pending_payments: dict[int, dict] = {}
+
+
+# ------------------------------------------------------------------
 # نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط. الأساس هو
 # مطابقة الكلمات المفتاحية مباشرة (بدون ذكاء اصطناعي) — نفس الأسلوب
 # الموثوق اللي كان يشتغل بالنظام القديم. كل عنصر: (اسم الفئة، قائمة
@@ -98,7 +161,7 @@ FAQ_RULES = [
     (
         "سلام",
         [
-            "السلام عليكم", "سلام عليكم", "سلام", "السلام", "سلامو عليكم", "سلامة عليكم",
+            "السلام عليكم", "سلام عليكم", "سلامو عليكم", "سلامة عليكم",
             "السلام عليكم ورحمة الله", "assalamu alaikum", "salam alaikum",
         ],
         "وعليكم السلام ورحمة الله وبركاته اهلا وسهلا",
@@ -139,7 +202,7 @@ FAQ_RULES = [
         "طرق_الدفع",
         [
             "طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع", "وين ادفع",
-            "شلون الدفع", "طرق التسديد", "ماستر", "احولك", "احول", "كيفية الدفع", "شنو طرق الدفع",
+            "شلون الدفع", "طرق التسديد", "كيفية الدفع", "شنو طرق الدفع",
             "زين كاش", "سوبر كي", "زد كاش",
         ],
         "طرق الدفع\n"
@@ -212,6 +275,191 @@ CODE_REQUEST_KEYWORDS = [
 ]
 
 CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تلقائياً بعد هالمدة
+
+# ------------------------------------------------------------------
+# ميزة تسجيل الدفع بـ Google Sheet — قوائم المنتجات وطرق الدفع الثابتة
+# اللي تظهر كأزرار وقت تأكيد عملية دفع. القائمة مبنية على منتجات
+# FAQ_RULES + رصيد، والمنتج/الطريقة الأولى بكل قائمة هي "الاختيار
+# السريع" (الأكثر استخداماً) اللي يطلع كزر مباشر بدون فتح قائمة.
+# ------------------------------------------------------------------
+PAYMENT_PRODUCTS = ["جات", "انكي", "كانفا", "فرينوت", "گودنوت", "تليجرام مميز"]
+PAYMENT_METHODS = ["ماستر", "زين كاش", "رصيد اثير", "رصيد اسيا"]
+
+PAYMENT_AMOUNT_STEP_SMALL = 1000
+PAYMENT_AMOUNT_STEP_LARGE = 5000
+
+
+def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
+    """أول زرين يطلعون تحت صورة دفع جديدة توصل من زبون."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تأكيد", callback_data="pay_confirm"),
+            InlineKeyboardButton("❌ إلغاء", callback_data="pay_cancel"),
+        ]
+    ])
+
+
+def build_product_keyboard() -> InlineKeyboardMarkup:
+    """أول شاشة بعد التأكيد — اختيار سريع لأكثر منتج مبيع + بقية المنتجات."""
+    quick_pick = PAYMENT_PRODUCTS[0]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(quick_pick, callback_data=f"pay_product_{quick_pick}")],
+        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")],
+    ])
+
+
+def build_product_list_keyboard() -> InlineKeyboardMarkup:
+    """قائمة كل المنتجات ما عدا الاختيار السريع (اللي طلع بالشاشة السابقة)."""
+    rows = [
+        [InlineKeyboardButton(p, callback_data=f"pay_product_{p}")]
+        for p in PAYMENT_PRODUCTS[1:]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_method_list_keyboard() -> InlineKeyboardMarkup:
+    """قائمة كل طرق الدفع ما عدا الاختيار السريع."""
+    rows = [
+        [InlineKeyboardButton(m, callback_data=f"pay_method_{m}")]
+        for m in PAYMENT_METHODS[1:]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def build_amount_keyboard() -> InlineKeyboardMarkup:
+    """شاشة تحديد مبلغ طريقة الدفع المختارة — أزرار تراكمية + إدخال يدوي + تثبيت المبلغ."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="pay_amount_add_small"),
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_LARGE}", callback_data="pay_amount_add_large"),
+        ],
+        [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="pay_amount_manual")],
+        [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="pay_amount_commit")],
+    ])
+
+
+def build_summary_keyboard(has_product: bool, has_payment: bool) -> InlineKeyboardMarkup:
+    """
+    الشاشة الرئيسية بعد ما فيه منتج أو طريقة دفع واحدة محفوظة على الأقل —
+    زر المرحلة الحالية (منتج أو طريقة دفع جديدة) + زر التثبيت النهائي دايماً.
+    """
+    rows = []
+    if not has_product:
+        rows.append([InlineKeyboardButton(PAYMENT_PRODUCTS[0], callback_data=f"pay_product_{PAYMENT_PRODUCTS[0]}")])
+        rows.append([InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")])
+    else:
+        rows.append([InlineKeyboardButton(PAYMENT_METHODS[0], callback_data=f"pay_method_{PAYMENT_METHODS[0]}")])
+        rows.append([InlineKeyboardButton("بقية الطرق ▾", callback_data="pay_method_list")])
+    rows.append([InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_payment_summary(state: dict) -> str:
+    """يبني نص الملخص المعروض فوق الأزرار أثناء تسجيل الدفع."""
+    lines = ["تسجيل عملية دفع"]
+    customer_line = state["customer_name"]
+    if state.get("customer_username"):
+        customer_line += f" (@{state['customer_username']})"
+    lines.append(f"الزبون: {customer_line}")
+
+    product = state.get("product")
+    lines.append(f"المنتج: {product if product else '— لم يُختر بعد —'}")
+
+    payments = state.get("payments", [])
+    if payments:
+        payments_text = " + ".join(f"{method} {amount}" for method, amount in payments)
+        total = sum(amount for _, amount in payments)
+        lines.append(f"طرق الدفع: {payments_text}")
+        lines.append(f"المجموع الكلي: {total}")
+    else:
+        lines.append("طرق الدفع: — لم تُضف بعد —")
+
+    return "\n".join(lines)
+
+
+def append_payment_row(state: dict) -> bool:
+    """
+    يضيف سطر جديد بـ Google Sheet لعملية دفع مكتملة. يرجع True لو نجح
+    الحفظ، False لو فشل (مشكلة اتصال، صلاحيات، إلخ) — الاستدعاء المسؤول
+    يتعامل مع الفشل بتنبيه الأونر بدل ما يفترض النجاح.
+    """
+    sheet = get_google_sheet()
+    if sheet is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    date_time_str = now.strftime("%Y-%m-%d %H:%M")
+
+    payments = state.get("payments", [])
+    total = sum(amount for _, amount in payments)
+    payments_text = " + ".join(f"{method} {amount}" for method, amount in payments)
+
+    customer_line = state["customer_name"]
+    if state.get("customer_username"):
+        customer_line += f" (@{state['customer_username']})"
+
+    row = [date_time_str, total, payments_text, state.get("product") or "", customer_line]
+
+    try:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        logger.exception("Failed to append payment row to Google Sheet")
+        return False
+
+
+def calculate_income_report() -> str:
+    """
+    يقرأ كل صفوف الشيت ويحسب دخل اليوم، الأسبوع الحالي، والشهر الحالي.
+    يرجع نص جاهز للعرض، أو رسالة خطأ واضحة لو فشل الاتصال بالشيت.
+    """
+    sheet = get_google_sheet()
+    if sheet is None:
+        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
+
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read rows from Google Sheet for income report")
+        return "صار خطأ أثناء قراءة الشيت — حاول مرة ثانية بعد شوي."
+
+    if len(rows) <= 1:
+        return "ماكو أي عمليات دفع مسجلة لحد الحين."
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    week_start = today - timedelta(days=today.weekday())  # الاثنين هو بداية الأسبوع
+    month_start = today.replace(day=1)
+
+    total_today = 0
+    total_week = 0
+    total_month = 0
+
+    # نتجاوز صف العناوين (index 0)
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+        date_str, amount_str = row[0], row[1]
+        try:
+            row_date = datetime.strptime(date_str.split(" ")[0], "%Y-%m-%d").date()
+            amount = int(float(amount_str))
+        except (ValueError, IndexError):
+            continue  # صف فيه بيانات غير متوقعة — نتجاهله بدل ما نكرش
+
+        if row_date == today:
+            total_today += amount
+        if row_date >= week_start:
+            total_week += amount
+        if row_date >= month_start:
+            total_month += amount
+
+    return (
+        "تقرير الدخل\n\n"
+        f"اليوم: {total_today}\n"
+        f"هذا الأسبوع: {total_week}\n"
+        f"هذا الشهر: {total_month}"
+    )
+
 
 # ------------------------------------------------------------------
 # طبقة الذكاء الاصطناعي — محدودة جداً ومستخدمة بس بحالة وحدة:
@@ -641,21 +889,260 @@ async def notify_owner(
         logger.exception("Failed to notify owner")
 
 
+async def handle_incoming_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, bm) -> None:
+    """
+    توصل صورة دفع من زبون بمحادثة Business — نحولها لمحادثتك الخاصة
+    مع البوت (مو Business) مع زرين: تأكيد/إلغاء، ونحفظ بيانات الزبون
+    بحالة مؤقتة عشان نربطها لاحقاً بعملية التسجيل.
+    """
+    customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
+    customer_username = bm.chat.username
+    customer_chat_id = bm.chat.id
+
+    try:
+        sent = await context.bot.send_photo(
+            chat_id=OWNER_USER_ID,
+            photo=bm.photo[-1].file_id,  # أعلى دقة متوفرة
+            caption=f"صورة دفع من: {customer_name}" + (f" (@{customer_username})" if customer_username else ""),
+            reply_markup=build_confirm_cancel_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to forward payment photo to owner")
+        return
+
+    _pending_payments[sent.message_id] = {
+        "customer_name": customer_name,
+        "customer_username": customer_username,
+        "customer_chat_id": customer_chat_id,
+        "product": None,
+        "payments": [],
+        "pending_method": None,
+        "pending_amount": 0,
+        "awaiting_manual_amount": False,
+    }
+
+
+async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يعالج كل ضغطات الأزرار بمحادثتك الخاصة مع البوت لتسجيل عملية دفع —
+    من التأكيد الأولي، اختيار المنتج وطريقة الدفع، تحديد المبلغ،
+    ولين التثبيت النهائي وحفظ السطر بالشيت.
+    """
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    message_id = query.message.message_id
+    state = _pending_payments.get(message_id)
+
+    if state is None:
+        await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
+        return
+
+    data = query.data
+    await query.answer()
+
+    # -------------------- إلغاء --------------------
+    if data == "pay_cancel":
+        del _pending_payments[message_id]
+        try:
+            await query.message.delete()
+        except Exception:
+            logger.exception("Failed to delete cancelled payment photo message")
+        return
+
+    # -------------------- تأكيد أولي: يفتح شاشة اختيار المنتج --------------------
+    if data == "pay_confirm":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_product_keyboard(),
+        )
+        return
+
+    # -------------------- اختيار منتج مباشر (سريع أو من القائمة) --------------------
+    if data.startswith("pay_product_") and data != "pay_product_list":
+        product = data[len("pay_product_"):]
+        state["product"] = product
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(has_product=True, has_payment=bool(state["payments"])),
+        )
+        return
+
+    # -------------------- فتح قائمة بقية المنتجات --------------------
+    if data == "pay_product_list":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_product_list_keyboard(),
+        )
+        return
+
+    # -------------------- اختيار طريقة دفع مباشرة (سريعة أو من القائمة) --------------------
+    if data.startswith("pay_method_") and data != "pay_method_list":
+        method = data[len("pay_method_"):]
+        state["pending_method"] = method
+        state["pending_amount"] = 0
+        await query.edit_message_caption(
+            caption=format_payment_summary(state) + f"\n\nطريقة الدفع المختارة: {method}\nحدد المبلغ:",
+            reply_markup=build_amount_keyboard(),
+        )
+        return
+
+    # -------------------- فتح قائمة بقية طرق الدفع --------------------
+    if data == "pay_method_list":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_method_list_keyboard(),
+        )
+        return
+
+    # -------------------- زيادة المبلغ المتراكم --------------------
+    if data == "pay_amount_add_small":
+        state["pending_amount"] += PAYMENT_AMOUNT_STEP_SMALL
+        await query.edit_message_caption(
+            caption=format_payment_summary(state)
+            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {state['pending_amount']}",
+            reply_markup=build_amount_keyboard(),
+        )
+        return
+
+    if data == "pay_amount_add_large":
+        state["pending_amount"] += PAYMENT_AMOUNT_STEP_LARGE
+        await query.edit_message_caption(
+            caption=format_payment_summary(state)
+            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {state['pending_amount']}",
+            reply_markup=build_amount_keyboard(),
+        )
+        return
+
+    # -------------------- طلب إدخال يدوي (ينتظر رسالة نصية جاية) --------------------
+    if data == "pay_amount_manual":
+        state["awaiting_manual_amount"] = True
+        await query.edit_message_caption(
+            caption=format_payment_summary(state)
+            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
+        )
+        return
+
+    # -------------------- تثبيت المبلغ لهذي الطريقة --------------------
+    if data == "pay_amount_commit":
+        method = state.get("pending_method")
+        amount = state.get("pending_amount", 0)
+        if method and amount > 0:
+            state["payments"].append((method, amount))
+        state["pending_method"] = None
+        state["pending_amount"] = 0
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(has_product=bool(state["product"]), has_payment=True),
+        )
+        return
+
+    # -------------------- تثبيت العملية بالكامل وحفظها بالشيت --------------------
+    if data == "pay_finalize":
+        if not state["product"] or not state["payments"]:
+            await query.answer("لازم تختار منتج وطريقة دفع وحدة على الأقل قبل التثبيت.", show_alert=True)
+            return
+
+        saved = append_payment_row(state)
+        del _pending_payments[message_id]
+
+        if saved:
+            final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح."
+        else:
+            final_text = format_payment_summary(state) + "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
+
+        try:
+            await query.edit_message_caption(caption=final_text, reply_markup=None)
+        except Exception:
+            logger.exception("Failed to update final payment confirmation message")
+        return
+
+
+async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
+    البوت ينتظر إدخال مبلغ يدوي لعملية دفع جارية (رد على رسالة الصورة).
+    يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
+    """
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+
+    replied_id = message.reply_to_message.message_id
+    state = _pending_payments.get(replied_id)
+    if state is None or not state.get("awaiting_manual_amount"):
+        return False
+
+    try:
+        amount = int(re.sub(r"[^\d]", "", message.text))
+    except ValueError:
+        await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
+        return True
+
+    if amount <= 0:
+        await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
+        return True
+
+    state["pending_amount"] = amount
+    state["awaiting_manual_amount"] = False
+
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=OWNER_USER_ID,
+            message_id=replied_id,
+            caption=format_payment_summary(state)
+            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {amount}",
+            reply_markup=build_amount_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to update caption after manual amount entry")
+
+    return True
+
+
+async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
+    مع البوت — حالياً بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع.
+    """
+    await handle_manual_amount_entry(update, context)
+
+
+async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أمر /دخل — يعرض تقرير الدخل (اليوم/الأسبوع/الشهر) من Google Sheet."""
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    report = calculate_income_report()
+    await update.message.reply_text(report)
+
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل الرسائل الجاية عن طريق Telegram Business (محادثتك الشخصية)."""
     bm = update.business_message
-    if not bm or not bm.text:
+    if not bm:
+        return
+
+    sender_id = bm.from_user.id if bm.from_user else None
+    is_from_owner = sender_id == OWNER_USER_ID
+
+    # صورة دفع جاية من الزبون (مو منك) — نحولها لمحادثتك الخاصة مع
+    # البوت مع أزرار تأكيد/إلغاء عشان تبدأ تسجيل عملية الدفع
+    if bm.photo and not is_from_owner:
+        await handle_incoming_payment_photo(update, context, bm)
+        return
+
+    if not bm.text:
         return
 
     chat_id = bm.chat.id
     text = bm.text
-    sender_id = bm.from_user.id if bm.from_user else None
 
     # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
-
-    is_from_owner = sender_id == OWNER_USER_ID
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة
     if is_from_owner:
@@ -772,11 +1259,28 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # فقط تحديثات business_message — نستثني الرسائل العادية بالكامل
+    # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
+    # Telegram Business، وهي أساس عمل البوت
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
 
+    # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
+    app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
+
+    # أمر /دخل لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
+    app.add_handler(CommandHandler("دخل", cmd_income_report))
+    app.add_handler(CommandHandler("income", cmd_income_report))
+
+    # رسائل نصية عادية منك بمحادثتك الخاصة مع البوت — تستخدم حالياً
+    # بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع (رد على رسالة الصورة)
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & filters.User(OWNER_USER_ID),
+            on_owner_private_message,
+        )
+    )
+
     app.run_polling(
-        allowed_updates=["business_message", "business_connection", "edited_business_message"]
+        allowed_updates=["business_message", "business_connection", "edited_business_message", "callback_query", "message"]
     )
 
 
