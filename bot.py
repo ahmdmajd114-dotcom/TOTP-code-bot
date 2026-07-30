@@ -150,6 +150,14 @@ def should_send_faq_reply(chat_id: int, category: str) -> bool:
 _pending_payments: dict[int, dict] = {}
 
 # ------------------------------------------------------------------
+# سجل خفيف لعمليات الدفع المكتملة (بعد pay_finalize) — يبقى موجود
+# حتى بعد ما تنمحى الحالة الكاملة من _pending_payments، عشان لو رديت
+# على رسالة "تم الحفظ بنجاح" بإيميل أو كلمة "خاص"، نعرف مين الزبون
+# وشنو منتجه. المفتاح message_id لنفس رسالة التأكيد النهائي.
+# ------------------------------------------------------------------
+_completed_payments: dict[int, dict] = {}
+
+# ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
 # متكرر من زبون يرسل سكرين شوت كثير لنفس عملية الدفع. المفتاح هو
 # customer_chat_id، والقيمة قائمة بأوقات وصول الصور المقبولة (تلقائياً
@@ -314,7 +322,7 @@ CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تل�
 # FAQ_RULES + رصيد، والمنتج/الطريقة الأولى بكل قائمة هي "الاختيار
 # السريع" (الأكثر استخداماً) اللي يطلع كزر مباشر بدون فتح قائمة.
 # ------------------------------------------------------------------
-PAYMENT_PRODUCTS = ["جات", "انكي", "كانفا", "فرينوت", "گودنوت", "تليجرام مميز"]
+PAYMENT_PRODUCTS = ["جات", "انكي", "كانفا", "فرينوت", "گودنوت", "تليجرام مميز", "امبوس"]
 PAYMENT_METHODS = ["ماستر", "زين كاش", "رصيد اثير", "رصيد اسيا"]
 
 PAYMENT_AMOUNT_STEP_SMALL = 1000
@@ -409,11 +417,80 @@ def format_payment_summary(state: dict) -> str:
     return "\n".join(lines)
 
 
+SHEET_COL_DATE = 1
+SHEET_COL_TOTAL = 2
+SHEET_COL_PAYMENTS = 3
+SHEET_COL_PRODUCT = 4
+SHEET_COL_CUSTOMER = 5
+SHEET_COL_CHATGPT_ACCOUNT = 6
+SHEET_COL_CHAT_ID = 7
+
+CHATGPT_PRODUCT_NAME = "جات"
+CHATGPT_ROW_MATCH_WINDOW_DAYS = 7
+
+
+def format_customer_line(customer_name: str, customer_username: str | None) -> str:
+    line = customer_name
+    if customer_username:
+        line += f" (@{customer_username})"
+    return line
+
+
+def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
+    """
+    يدور عن آخر سطر بالشيت لنفس chat_id، شرط المنتج = جات، خلال آخر
+    أسبوع، وفيه خانة مهمة فاضية (مبلغ/طرق الدفع/حسابات جات). يرجع رقم
+    الصف (1-indexed كما تتوقعه gspread) لو لقى، أو None لو لازم سطر جديد.
+    """
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read rows while searching for completable ChatGPT row")
+        return None
+
+    if len(rows) <= 1:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=CHATGPT_ROW_MATCH_WINDOW_DAYS)
+    chat_id_str = str(chat_id)
+
+    # نفحص من الأسفل للأعلى (الأحدث أول) عشان نلقى أقرب سطر مطابق بسرعة
+    for i in range(len(rows) - 1, 0, -1):  # نتجاوز صف العناوين (index 0)
+        row = rows[i]
+        if len(row) < SHEET_COL_CHAT_ID:
+            continue
+
+        row_chat_id = row[SHEET_COL_CHAT_ID - 1].strip()
+        row_product = row[SHEET_COL_PRODUCT - 1].strip()
+
+        if row_chat_id != chat_id_str or row_product != CHATGPT_PRODUCT_NAME:
+            continue
+
+        try:
+            row_date = datetime.strptime(row[SHEET_COL_DATE - 1].split(" ")[0], "%Y-%m-%d")
+            row_date = row_date.replace(tzinfo=timezone.utc)
+        except (ValueError, IndexError):
+            continue
+
+        if row_date < cutoff:
+            break  # وصلنا لصفوف أقدم من أسبوع، ما فيه فايدة نكمل الفحص
+
+        total_empty = not row[SHEET_COL_TOTAL - 1].strip() if len(row) >= SHEET_COL_TOTAL else True
+        payments_empty = not row[SHEET_COL_PAYMENTS - 1].strip() if len(row) >= SHEET_COL_PAYMENTS else True
+        account_empty = not row[SHEET_COL_CHATGPT_ACCOUNT - 1].strip() if len(row) >= SHEET_COL_CHATGPT_ACCOUNT else True
+
+        if total_empty or payments_empty or account_empty:
+            return i + 1  # gspread صفوف 1-indexed
+
+    return None
+
+
 def append_payment_row(state: dict) -> bool:
     """
-    يضيف سطر جديد بـ Google Sheet لعملية دفع مكتملة. يرجع True لو نجح
-    الحفظ، False لو فشل (مشكلة اتصال، صلاحيات، إلخ) — الاستدعاء المسؤول
-    يتعامل مع الفشل بتنبيه الأونر بدل ما يفترض النجاح.
+    يضيف سطر جديد بـ Google Sheet لعملية دفع مكتملة، أو يكمل سطر ناقص
+    موجود لنفس الزبون لو المنتج جات (خلال آخر أسبوع). يرجع True لو نجح
+    الحفظ، False لو فشل — الاستدعاء المسؤول يتعامل مع الفشل بتنبيه
+    الأونر بدل ما يفترض النجاح.
     """
     sheet = get_google_sheet()
     if sheet is None:
@@ -426,17 +503,71 @@ def append_payment_row(state: dict) -> bool:
     total = sum(amount for _, amount in payments)
     payments_text = " + ".join(f"{method} {amount}" for method, amount in payments)
 
-    customer_line = state["customer_name"]
-    if state.get("customer_username"):
-        customer_line += f" (@{state['customer_username']})"
-
-    row = [date_time_str, total, payments_text, state.get("product") or "", customer_line]
+    customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
+    product = state.get("product") or ""
+    chat_id = state.get("customer_chat_id")
 
     try:
-        sheet.append_row(row, value_input_option="USER_ENTERED")
+        target_row = None
+        if product == CHATGPT_PRODUCT_NAME and chat_id is not None:
+            target_row = find_completable_chatgpt_row(sheet, chat_id)
+
+        if target_row is not None:
+            # نكمل السطر الناقص — نعبي بس الخانات الفاضية (مبلغ/طرق الدفع)
+            sheet.update_cell(target_row, SHEET_COL_TOTAL, total)
+            sheet.update_cell(target_row, SHEET_COL_PAYMENTS, payments_text)
+        else:
+            row = [
+                date_time_str,
+                total,
+                payments_text,
+                product,
+                customer_line,
+                "",  # حسابات جات — تُعبى لاحقاً عن طريق accept/link
+                str(chat_id) if chat_id is not None else "",
+            ]
+            sheet.append_row(row, value_input_option="USER_ENTERED")
         return True
     except Exception:
-        logger.exception("Failed to append payment row to Google Sheet")
+        logger.exception("Failed to append/update payment row in Google Sheet")
+        return False
+
+
+def upsert_chatgpt_account(
+    chat_id: int, customer_name: str, customer_username: str | None, account_text: str
+) -> bool:
+    """
+    يسجل معلومة حساب ChatGPT (إيميل أو 'خاص') لزبون معين — يكمل سطر
+    ناقص موجود (خلال آخر أسبوع، منتجه جات) لو لقى، وإلا يفتح سطر جديد
+    مستقل (التاريخ + بيانات الزبون + عمود حسابات جات، الباقي فاضي).
+    """
+    sheet = get_google_sheet()
+    if sheet is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    date_time_str = now.strftime("%Y-%m-%d %H:%M")
+    customer_line = format_customer_line(customer_name, customer_username)
+
+    try:
+        target_row = find_completable_chatgpt_row(sheet, chat_id)
+
+        if target_row is not None:
+            sheet.update_cell(target_row, SHEET_COL_CHATGPT_ACCOUNT, account_text)
+        else:
+            row = [
+                date_time_str,
+                "",  # المبلغ الكلي — يُعبى لاحقاً عند تسجيل الدفع
+                "",  # طرق الدفع — نفس الشي
+                CHATGPT_PRODUCT_NAME,
+                customer_line,
+                account_text,
+                str(chat_id),
+            ]
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        logger.exception("Failed to upsert ChatGPT account info in Google Sheet")
         return False
 
 
@@ -890,9 +1021,18 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             {"chat_id": chat_id, "account_id": account_id}
         ).execute()
 
+        # لو اللابل يشبه إيميل، نعتبره حساب ChatGPT مشترك ونسجله بالشيت
+        # (يكمل سطر ناقص لنفس الزبون لو موجود، وإلا يفتح سطر جديد)
+        sheet_note = ""
+        if bm is not None and "@" in label and "." in label:
+            customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
+            customer_username = bm.chat.username
+            saved = upsert_chatgpt_account(chat_id, customer_name, customer_username, label)
+            sheet_note = "\n✅ تم تسجيل الحساب بالشيت." if saved else "\n⚠️ فشل تسجيل الحساب بالشيت."
+
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
-            text=f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).",
+            text=f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}",
         )
         return True
 
@@ -1104,6 +1244,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             return
 
         saved = append_payment_row(state)
+
+        # نحفظ نسخة خفيفة من بيانات الزبون بعد التثبيت — عشان نقدر نربطها
+        # لاحقاً لو رديت على رسالة التأكيد بإيميل/خاص (حساب ChatGPT خاص)
+        _completed_payments[message_id] = {
+            "customer_name": state["customer_name"],
+            "customer_username": state.get("customer_username"),
+            "customer_chat_id": state.get("customer_chat_id"),
+            "product": state["product"],
+        }
         del _pending_payments[message_id]
 
         if saved:
@@ -1160,12 +1309,62 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
     return True
 
 
+async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رد منك (owner) على رسالة "تم الحفظ بنجاح" لعملية دفع منتجها
+    جات — لو رديت بإيميل يسجله بعمود حسابات جات، لو رديت بكلمة "خاص"
+    يسجل "خاص" بنفس العمود. يشتغل بس لو المنتج جات، يرجع True لو عالج
+    الرسالة (حتى لو رفضها لسبب ما)، False لو ما تنطبق الشروط إطلاقاً.
+    """
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+
+    replied_id = message.reply_to_message.message_id
+    completed = _completed_payments.get(replied_id)
+    if completed is None:
+        return False
+
+    if completed.get("product") != CHATGPT_PRODUCT_NAME:
+        return False  # هذا الرد على عملية دفع منتج ثاني، مو جات — نتجاهل بصمت
+
+    text = message.text.strip()
+    is_private_only = text.lower() in ("خاص", "private")
+
+    if is_private_only:
+        account_text = "خاص"
+    elif "@" in text and "." in text:
+        account_text = f"خاص - {text}"
+    else:
+        await message.reply_text("الرجاء الرد بإيميل صحيح، أو كتابة كلمة 'خاص' فقط.")
+        return True
+
+    chat_id = completed.get("customer_chat_id")
+    if chat_id is None:
+        await message.reply_text("⚠️ ما لكيت بيانات الزبون لهذي العملية.")
+        return True
+
+    saved = upsert_chatgpt_account(
+        chat_id, completed["customer_name"], completed.get("customer_username"), account_text
+    )
+
+    if saved:
+        await message.reply_text("✅ تم تسجيل معلومة الحساب بالشيت.")
+    else:
+        await message.reply_text("⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً.")
+
+    return True
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
-    مع البوت — حالياً بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع.
+    مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، أو تسجيل حساب ChatGPT
+    خاص عن طريق الرد على رسالة تأكيد دفع مكتملة.
     """
-    await handle_manual_amount_entry(update, context)
+    if await handle_manual_amount_entry(update, context):
+        return
+    await handle_chatgpt_account_reply(update, context)
 
 
 async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
