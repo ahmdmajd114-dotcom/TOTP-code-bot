@@ -149,6 +149,38 @@ def should_send_faq_reply(chat_id: int, category: str) -> bool:
 # ------------------------------------------------------------------
 _pending_payments: dict[int, dict] = {}
 
+# ------------------------------------------------------------------
+# حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
+# متكرر من زبون يرسل سكرين شوت كثير لنفس عملية الدفع. المفتاح هو
+# customer_chat_id، والقيمة قائمة بأوقات وصول الصور المقبولة (تلقائياً
+# فقط، مو صور accept اليدوي) خلال النافذة الحالية.
+# ------------------------------------------------------------------
+PHOTO_RATE_LIMIT_MAX = 3
+PHOTO_RATE_LIMIT_WINDOW_HOURS = 6
+_photo_timestamps: dict[int, list[datetime]] = {}
+
+
+def is_photo_within_rate_limit(customer_chat_id: int) -> bool:
+    """
+    يتحقق هل هذي الصورة ضمن حد 3 صور/6 ساعات لهذا الزبون. لو نعم،
+    يسجل وقت وصولها ويرجع True (نحول الصورة عادي). لو تجاوز الحد،
+    يرجع False بدون ما يسجل شي (الصورة تتجاهل بالكامل).
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=PHOTO_RATE_LIMIT_WINDOW_HOURS)
+
+    timestamps = _photo_timestamps.get(customer_chat_id, [])
+    # نشيل أي وقت أقدم من النافذة الحالية (منتهي الصلاحية)
+    timestamps = [t for t in timestamps if t > cutoff]
+
+    if len(timestamps) >= PHOTO_RATE_LIMIT_MAX:
+        _photo_timestamps[customer_chat_id] = timestamps  # نحدث القائمة المصفاة حتى لو رفضنا
+        return False
+
+    timestamps.append(now)
+    _photo_timestamps[customer_chat_id] = timestamps
+    return True
+
 
 # ------------------------------------------------------------------
 # نظام الردود التلقائية (FAQ) — لكل الزبائن بدون شرط ربط. الأساس هو
@@ -798,8 +830,21 @@ async def human_like_reply_sequence(
     await _show_typing(context, chat_id, business_connection_id, TYPING_DURATION_SECONDS)
 
 
-async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> bool:
-    """يعالج أوامر الأونر: /addaccount و /link. يرجع True اذا كانت الرسالة أمر تم التعامل معه."""
+async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
+    """يعالج أوامر الأونر: /addaccount، /link، /resetcode، وaccept. يرجع True اذا كانت الرسالة أمر تم التعامل معه."""
+
+    # accept — رد على صورة دفع معينة من الزبون (بمحادثتك Business وياه)
+    # عشان تحولها لمحادثتك مع البوت، حتى لو تجاوزت حد 3 صور/6 ساعات
+    if text.strip().lower() == "accept":
+        if bm is not None and bm.reply_to_message and bm.reply_to_message.photo:
+            await handle_incoming_payment_photo(update, context, bm.reply_to_message, bypass_rate_limit=True)
+            await context.bot.send_message(chat_id=OWNER_USER_ID, text="✅ تم تحويل الصورة.")
+        else:
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text="⚠️ لازم ترد على رسالة الصورة نفسها وتكتب accept.",
+            )
+        return True
 
     # /addaccount <link_code> <secret> [label]
     add_match = ADD_PATTERN.match(text.strip())
@@ -889,15 +934,27 @@ async def notify_owner(
         logger.exception("Failed to notify owner")
 
 
-async def handle_incoming_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, bm) -> None:
+async def handle_incoming_payment_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, bm, bypass_rate_limit: bool = False
+) -> None:
     """
     توصل صورة دفع من زبون بمحادثة Business — نحولها لمحادثتك الخاصة
     مع البوت (مو Business) مع زرين: تأكيد/إلغاء، ونحفظ بيانات الزبون
     بحالة مؤقتة عشان نربطها لاحقاً بعملية التسجيل.
+
+    محدودة بـ 3 صور/6 ساعات لكل زبون — أي صورة تتجاوز الحد تُتجاهل
+    بالكامل (بدون تحويل وبدون حفظ)، وتقدر تحول أي وحدة منهن يدوياً
+    بالرد عليها بكلمة accept بمحادثتك مع الزبون (Business) —
+    bypass_rate_limit=True تُستخدم بالضبط بهذي الحالة لتخطي الحد.
     """
+    customer_chat_id = bm.chat.id
+
+    if not bypass_rate_limit and not is_photo_within_rate_limit(customer_chat_id):
+        logger.info(f"Photo from chat_id={customer_chat_id} ignored — exceeded rate limit")
+        return
+
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
-    customer_chat_id = bm.chat.id
 
     try:
         sent = await context.bot.send_photo(
@@ -1144,9 +1201,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
 
-    # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة
+    # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
-        handled = await handle_owner_command(update, context, chat_id, text)
+        handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
         if handled:
             return
         return
