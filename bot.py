@@ -1266,8 +1266,8 @@ def main() -> None:
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
 
-    # أمر /دخل لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
-    app.add_handler(CommandHandler("دخل", cmd_income_report))
+    # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
+    # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
 
     # رسائل نصية عادية منك بمحادثتك الخاصة مع البوت — تستخدم حالياً
