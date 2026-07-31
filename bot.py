@@ -1952,6 +1952,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 
+async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يلتقط رد منك (owner) على رسالة "تم الحفظ بنجاح" لعملية دفع منتجها
     جات — لو رديت بإيميل يسجله بعمود حسابات جات، لو رديت بكلمة "خاص"
