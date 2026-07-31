@@ -271,7 +271,7 @@ FAQ_RULES = [
     (
         "ترحيب",
         [
-            "هلا", "مرحبا", "مرحبتين", "هاي", "هلو", "hi", "hello", "hey",
+            "هلا", "مرحبا", "مرحبتين", "هلو", "hi", "hello", "hey",
             "هلابيك", "هلا بيك", "صباح الخير", "مساء الخير", "شلونك",
             "شلونكم", "اهلين", "مرحب",
         ],
@@ -305,7 +305,7 @@ FAQ_RULES = [
         [
             "طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع", "وين ادفع",
             "شلون الدفع", "طرق التسديد", "كيفية الدفع", "شنو طرق الدفع",
-            "زين كاش", "سوبر كي", "زد كاش",
+            "زين كاش", "سوبر كي", "زد كاش", "اريد ادفع", "ادفع", "ماستر",
         ],
         "طرق الدفع\n"
         "رقم زين كاش التالي\n"
@@ -1418,6 +1418,48 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception("Failed to update final payment confirmation message")
         return
+
+
+async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
+    البوت ينتظر إدخال مبلغ يدوي لعملية دفع جارية (رد على رسالة الصورة).
+    يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
+    """
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+
+    replied_id = message.reply_to_message.message_id
+    state = _pending_payments.get(replied_id)
+    if state is None or not state.get("awaiting_manual_amount"):
+        return False
+
+    try:
+        amount = int(re.sub(r"[^\d]", "", message.text))
+    except ValueError:
+        await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
+        return True
+
+    if amount <= 0:
+        await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
+        return True
+
+    state["pending_amount"] = amount
+    state["awaiting_manual_amount"] = False
+
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=OWNER_USER_ID,
+            message_id=replied_id,
+            caption=format_payment_summary(state)
+            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {amount}",
+            reply_markup=build_amount_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to update caption after manual amount entry")
+
+    return True
 
 
 async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
