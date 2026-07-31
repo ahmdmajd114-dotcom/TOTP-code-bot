@@ -220,6 +220,11 @@ _pending_expense: dict | None = None
 _pending_add_account: dict | None = None
 
 # ------------------------------------------------------------------
+# حالة مؤقتة لانتظار إدخال تاريخ يدوي بشاشة الإحصائيات — {message_id, next_action}
+# ------------------------------------------------------------------
+_pending_stats_period: dict | None = None
+
+# ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
 # متكرر من زبون يرسل سكرين شوت كثير لنفس عملية الدفع. المفتاح هو
 # customer_chat_id، والقيمة قائمة بأوقات وصول الصور المقبولة (تلقائياً
@@ -397,10 +402,14 @@ EXPENSES_WORKSHEET_NAME = "ورقة المصروفات"
 BTN_EXPENSE = "💸 تسجيل مصروف"
 BTN_INCOME = "📊 تقرير الدخل"
 BTN_ADD_ACCOUNT = "➕ إضافة حساب"
+BTN_STATS = "📈 إحصائيات"
 BTN_BACK = "◀️ رجوع"
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME), KeyboardButton(BTN_ADD_ACCOUNT)]],
+    [
+        [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
+        [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
+    ],
     resize_keyboard=True,
 )
 
@@ -759,6 +768,303 @@ def calculate_income_report() -> str:
         f"هذا الأسبوع: {total_week}\n"
         f"هذا الشهر: {total_month}"
     )
+
+
+# ------------------------------------------------------------------
+# طبقة الإحصائيات الشاملة — تدعم فترات مرنة (اليوم/الأسبوع/الشهر/كل
+# الوقت/تاريخ محدد يدوي)، تفصيل حسب المنتج، وإحصائيات حسابات ChatGPT.
+# ------------------------------------------------------------------
+
+def parse_stats_period(period_key: str) -> tuple[object, object] | None:
+    """
+    يحول مفتاح فترة (جاهز أو نص يدوي) إلى (start_date, end_date) شامل
+    الطرفين. يرجع None لو الفترة "كل الوقت" (بدون حدود)، أو يرمي
+    ValueError لو نص يدوي غير مفهوم.
+    """
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    if period_key == "today":
+        return today, today
+    if period_key == "week":
+        week_start = today - timedelta(days=today.weekday())
+        return week_start, today
+    if period_key == "month":
+        month_start = today.replace(day=1)
+        return month_start, today
+    if period_key == "all":
+        return None
+
+    # نص يدوي: YYYY-MM-DD (يوم محدد) أو YYYY-MM (شهر محدد)
+    if len(period_key) == 10:
+        d = datetime.strptime(period_key, "%Y-%m-%d").date()
+        return d, d
+    if len(period_key) == 7:
+        d = datetime.strptime(period_key + "-01", "%Y-%m-%d").date()
+        if d.month == 12:
+            next_month = d.replace(year=d.year + 1, month=1)
+        else:
+            next_month = d.replace(month=d.month + 1)
+        month_end = next_month - timedelta(days=1)
+        return d, month_end
+
+    raise ValueError(f"Unrecognized period format: {period_key!r}")
+
+
+def get_payment_rows_in_period(period_key: str) -> list[list[str]] | None:
+    """
+    يرجع كل صفوف الدفعات (بدون صف العناوين) اللي تقع بالفترة المحددة.
+    يرجع None لو فشل الاتصال بالشيت.
+    """
+    sheet = get_google_sheet()
+    if sheet is None:
+        return None
+
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read payment rows for stats")
+        return None
+
+    if len(rows) <= 1:
+        return []
+
+    date_range = parse_stats_period(period_key)
+    filtered = []
+
+    for row in rows[1:]:
+        if len(row) < 1 or not row[0].strip():
+            continue
+        try:
+            row_date = datetime.strptime(row[0].split(" ")[0], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            continue
+
+        if date_range is not None:
+            start, end = date_range
+            if not (start <= row_date <= end):
+                continue
+
+        filtered.append(row)
+
+    return filtered
+
+
+def get_expense_rows_in_period(period_key: str) -> list[list[str]] | None:
+    """نفس get_payment_rows_in_period بس لصفحة المصروفات."""
+    sheet = get_expenses_worksheet()
+    if sheet is None:
+        return None
+
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read expense rows for stats")
+        return None
+
+    if len(rows) <= 1:
+        return []
+
+    date_range = parse_stats_period(period_key)
+    filtered = []
+
+    for row in rows[1:]:
+        if len(row) < 1 or not row[0].strip():
+            continue
+        try:
+            row_date = datetime.strptime(row[0].split(" ")[0], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            continue
+
+        if date_range is not None:
+            start, end = date_range
+            if not (start <= row_date <= end):
+                continue
+
+        filtered.append(row)
+
+    return filtered
+
+
+PERIOD_LABELS = {"today": "اليوم", "week": "هذا الأسبوع", "month": "هذا الشهر", "all": "كل الوقت"}
+
+
+def format_period_label(period_key: str) -> str:
+    if period_key in PERIOD_LABELS:
+        return PERIOD_LABELS[period_key]
+    return period_key  # نص تاريخ يدوي، نعرضه كما هو
+
+
+def calculate_totals_summary(period_key: str) -> str:
+    """يحسب دخل/مصروف/صافي إجمالي لفترة معينة. يرجع نص جاهز للعرض."""
+    payment_rows = get_payment_rows_in_period(period_key)
+    expense_rows = get_expense_rows_in_period(period_key)
+
+    if payment_rows is None or expense_rows is None:
+        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
+
+    total_income = 0
+    for row in payment_rows:
+        if len(row) >= 2 and row[1].strip():
+            try:
+                total_income += int(float(row[1]))
+            except ValueError:
+                continue
+
+    total_expense = 0
+    for row in expense_rows:
+        if len(row) >= 2 and row[1].strip():
+            try:
+                total_expense += int(float(row[1]))
+            except ValueError:
+                continue
+
+    net = total_income - total_expense
+    label = format_period_label(period_key)
+
+    return (
+        f"إحصائيات {label}\n\n"
+        f"الدخل: {total_income}\n"
+        f"المصروف: {total_expense}\n"
+        f"الصافي: {net}"
+    )
+
+
+def calculate_product_breakdown(period_key: str) -> str:
+    """يحسب دخل + عدد عمليات لكل منتج بفترة معينة. يرجع نص جاهز للعرض."""
+    payment_rows = get_payment_rows_in_period(period_key)
+    if payment_rows is None:
+        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
+
+    label = format_period_label(period_key)
+    if not payment_rows:
+        return f"ماكو أي عمليات دفع مسجلة لفترة {label}."
+
+    product_totals: dict[str, int] = {}
+    product_counts: dict[str, int] = {}
+
+    for row in payment_rows:
+        if len(row) < 4:
+            continue
+        product = row[3].strip()
+        if not product:
+            continue
+        amount_str = row[1].strip() if len(row) >= 2 else ""
+        try:
+            amount = int(float(amount_str)) if amount_str else 0
+        except ValueError:
+            amount = 0
+
+        product_totals[product] = product_totals.get(product, 0) + amount
+        product_counts[product] = product_counts.get(product, 0) + 1
+
+    lines = [f"تفصيل المنتجات — {label}\n"]
+    for product in sorted(product_totals.keys(), key=lambda p: product_totals[p], reverse=True):
+        lines.append(f"{product}: {product_totals[product]} ({product_counts[product]} عملية)")
+
+    return "\n".join(lines)
+
+
+def calculate_chatgpt_account_stats() -> tuple[int, int]:
+    """
+    يرجع (عدد الحسابات الخاصة، عدد الحسابات المشتركة) — الخاصة تُحسب من
+    عمود حسابات جات بالشيت (نص يبدأ بـ"خاص")، والمشتركة من عدد الحسابات
+    المسجلة بـ Supabase (totp_accounts) اللي إلها زبون واحد أو أكثر
+    مرتبط فيها (عن طريق totp_links).
+    """
+    private_count = 0
+    sheet = get_google_sheet()
+    if sheet is not None:
+        try:
+            rows = sheet.get_all_values()
+            seen_chat_ids = set()
+            for row in rows[1:]:
+                if len(row) < SHEET_COL_CHATGPT_ACCOUNT:
+                    continue
+                account_text = row[SHEET_COL_CHATGPT_ACCOUNT - 1].strip()
+                chat_id = row[SHEET_COL_CHAT_ID - 1].strip() if len(row) >= SHEET_COL_CHAT_ID else ""
+                if account_text.startswith("خاص") and chat_id and chat_id not in seen_chat_ids:
+                    seen_chat_ids.add(chat_id)
+                    private_count += 1
+        except Exception:
+            logger.exception("Failed to count private ChatGPT accounts from sheet")
+
+    shared_count = 0
+    try:
+        res = supabase.table("totp_accounts").select("id").execute()
+        shared_count = len(res.data) if res.data else 0
+    except Exception:
+        logger.exception("Failed to count shared accounts from Supabase")
+
+    return private_count, shared_count
+
+
+def get_shared_accounts_list() -> list[dict]:
+    """يرجع قائمة الحسابات المشتركة (id, link_code, label) من Supabase."""
+    try:
+        res = supabase.table("totp_accounts").select("id, link_code, label").execute()
+        return res.data or []
+    except Exception:
+        logger.exception("Failed to fetch shared accounts list")
+        return []
+
+
+def get_customers_for_account(account_id) -> list[int]:
+    """يرجع قائمة chat_id تبع كل الزباين المرتبطين بحساب مشترك معين."""
+    try:
+        res = supabase.table("totp_links").select("chat_id").eq("account_id", account_id).execute()
+        return [r["chat_id"] for r in (res.data or [])]
+    except Exception:
+        logger.exception("Failed to fetch customers for account")
+        return []
+
+
+def build_stats_main_keyboard() -> InlineKeyboardMarkup:
+    """الشاشة الرئيسية للإحصائيات — أربع أزرار."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 إجمالي الدخل/المصروف/الصافي", callback_data="stats_totals_default")],
+        [InlineKeyboardButton("📦 تفصيل حسب المنتج", callback_data="stats_products_period")],
+        [InlineKeyboardButton("🤖 حسابات ChatGPT", callback_data="stats_chatgpt_main")],
+        [InlineKeyboardButton("📅 اختيار فترة زمنية", callback_data="stats_totals_period")],
+    ])
+
+
+def build_period_selection_keyboard(next_action: str) -> InlineKeyboardMarkup:
+    """
+    شاشة اختيار فترة (تُستخدم لأكثر من غرض — next_action يحدد شنو يصير
+    بعد الاختيار: "totals" لإجمالي بس، أو "products" لتفصيل المنتجات).
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("اليوم", callback_data=f"stats_period_{next_action}_today"),
+            InlineKeyboardButton("الأسبوع", callback_data=f"stats_period_{next_action}_week"),
+        ],
+        [
+            InlineKeyboardButton("الشهر", callback_data=f"stats_period_{next_action}_month"),
+            InlineKeyboardButton("كل الوقت", callback_data=f"stats_period_{next_action}_all"),
+        ],
+        [InlineKeyboardButton("✏️ تاريخ محدد", callback_data=f"stats_period_manual_{next_action}")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")],
+    ])
+
+
+def build_chatgpt_main_keyboard(private_count: int, shared_count: int) -> InlineKeyboardMarkup:
+    total = private_count + shared_count
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"الإجمالي: {total}", callback_data="stats_noop")],
+        [InlineKeyboardButton(f"الحسابات الخاصة ({private_count})", callback_data="stats_chatgpt_private")],
+        [InlineKeyboardButton(f"الحسابات المشتركة ({shared_count})", callback_data="stats_chatgpt_shared")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")],
+    ])
+
+
+def build_shared_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for acc in accounts:
+        label = acc.get("label") or acc.get("link_code", "بدون اسم")
+        rows.append([InlineKeyboardButton(label, callback_data=f"stats_account_{acc['id']}")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ------------------------------------------------------------------
@@ -1546,48 +1852,106 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 
-    """
-    يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
-    البوت ينتظر إدخال مبلغ يدوي لعملية دفع جارية (رد على رسالة الصورة).
-    يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
-    """
-    message = update.message
-    if not message or not message.text or not message.reply_to_message:
-        return False
+async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج كل ضغطات الأزرار الخاصة بشاشات الإحصائيات."""
+    global _pending_stats_period
 
-    replied_id = message.reply_to_message.message_id
-    state = _pending_payments.get(replied_id)
-    if state is None or not state.get("awaiting_manual_amount"):
-        return False
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
 
-    try:
-        amount = int(re.sub(r"[^\d]", "", message.text))
-    except ValueError:
-        await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
-        return True
+    data = query.data
+    await query.answer()
 
-    if amount <= 0:
-        await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
-        return True
+    if data == "stats_noop":
+        return
 
-    state["pending_amount"] = amount
-    state["awaiting_manual_amount"] = False
+    if data == "stats_back_to_main":
+        await query.edit_message_text(text="الإحصائيات", reply_markup=build_stats_main_keyboard())
+        return
 
-    try:
-        await context.bot.edit_message_caption(
-            chat_id=OWNER_USER_ID,
-            message_id=replied_id,
-            caption=format_payment_summary(state)
-            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {amount}",
-            reply_markup=build_amount_keyboard(),
+    if data == "stats_totals_default":
+        text = calculate_totals_summary("month")
+        await query.edit_message_text(
+            text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
         )
-    except Exception:
-        logger.exception("Failed to update caption after manual amount entry")
+        return
 
-    return True
+    if data == "stats_totals_period":
+        await query.edit_message_text(text="اختر الفترة:", reply_markup=build_period_selection_keyboard("totals"))
+        return
+
+    if data == "stats_products_period":
+        await query.edit_message_text(text="اختر الفترة:", reply_markup=build_period_selection_keyboard("products"))
+        return
+
+    if data.startswith("stats_period_manual_"):
+        next_action = data[len("stats_period_manual_"):]
+        _pending_stats_period = {"message_id": query.message.message_id, "next_action": next_action}
+        await query.edit_message_text(
+            text="اكتب التاريخ كـ رد على هذي الرسالة (مثال: 2026-07 لشهر، أو 2026-07-15 ليوم):",
+            reply_markup=None,
+        )
+        return
+
+    if data.startswith("stats_period_"):
+        # الصيغة: stats_period_<next_action>_<period_key>
+        remainder = data[len("stats_period_"):]
+        next_action, period_key = remainder.rsplit("_", 1)
+        back_target = "stats_totals_period" if next_action == "totals" else "stats_products_period"
+        back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data=back_target)]])
+
+        if next_action == "totals":
+            text = calculate_totals_summary(period_key)
+        else:
+            text = calculate_product_breakdown(period_key)
+
+        await query.edit_message_text(text=text, reply_markup=back_keyboard)
+        return
+
+    if data == "stats_chatgpt_main":
+        private_count, shared_count = calculate_chatgpt_account_stats()
+        await query.edit_message_text(
+            text="حسابات ChatGPT",
+            reply_markup=build_chatgpt_main_keyboard(private_count, shared_count),
+        )
+        return
+
+    if data == "stats_chatgpt_private":
+        private_count, _ = calculate_chatgpt_account_stats()
+        await query.edit_message_text(
+            text=f"عدد الحسابات الخاصة: {private_count}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")]]),
+        )
+        return
+
+    if data == "stats_chatgpt_shared":
+        accounts = get_shared_accounts_list()
+        if not accounts:
+            await query.edit_message_text(
+                text="ماكو حسابات مشتركة مسجلة.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")]]),
+            )
+            return
+        await query.edit_message_text(text="اختر حساب:", reply_markup=build_shared_accounts_keyboard(accounts))
+        return
+
+    if data.startswith("stats_account_"):
+        account_id = data[len("stats_account_"):]
+        customer_chat_ids = get_customers_for_account(account_id)
+        if not customer_chat_ids:
+            text = "ماكو زباين مرتبطين بهذا الحساب."
+        else:
+            text = f"عدد الزباين: {len(customer_chat_ids)}\n\n" + "\n".join(str(cid) for cid in customer_chat_ids)
+        await query.edit_message_text(
+            text=text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_shared")]]),
+        )
+        return
 
 
-async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+
     """
     يلتقط رد منك (owner) على رسالة "تم الحفظ بنجاح" لعملية دفع منتجها
     جات — لو رديت بإيميل يسجله بعمود حسابات جات، لو رديت بكلمة "خاص"
@@ -1733,6 +2097,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         _pending_add_account = {"message_id": sent.message_id, "step": "link_code", "link_code": None, "secret": None}
         return True
 
+    if text == BTN_STATS:
+        await message.reply_text("الإحصائيات", reply_markup=build_stats_main_keyboard())
+        return True
+
     return False
 
 
@@ -1781,16 +2149,53 @@ async def handle_add_account_flow(update: Update, context: ContextTypes.DEFAULT_
     return False
 
 
+async def handle_stats_manual_period_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رد نصي منك أثناء انتظار تاريخ يدوي بشاشة الإحصائيات (YYYY-MM
+    أو YYYY-MM-DD)، ويعرض النتيجة المطلوبة (إجمالي أو تفصيل منتجات).
+    """
+    global _pending_stats_period
+
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+    if _pending_stats_period is None or _pending_stats_period.get("message_id") != message.reply_to_message.message_id:
+        return False
+
+    period_key = message.text.strip()
+    next_action = _pending_stats_period["next_action"]
+    _pending_stats_period = None
+
+    try:
+        parse_stats_period(period_key)
+    except ValueError:
+        await message.reply_text("صيغة غير صحيحة. استخدم YYYY-MM أو YYYY-MM-DD (مثال: 2026-07 أو 2026-07-15).")
+        return True
+
+    back_target = "stats_totals_period" if next_action == "totals" else "stats_products_period"
+    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data=back_target)]])
+
+    if next_action == "totals":
+        text = calculate_totals_summary(period_key)
+    else:
+        text = calculate_product_breakdown(period_key)
+
+    await message.reply_text(text, reply_markup=back_keyboard)
+    return True
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
     مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، تسجيل حساب ChatGPT
-    خاص، إدخال مصروف يدوي، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة
-    حساب تفاعلي.
+    خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، أزرار لوحة المفاتيح
+    الثابتة، أو فلو إضافة حساب تفاعلي.
     """
     if await handle_manual_amount_entry(update, context):
         return
     if await handle_expense_manual_entry(update, context):
+        return
+    if await handle_stats_manual_period_entry(update, context):
         return
     if await handle_chatgpt_account_reply(update, context):
         return
@@ -1963,6 +2368,9 @@ def main() -> None:
 
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
+
+    # أزرار الإحصائيات — تشتغل بمحادثتك الخاصة مع البوت نفسه
+    app.add_handler(CallbackQueryHandler(handle_stats_callback, pattern=r"^stats_"))
 
     # أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب)
     app.add_handler(CommandHandler("start", cmd_start))
