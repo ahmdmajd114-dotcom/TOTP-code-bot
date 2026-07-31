@@ -26,7 +26,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -107,6 +107,43 @@ def get_google_sheet():
         return None
 
 
+_expenses_sheet = None
+
+
+def get_expenses_worksheet():
+    """
+    يرجع كائن صفحة (Tab) المصروفات، وينشئها تلقائياً لو مو موجودة أصلاً
+    (بعنوان: التاريخ والوقت — المبلغ — السبب). يرجع None لو فشل الاتصال.
+    """
+    global _expenses_sheet
+    if _expenses_sheet is not None:
+        return _expenses_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _expenses_sheet = spreadsheet.worksheet(EXPENSES_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            _expenses_sheet = spreadsheet.add_worksheet(
+                title=EXPENSES_WORKSHEET_NAME, rows=1000, cols=3
+            )
+            _expenses_sheet.append_row(
+                ["التاريخ والوقت", "المبلغ", "السبب"], value_input_option="USER_ENTERED"
+            )
+            logger.info(f"Created new expenses worksheet: {EXPENSES_WORKSHEET_NAME}")
+        return _expenses_sheet
+    except Exception:
+        logger.exception("Failed to connect to expenses worksheet")
+        return None
+
+
 # ------------------------------------------------------------------
 # منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
 # القديم. مخزن بذاكرة البرنامج (ينمحي عند اعادة تشغيل البوت، وهذا
@@ -156,6 +193,31 @@ _pending_payments: dict[int, dict] = {}
 # وشنو منتجه. المفتاح message_id لنفس رسالة التأكيد النهائي.
 # ------------------------------------------------------------------
 _completed_payments: dict[int, dict] = {}
+
+# ------------------------------------------------------------------
+# حالة مؤقتة لعملية تسجيل مصروف جارية — مفتاح وحيد (بس عملية وحدة
+# بنفس الوقت للأونر، مو محتاج تعدد مثل الدفعات). تُخزن بذاكرة البرنامج.
+# {
+#   "message_id": int,          # رسالة الملخص الوحيدة اللي نعدلها
+#   "amount": int,
+#   "reason": str | None,
+#   "awaiting_manual_amount": bool,
+#   "awaiting_manual_reason": bool,
+# }
+# ------------------------------------------------------------------
+_pending_expense: dict | None = None
+
+# ------------------------------------------------------------------
+# حالة مؤقتة لفلو إضافة حساب TOTP التفاعلي (بديل لكتابة /addaccount
+# يدوياً) — بس عملية وحدة بنفس الوقت.
+# {
+#   "message_id": int,
+#   "step": "link_code" | "secret" | "label",
+#   "link_code": str | None,
+#   "secret": str | None,
+# }
+# ------------------------------------------------------------------
+_pending_add_account: dict | None = None
 
 # ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
@@ -328,6 +390,20 @@ PAYMENT_METHODS = ["ماستر", "زين كاش", "رصيد اثير", "رصيد
 PAYMENT_AMOUNT_STEP_SMALL = 1000
 PAYMENT_AMOUNT_STEP_LARGE = 5000
 
+# اسم صفحة (Tab) المصروفات بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
+EXPENSES_WORKSHEET_NAME = "ورقة المصروفات"
+
+# نصوص أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق الكتابة
+BTN_EXPENSE = "💸 تسجيل مصروف"
+BTN_INCOME = "📊 تقرير الدخل"
+BTN_ADD_ACCOUNT = "➕ إضافة حساب"
+BTN_BACK = "◀️ رجوع"
+
+MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME), KeyboardButton(BTN_ADD_ACCOUNT)]],
+    resize_keyboard=True,
+)
+
 
 def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
     """أول زرين يطلعون تحت صورة دفع جديدة توصل من زبون."""
@@ -349,20 +425,22 @@ def build_product_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_product_list_keyboard() -> InlineKeyboardMarkup:
-    """قائمة كل المنتجات ما عدا الاختيار السريع (اللي طلع بالشاشة السابقة)."""
+    """قائمة كل المنتجات ما عدا الاختيار السريع (اللي طلع بالشاشة السابقة) + زر رجوع."""
     rows = [
         [InlineKeyboardButton(p, callback_data=f"pay_product_{p}")]
         for p in PAYMENT_PRODUCTS[1:]
     ]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_product")])
     return InlineKeyboardMarkup(rows)
 
 
 def build_method_list_keyboard() -> InlineKeyboardMarkup:
-    """قائمة كل طرق الدفع ما عدا الاختيار السريع."""
+    """قائمة كل طرق الدفع ما عدا الاختيار السريع + زر رجوع."""
     rows = [
         [InlineKeyboardButton(m, callback_data=f"pay_method_{m}")]
         for m in PAYMENT_METHODS[1:]
     ]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_method")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -568,6 +646,65 @@ def upsert_chatgpt_account(
         return True
     except Exception:
         logger.exception("Failed to upsert ChatGPT account info in Google Sheet")
+        return False
+
+
+def build_expense_amount_keyboard() -> InlineKeyboardMarkup:
+    """شاشة تحديد مبلغ المصروف — نفس أزرار مبلغ الدفع، بس callback_data مختلف."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="exp_amount_add_small"),
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_LARGE}", callback_data="exp_amount_add_large"),
+        ],
+        [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="exp_amount_manual")],
+        [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="exp_amount_commit")],
+    ])
+
+
+def build_expense_reason_keyboard() -> InlineKeyboardMarkup:
+    """شاشة اختيار سبب المصروف — منتج سريع + بقية المنتجات + إدخال حر."""
+    quick_pick = PAYMENT_PRODUCTS[0]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(quick_pick, callback_data=f"exp_reason_{quick_pick}")],
+        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="exp_reason_list")],
+        [InlineKeyboardButton("✏️ إدخال حر", callback_data="exp_reason_manual")],
+    ])
+
+
+def build_expense_reason_list_keyboard() -> InlineKeyboardMarkup:
+    """قائمة كل المنتجات ما عدا الاختيار السريع + زر رجوع، لسبب المصروف."""
+    rows = [
+        [InlineKeyboardButton(p, callback_data=f"exp_reason_{p}")]
+        for p in PAYMENT_PRODUCTS[1:]
+    ]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_reason")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_expense_summary(expense: dict) -> str:
+    """يبني نص الملخص المعروض فوق أزرار تسجيل المصروف."""
+    lines = ["تسجيل مصروف"]
+    amount = expense.get("amount", 0)
+    reason = expense.get("reason")
+    lines.append(f"المبلغ: {amount if amount else '— لم يُحدد بعد —'}")
+    lines.append(f"السبب: {reason if reason else '— لم يُحدد بعد —'}")
+    return "\n".join(lines)
+
+
+def append_expense_row(amount: int, reason: str) -> bool:
+    """يضيف سطر مصروف جديد لصفحة المصروفات. يرجع True لو نجح الحفظ."""
+    sheet = get_expenses_worksheet()
+    if sheet is None:
+        return False
+
+    date_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    row = [date_time_str, amount, reason]
+
+    try:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        logger.exception("Failed to append expense row to Google Sheet")
         return False
 
 
@@ -1175,6 +1312,14 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    # -------------------- رجوع من قائمة المنتجات لشاشة اختيار المنتج الأولى --------------------
+    if data == "pay_back_to_product":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_product_keyboard(),
+        )
+        return
+
     # -------------------- اختيار طريقة دفع مباشرة (سريعة أو من القائمة) --------------------
     if data.startswith("pay_method_") and data != "pay_method_list":
         method = data[len("pay_method_"):]
@@ -1191,6 +1336,14 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_caption(
             caption=format_payment_summary(state),
             reply_markup=build_method_list_keyboard(),
+        )
+        return
+
+    # -------------------- رجوع من قائمة طرق الدفع لشاشة الملخص (اختيار سريع للطريقة) --------------------
+    if data == "pay_back_to_method":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(has_product=bool(state["product"]), has_payment=bool(state["payments"])),
         )
         return
 
@@ -1267,7 +1420,90 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
 
-async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج كل ضغطات الأزرار الخاصة بفلو تسجيل مصروف."""
+    global _pending_expense
+
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    if _pending_expense is None or _pending_expense.get("message_id") != query.message.message_id:
+        await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
+        return
+
+    data = query.data
+    await query.answer()
+    expense = _pending_expense
+
+    if data == "exp_amount_add_small":
+        expense["amount"] = expense.get("amount", 0) + PAYMENT_AMOUNT_STEP_SMALL
+        await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_amount_keyboard()
+        )
+        return
+
+    if data == "exp_amount_add_large":
+        expense["amount"] = expense.get("amount", 0) + PAYMENT_AMOUNT_STEP_LARGE
+        await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_amount_keyboard()
+        )
+        return
+
+    if data == "exp_amount_manual":
+        expense["awaiting_manual_amount"] = True
+        await query.edit_message_text(
+            text=format_expense_summary(expense) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
+        )
+        return
+
+    if data == "exp_amount_commit":
+        if not expense.get("amount"):
+            await query.answer("لازم تحدد مبلغ أكبر من صفر أول.", show_alert=True)
+            return
+        await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_reason_keyboard()
+        )
+        return
+
+    if data.startswith("exp_reason_") and data not in ("exp_reason_list", "exp_reason_manual"):
+        reason = data[len("exp_reason_"):]
+        expense["reason"] = reason
+        saved = append_expense_row(expense["amount"], reason)
+        final_text = format_expense_summary(expense) + (
+            "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
+        )
+        try:
+            await query.edit_message_text(text=final_text, reply_markup=None)
+        except Exception:
+            logger.exception("Failed to update final expense confirmation message")
+        _pending_expense = None
+        return
+
+    if data == "exp_reason_list":
+        await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_reason_list_keyboard()
+        )
+        return
+
+    if data == "exp_back_to_reason":
+        await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_reason_keyboard()
+        )
+        return
+
+    if data == "exp_reason_manual":
+        expense["awaiting_manual_reason"] = True
+        await query.edit_message_text(
+            text=format_expense_summary(expense) + "\n\nاكتب سبب المصروف بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
+        )
+        return
+
+
+
     """
     يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
     البوت ينتظر إدخال مبلغ يدوي لعملية دفع جارية (رد على رسالة الصورة).
@@ -1356,15 +1592,176 @@ async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEF
     return True
 
 
+async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رد نصي منك أثناء تسجيل مصروف — إما مبلغ يدوي أو سبب حر،
+    حسب أي خطوة بانتظار إدخال. يرجع True لو عالج الرسالة.
+    """
+    global _pending_expense
+
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+    if _pending_expense is None or _pending_expense.get("message_id") != message.reply_to_message.message_id:
+        return False
+
+    expense = _pending_expense
+
+    if expense.get("awaiting_manual_amount"):
+        try:
+            amount = int(re.sub(r"[^\d]", "", message.text))
+        except ValueError:
+            await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
+            return True
+        if amount <= 0:
+            await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
+            return True
+
+        expense["amount"] = amount
+        expense["awaiting_manual_amount"] = False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=OWNER_USER_ID,
+                message_id=expense["message_id"],
+                text=format_expense_summary(expense),
+                reply_markup=build_expense_amount_keyboard(),
+            )
+        except Exception:
+            logger.exception("Failed to update expense caption after manual amount entry")
+        return True
+
+    if expense.get("awaiting_manual_reason"):
+        reason = message.text.strip()
+        if not reason:
+            await message.reply_text("الرجاء كتابة سبب غير فارغ.")
+            return True
+
+        expense["reason"] = reason
+        expense["awaiting_manual_reason"] = False
+        saved = append_expense_row(expense["amount"], reason)
+        final_text = format_expense_summary(expense) + (
+            "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
+        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=OWNER_USER_ID, message_id=expense["message_id"], text=final_text, reply_markup=None
+            )
+        except Exception:
+            logger.exception("Failed to update final expense confirmation after manual reason entry")
+        _pending_expense = None
+        return True
+
+    return False
+
+
+async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يعالج ضغطات أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق
+    الكتابة: تسجيل مصروف، تقرير الدخل، إضافة حساب. يرجع True لو عالج.
+    """
+    global _pending_expense, _pending_add_account
+
+    message = update.message
+    if not message or not message.text:
+        return False
+
+    text = message.text.strip()
+
+    if text == BTN_EXPENSE:
+        sent = await message.reply_text(
+            format_expense_summary({"amount": 0, "reason": None}),
+            reply_markup=build_expense_amount_keyboard(),
+        )
+        _pending_expense = {
+            "message_id": sent.message_id,
+            "amount": 0,
+            "reason": None,
+            "awaiting_manual_amount": False,
+            "awaiting_manual_reason": False,
+        }
+        return True
+
+    if text == BTN_INCOME:
+        report = calculate_income_report()
+        await message.reply_text(report)
+        return True
+
+    if text == BTN_ADD_ACCOUNT:
+        sent = await message.reply_text("أرسل رمز الربط (link code) للحساب الجديد:")
+        _pending_add_account = {"message_id": sent.message_id, "step": "link_code", "link_code": None, "secret": None}
+        return True
+
+    return False
+
+
+async def handle_add_account_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط ردودك المتتالية أثناء فلو إضافة حساب TOTP التفاعلي (رمز
+    ربط → مفتاح سري → لابل)، وينفذ /addaccount بالخلفية عند الاكتمال.
+    """
+    global _pending_add_account
+
+    message = update.message
+    if not message or not message.text or _pending_add_account is None:
+        return False
+
+    text = message.text.strip()
+    step = _pending_add_account["step"]
+
+    if step == "link_code":
+        _pending_add_account["link_code"] = text
+        _pending_add_account["step"] = "secret"
+        await message.reply_text("تمام. الحين أرسل المفتاح السري (Secret Key):")
+        return True
+
+    if step == "secret":
+        _pending_add_account["secret"] = text
+        _pending_add_account["step"] = "label"
+        await message.reply_text("تمام. الحين أرسل اللابل/الملاحظة (أو أرسل - لتركها فاضية):")
+        return True
+
+    if step == "label":
+        label = "" if text == "-" else text
+        link_code = _pending_add_account["link_code"]
+        secret = _pending_add_account["secret"]
+        _pending_add_account = None
+
+        try:
+            supabase.table("totp_accounts").insert(
+                {"link_code": link_code, "secret": secret, "label": label}
+            ).execute()
+            await message.reply_text(f"✅ تمت اضافة الحساب.\nرمز الربط: {link_code}\nملاحظة: {label or '—'}")
+        except Exception as e:
+            logger.exception("Failed to add account via interactive flow")
+            await message.reply_text(f"⚠️ فشلت الاضافة — تأكد ان رمز الربط '{link_code}' غير مستخدم سابقاً.\n{e}")
+        return True
+
+    return False
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
-    مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، أو تسجيل حساب ChatGPT
-    خاص عن طريق الرد على رسالة تأكيد دفع مكتملة.
+    مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، تسجيل حساب ChatGPT
+    خاص، إدخال مصروف يدوي، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة
+    حساب تفاعلي.
     """
     if await handle_manual_amount_entry(update, context):
         return
-    await handle_chatgpt_account_reply(update, context)
+    if await handle_expense_manual_entry(update, context):
+        return
+    if await handle_chatgpt_account_reply(update, context):
+        return
+    if await handle_reply_keyboard_button(update, context):
+        return
+    await handle_add_account_flow(update, context)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب) بمحادثتك مع البوت."""
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    await update.message.reply_text("جاهز. استخدم الأزرار بالأسفل:", reply_markup=MAIN_REPLY_KEYBOARD)
 
 
 async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1521,6 +1918,12 @@ def main() -> None:
 
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
+
+    # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
+    app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
+
+    # أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب)
+    app.add_handler(CommandHandler("start", cmd_start))
 
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
