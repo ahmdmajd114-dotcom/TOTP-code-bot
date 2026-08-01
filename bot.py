@@ -144,6 +144,43 @@ def get_expenses_worksheet():
         return None
 
 
+_vaults_sheet = None
+
+
+def get_vaults_worksheet():
+    """
+    يرجع كائن صفحة (Tab) خزائن الرصيد، وينشئها تلقائياً لو مو موجودة —
+    صف عناوين (ماستر، زين كاش، رصيد اثير، رصيد اسيا) + صف واحد للأرصدة
+    الحالية (يبدأ بأصفار، يتحدث لاحقاً). يرجع None لو فشل الاتصال.
+    """
+    global _vaults_sheet
+    if _vaults_sheet is not None:
+        return _vaults_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _vaults_sheet = spreadsheet.worksheet(VAULTS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            _vaults_sheet = spreadsheet.add_worksheet(
+                title=VAULTS_WORKSHEET_NAME, rows=10, cols=len(VAULT_NAMES)
+            )
+            _vaults_sheet.append_row(VAULT_NAMES, value_input_option="USER_ENTERED")
+            _vaults_sheet.append_row([0] * len(VAULT_NAMES), value_input_option="USER_ENTERED")
+            logger.info(f"Created new vaults worksheet: {VAULTS_WORKSHEET_NAME}")
+        return _vaults_sheet
+    except Exception:
+        logger.exception("Failed to connect to vaults worksheet")
+        return None
+
+
 # ------------------------------------------------------------------
 # منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
 # القديم. مخزن بذاكرة البرنامج (ينمحي عند اعادة تشغيل البوت، وهذا
@@ -223,6 +260,12 @@ _pending_add_account: dict | None = None
 # حالة مؤقتة لانتظار إدخال تاريخ يدوي بشاشة الإحصائيات — {message_id, next_action}
 # ------------------------------------------------------------------
 _pending_stats_period: dict | None = None
+
+# ------------------------------------------------------------------
+# حالة مؤقتة لانتظار إدخال مبلغ يدوي أثناء تعديل رصيد خزنة —
+# {message_id, vault_name, mode} — mode: "set" | "add" | "sub"
+# ------------------------------------------------------------------
+_pending_vault_edit: dict | None = None
 
 # ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
@@ -392,11 +435,18 @@ CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تل�
 PAYMENT_PRODUCTS = ["جات", "انكي", "كانفا", "فرينوت", "گودنوت", "تليجرام مميز", "امبوس"]
 PAYMENT_METHODS = ["ماستر", "زين كاش", "رصيد اثير", "رصيد اسيا"]
 
+# أسماء الخزائن — نفس أسماء طرق الدفع بالضبط، عشان كل طريقة دفع تربط
+# مباشرة بخزنتها المطابقة بدون أي تحويل إضافي
+VAULT_NAMES = PAYMENT_METHODS
+
 PAYMENT_AMOUNT_STEP_SMALL = 1000
 PAYMENT_AMOUNT_STEP_LARGE = 5000
 
 # اسم صفحة (Tab) المصروفات بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
 EXPENSES_WORKSHEET_NAME = "ورقة المصروفات"
+
+# اسم صفحة (Tab) خزائن الرصيد بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
+VAULTS_WORKSHEET_NAME = "خزائن الرصيد"
 
 # نصوص أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق الكتابة
 BTN_EXPENSE = "💸 تسجيل مصروف"
@@ -670,6 +720,13 @@ def build_expense_amount_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_expense_vault_keyboard() -> InlineKeyboardMarkup:
+    """شاشة اختيار الخزنة اللي ينسحب منها مبلغ المصروف."""
+    rows = [[InlineKeyboardButton(v, callback_data=f"exp_vault_{v}")] for v in VAULT_NAMES]
+    rows.append([InlineKeyboardButton("بدون خزنة محددة", callback_data="exp_vault_none")])
+    return InlineKeyboardMarkup(rows)
+
+
 def build_expense_reason_keyboard() -> InlineKeyboardMarkup:
     """شاشة اختيار سبب المصروف — منتج سريع + بقية المنتجات + إدخال حر."""
     quick_pick = PAYMENT_PRODUCTS[0]
@@ -694,8 +751,10 @@ def format_expense_summary(expense: dict) -> str:
     """يبني نص الملخص المعروض فوق أزرار تسجيل المصروف."""
     lines = ["تسجيل مصروف"]
     amount = expense.get("amount", 0)
+    vault = expense.get("vault")
     reason = expense.get("reason")
     lines.append(f"المبلغ: {amount if amount else '— لم يُحدد بعد —'}")
+    lines.append(f"الخزنة: {vault if vault else '— لم تُحدد بعد —'}")
     lines.append(f"السبب: {reason if reason else '— لم يُحدد بعد —'}")
     return "\n".join(lines)
 
@@ -715,6 +774,73 @@ def append_expense_row(amount: int, reason: str) -> bool:
     except Exception:
         logger.exception("Failed to append expense row to Google Sheet")
         return False
+
+
+def get_vault_balances() -> dict[str, int] | None:
+    """يرجع الأرصدة الحالية لكل الخزائن كـ dict، أو None لو فشل الاتصال."""
+    sheet = get_vaults_worksheet()
+    if sheet is None:
+        return None
+
+    try:
+        values = sheet.row_values(2)  # الصف الثاني (بعد صف العناوين)
+    except Exception:
+        logger.exception("Failed to read vault balances")
+        return None
+
+    balances = {}
+    for i, name in enumerate(VAULT_NAMES):
+        try:
+            balances[name] = int(float(values[i])) if i < len(values) and values[i].strip() else 0
+        except (ValueError, IndexError):
+            balances[name] = 0
+    return balances
+
+
+def adjust_vault_balance(vault_name: str, delta: int) -> bool:
+    """يضيف (أو يطرح لو delta سالب) مبلغ من رصيد خزنة معينة. يرجع True لو نجح."""
+    sheet = get_vaults_worksheet()
+    if sheet is None or vault_name not in VAULT_NAMES:
+        return False
+
+    try:
+        balances = get_vault_balances()
+        if balances is None:
+            return False
+        new_value = balances[vault_name] + delta
+        col_index = VAULT_NAMES.index(vault_name) + 1  # gspread أعمدة 1-indexed
+        sheet.update_cell(2, col_index, new_value)
+        return True
+    except Exception:
+        logger.exception("Failed to adjust vault balance")
+        return False
+
+
+def set_vault_balance(vault_name: str, new_value: int) -> bool:
+    """يحدد رصيد خزنة معينة برقم مطلق (يستبدل القديم بالكامل). يرجع True لو نجح."""
+    sheet = get_vaults_worksheet()
+    if sheet is None or vault_name not in VAULT_NAMES:
+        return False
+
+    try:
+        col_index = VAULT_NAMES.index(vault_name) + 1
+        sheet.update_cell(2, col_index, new_value)
+        return True
+    except Exception:
+        logger.exception("Failed to set vault balance")
+        return False
+
+
+def format_vault_balances() -> str:
+    """يبني نص عرض أرصدة كل الخزائن."""
+    balances = get_vault_balances()
+    if balances is None:
+        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
+
+    lines = ["أرصدة الخزائن\n"]
+    for name in VAULT_NAMES:
+        lines.append(f"{name}: {balances.get(name, 0)}")
+    return "\n".join(lines)
 
 
 def calculate_income_report() -> str:
@@ -1020,12 +1146,14 @@ def get_customers_for_account(account_id) -> list[int]:
 
 
 def build_stats_main_keyboard() -> InlineKeyboardMarkup:
-    """الشاشة الرئيسية للإحصائيات — أربع أزرار."""
+    """الشاشة الرئيسية للإحصائيات — ستة أزرار."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 إجمالي الدخل/المصروف/الصافي", callback_data="stats_totals_default")],
         [InlineKeyboardButton("📦 تفصيل حسب المنتج", callback_data="stats_products_period")],
         [InlineKeyboardButton("🤖 حسابات ChatGPT", callback_data="stats_chatgpt_main")],
         [InlineKeyboardButton("📅 اختيار فترة زمنية", callback_data="stats_totals_period")],
+        [InlineKeyboardButton("💵 أرصدة الخزائن", callback_data="stats_vaults_view")],
+        [InlineKeyboardButton("✏️ تعديل رصيد", callback_data="stats_vaults_edit")],
     ])
 
 
@@ -1065,6 +1193,23 @@ def build_shared_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup
         rows.append([InlineKeyboardButton(label, callback_data=f"stats_account_{acc['id']}")])
     rows.append([InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_vault_edit_select_keyboard() -> InlineKeyboardMarkup:
+    """شاشة اختيار الخزنة اللي تريد تعدل رصيدها."""
+    rows = [[InlineKeyboardButton(v, callback_data=f"stats_vaultedit_select_{v}")] for v in VAULT_NAMES]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_vault_edit_mode_keyboard(vault_name: str) -> InlineKeyboardMarkup:
+    """شاشة اختيار طريقة التعديل: تحديد رقم كامل، أو زيادة/نقصان."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 تحديد رقم كامل", callback_data=f"stats_vaultedit_mode_set_{vault_name}")],
+        [InlineKeyboardButton("➕ زيادة", callback_data=f"stats_vaultedit_mode_add_{vault_name}")],
+        [InlineKeyboardButton("➖ نقصان", callback_data=f"stats_vaultedit_mode_sub_{vault_name}")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="stats_vaults_edit")],
+    ])
 
 
 # ------------------------------------------------------------------
@@ -1704,6 +1849,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
         saved = append_payment_row(state)
 
+        # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
+        if saved:
+            for method, amount in state["payments"]:
+                if method in VAULT_NAMES:
+                    adjust_vault_balance(method, amount)
+
         # نحفظ نسخة خفيفة من بيانات الزبون بعد التثبيت — عشان نقدر نربطها
         # لاحقاً لو رديت على رسالة التأكيد بإيميل/خاص (حساب ChatGPT خاص)
         _completed_payments[message_id] = {
@@ -1812,6 +1963,14 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("لازم تحدد مبلغ أكبر من صفر أول.", show_alert=True)
             return
         await query.edit_message_text(
+            text=format_expense_summary(expense), reply_markup=build_expense_vault_keyboard()
+        )
+        return
+
+    if data.startswith("exp_vault_"):
+        vault_key = data[len("exp_vault_"):]
+        expense["vault"] = None if vault_key == "none" else vault_key
+        await query.edit_message_text(
             text=format_expense_summary(expense), reply_markup=build_expense_reason_keyboard()
         )
         return
@@ -1820,6 +1979,8 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         reason = data[len("exp_reason_"):]
         expense["reason"] = reason
         saved = append_expense_row(expense["amount"], reason)
+        if saved and expense.get("vault"):
+            adjust_vault_balance(expense["vault"], -expense["amount"])
         final_text = format_expense_summary(expense) + (
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
@@ -1854,7 +2015,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل ضغطات الأزرار الخاصة بشاشات الإحصائيات."""
-    global _pending_stats_period
+    global _pending_stats_period, _pending_vault_edit
 
     query = update.callback_query
     if query.from_user.id != OWNER_USER_ID:
@@ -1947,6 +2108,37 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             text=text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_shared")]]),
+        )
+        return
+
+    if data == "stats_vaults_view":
+        text = format_vault_balances()
+        await query.edit_message_text(
+            text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
+        )
+        return
+
+    if data == "stats_vaults_edit":
+        await query.edit_message_text(text="اختر الخزنة:", reply_markup=build_vault_edit_select_keyboard())
+        return
+
+    if data.startswith("stats_vaultedit_select_"):
+        vault_name = data[len("stats_vaultedit_select_"):]
+        await query.edit_message_text(
+            text=f"الخزنة: {vault_name}\nاختر طريقة التعديل:",
+            reply_markup=build_vault_edit_mode_keyboard(vault_name),
+        )
+        return
+
+    if data.startswith("stats_vaultedit_mode_"):
+        # الصيغة: stats_vaultedit_mode_<set|add|sub>_<vault_name>
+        remainder = data[len("stats_vaultedit_mode_"):]
+        mode, vault_name = remainder.split("_", 1)
+        _pending_vault_edit = {"message_id": query.message.message_id, "vault_name": vault_name, "mode": mode}
+        mode_label = {"set": "الرقم الجديد الكامل", "add": "مبلغ الزيادة", "sub": "مبلغ النقصان"}[mode]
+        await query.edit_message_text(
+            text=f"الخزنة: {vault_name}\nاكتب {mode_label} كـ رد على هذي الرسالة:",
+            reply_markup=None,
         )
         return
 
@@ -2046,6 +2238,8 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
         expense["reason"] = reason
         expense["awaiting_manual_reason"] = False
         saved = append_expense_row(expense["amount"], reason)
+        if saved and expense.get("vault"):
+            adjust_vault_balance(expense["vault"], -expense["amount"])
         final_text = format_expense_summary(expense) + (
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
@@ -2076,12 +2270,13 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     if text == BTN_EXPENSE:
         sent = await message.reply_text(
-            format_expense_summary({"amount": 0, "reason": None}),
+            format_expense_summary({"amount": 0, "vault": None, "reason": None}),
             reply_markup=build_expense_amount_keyboard(),
         )
         _pending_expense = {
             "message_id": sent.message_id,
             "amount": 0,
+            "vault": None,
             "reason": None,
             "awaiting_manual_amount": False,
             "awaiting_manual_reason": False,
@@ -2185,18 +2380,60 @@ async def handle_stats_manual_period_entry(update: Update, context: ContextTypes
     return True
 
 
+async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رد نصي منك أثناء انتظار مبلغ يدوي لتعديل رصيد خزنة معينة
+    (تحديد رقم كامل / زيادة / نقصان)، وينفذ التعديل.
+    """
+    global _pending_vault_edit
+
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+    if _pending_vault_edit is None or _pending_vault_edit.get("message_id") != message.reply_to_message.message_id:
+        return False
+
+    vault_name = _pending_vault_edit["vault_name"]
+    mode = _pending_vault_edit["mode"]
+    _pending_vault_edit = None
+
+    try:
+        amount = int(re.sub(r"[^\d]", "", message.text))
+    except ValueError:
+        await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
+        return True
+
+    if mode == "set":
+        saved = set_vault_balance(vault_name, amount)
+    elif mode == "add":
+        saved = adjust_vault_balance(vault_name, amount)
+    else:  # sub
+        saved = adjust_vault_balance(vault_name, -amount)
+
+    back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
+    if saved:
+        text = format_vault_balances()
+    else:
+        text = "⚠️ فشل تحديث الرصيد بـ Google Sheet — تحقق من الاتصال يدوياً."
+
+    await message.reply_text(text, reply_markup=back_keyboard)
+    return True
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
     مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، تسجيل حساب ChatGPT
-    خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، أزرار لوحة المفاتيح
-    الثابتة، أو فلو إضافة حساب تفاعلي.
+    خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل رصيد خزنة
+    يدوياً، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة حساب تفاعلي.
     """
     if await handle_manual_amount_entry(update, context):
         return
     if await handle_expense_manual_entry(update, context):
         return
     if await handle_stats_manual_period_entry(update, context):
+        return
+    if await handle_vault_edit_manual_entry(update, context):
         return
     if await handle_chatgpt_account_reply(update, context):
         return
