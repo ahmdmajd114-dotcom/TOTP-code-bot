@@ -62,7 +62,7 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])  # الـ Telegram User ID تب
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # مسار ملف مفاتيح حساب خدمة Google (Service Account) — ملف JSON خارجي
 # لا ينرفع لـ Git إطلاقاً (مضاف لـ .gitignore). المسار الافتراضي
@@ -268,7 +268,7 @@ _pending_stats_period: dict | None = None
 _pending_vault_edit: dict | None = None
 
 # ------------------------------------------------------------------
-# حد أقصى 1 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
+# حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
 # متكرر من زبون يرسل سكرين شوت كثير لنفس عملية الدفع. المفتاح هو
 # customer_chat_id، والقيمة قائمة بأوقات وصول الصور المقبولة (تلقائياً
 # فقط، مو صور accept اليدوي) خلال النافذة الحالية.
@@ -280,7 +280,7 @@ _photo_timestamps: dict[int, list[datetime]] = {}
 
 def is_photo_within_rate_limit(customer_chat_id: int) -> bool:
     """
-    يتحقق هل هذي الصورة ضمن حد 1 صور/6 ساعات لهذا الزبون. لو نعم،
+    يتحقق هل هذي الصورة ضمن حد 3 صور/6 ساعات لهذا الزبون. لو نعم،
     يسجل وقت وصولها ويرجع True (نحول الصورة عادي). لو تجاوز الحد،
     يرجع False بدون ما يسجل شي (الصورة تتجاهل بالكامل).
     """
@@ -396,7 +396,7 @@ FAQ_RULES = [
     (
         "تليجرام_مميز",
         [
-            "تلي مميز", "تليجرام مميز", "اشتراك تلي", "تليكرام مميز", "تليجرام بريميوم",
+            "تلي مميز", "تليجرام مميز", "تليكرام مميز", "تليجرام بريميوم",
             "telegram premium", "premium",
         ],
         "متوفر تلث اشهر ب 25 اما السة ب 35 والسنة ب55 الف",
