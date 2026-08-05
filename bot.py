@@ -1922,6 +1922,17 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 f"المنتج: {state['product']}\n"
                 f"{payment_lines}"
             )
+            payment_lines = "\n".join(f"{method}: {amount}" for method, amount in state["payments"])
+            customer_line = state["customer_name"]
+            if state.get("customer_username"):
+                customer_line += f" (@{state['customer_username']})"
+            payment_notification = (
+                f"✅ عملية دفع جديدة\n"
+                f"الزبون: {customer_line}\n"
+                f"المنتج: {state['product']}\n"
+                f"{payment_lines}"
+            )
+
             try:
                 await context.bot.send_message(
                     chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_PAYMENTS, text=payment_notification
