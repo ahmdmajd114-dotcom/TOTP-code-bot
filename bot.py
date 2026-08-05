@@ -244,7 +244,9 @@ _completed_payments: dict[int, dict] = {}
 # {
 #   "message_id": int,          # رسالة الملخص الوحيدة اللي نعدلها
 #   "amount": int,
+#   "vault": str | None,
 #   "reason": str | None,
+#   "photo_file_id": str | None,  # لو الفلو بدأ من صورة مصروف مؤكدة
 #   "awaiting_manual_amount": bool,
 #   "awaiting_manual_reason": bool,
 # }
@@ -305,6 +307,40 @@ def is_photo_within_rate_limit(customer_chat_id: int) -> bool:
     timestamps.append(now)
     _photo_timestamps[customer_chat_id] = timestamps
     return True
+
+
+# ------------------------------------------------------------------
+# حد أقصى صورة وحدة لكل 6 ساعات لصور المصروف اللي ترسلها أنت (owner)
+# — عداد مستقل تماماً عن عداد صور الزبائن أعلاه، بمفتاح ثابت واحد
+# (OWNER_USER_ID) بما إنه مصدر وحيد (أنت بس).
+# ------------------------------------------------------------------
+_owner_photo_timestamps: list[datetime] = []
+
+
+def is_owner_photo_within_rate_limit() -> bool:
+    """نفس منطق is_photo_within_rate_limit، بس لصور المصروف اللي ترسلها أنت."""
+    global _owner_photo_timestamps
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=PHOTO_RATE_LIMIT_WINDOW_HOURS)
+
+    timestamps = [t for t in _owner_photo_timestamps if t > cutoff]
+
+    if len(timestamps) >= PHOTO_RATE_LIMIT_MAX:
+        _owner_photo_timestamps = timestamps
+        return False
+
+    timestamps.append(now)
+    _owner_photo_timestamps = timestamps
+    return True
+
+
+# ------------------------------------------------------------------
+# حالة مؤقتة لصورة مصروف محتملة بانتظار تأكيدك (✅ مصروف / ❌ إلغاء) —
+# مفتاح وحيد (عملية وحدة بنفس الوقت). المفتاح message_id لرسالة الصورة
+# المحولة بمحادثتك مع البوت.
+# {"file_id": str}
+# ------------------------------------------------------------------
+_pending_expense_photo_confirm: dict[int, dict] = {}
 
 
 # ------------------------------------------------------------------
@@ -469,6 +505,16 @@ def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ تأكيد", callback_data="pay_confirm"),
             InlineKeyboardButton("❌ إلغاء", callback_data="pay_cancel"),
+        ]
+    ])
+
+
+def build_expense_photo_confirm_keyboard() -> InlineKeyboardMarkup:
+    """زرين يطلعون تحت صورة أرسلتها أنت (owner) — هل هذي إثبات مصروف؟"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ مصروف", callback_data="expphoto_yes"),
+            InlineKeyboardButton("❌ ليس مصروف", callback_data="expphoto_no"),
         ]
     ])
 
@@ -1756,6 +1802,33 @@ async def handle_incoming_payment_photo(
     }
 
 
+async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, photo) -> None:
+    """
+    توصل صورة منك (owner) — إما بمحادثتك مع زبون معين (Business) أو
+    مباشرة بمحادثتك مع البوت نفسه. نحولها (أو نستخدمها مباشرة لو
+    وصلت أصلاً بمحادثتك مع البوت) مع زرين: هل هذي إثبات مصروف؟
+    محدودة بصورة وحدة/6 ساعات (عداد مستقل عن صور الزبائن).
+    """
+    if not is_owner_photo_within_rate_limit():
+        logger.info("Owner expense photo ignored — exceeded rate limit")
+        return
+
+    file_id = photo[-1].file_id  # أعلى دقة متوفرة
+
+    try:
+        sent = await context.bot.send_photo(
+            chat_id=OWNER_USER_ID,
+            photo=file_id,
+            caption="هل هذي إثبات مصروف؟",
+            reply_markup=build_expense_photo_confirm_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to forward owner expense photo")
+        return
+
+    _pending_expense_photo_confirm[sent.message_id] = {"file_id": file_id}
+
+
 async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج كل ضغطات الأزرار بمحادثتك الخاصة مع البوت لتسجيل عملية دفع —
@@ -1922,17 +1995,6 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 f"المنتج: {state['product']}\n"
                 f"{payment_lines}"
             )
-            payment_lines = "\n".join(f"{method}: {amount}" for method, amount in state["payments"])
-            customer_line = state["customer_name"]
-            if state.get("customer_username"):
-                customer_line += f" (@{state['customer_username']})"
-            payment_notification = (
-                f"✅ عملية دفع جديدة\n"
-                f"الزبون: {customer_line}\n"
-                f"المنتج: {state['product']}\n"
-                f"{payment_lines}"
-            )
-
             try:
                 await context.bot.send_message(
                     chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_PAYMENTS, text=payment_notification
@@ -2040,6 +2102,68 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
     return True
 
 
+async def handle_expense_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يعالج ضغطة ✅ مصروف / ❌ ليس مصروف تحت صورة أرسلتها أنت. لو أكدت،
+    يبدأ فلو تسجيل المصروف العادي (مبلغ → خزنة → سبب) بنفس رسالة
+    الصورة (نعدل الـ caption تبعها بدل ما نرسل رسالة جديدة).
+    """
+    global _pending_expense
+
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    message_id = query.message.message_id
+    pending = _pending_expense_photo_confirm.get(message_id)
+    if pending is None:
+        await query.answer("انتهت صلاحية هذي الصورة أو تم التعامل معها.", show_alert=True)
+        return
+
+    data = query.data
+    await query.answer()
+    del _pending_expense_photo_confirm[message_id]
+
+    if data == "expphoto_no":
+        try:
+            await query.message.delete()
+        except Exception:
+            logger.exception("Failed to delete non-expense owner photo")
+        return
+
+    # expphoto_yes — نبدأ فلو تسجيل مصروف عادي، بس نعدل caption الصورة
+    # نفسها بدل ما نرسل رسالة نصية منفصلة
+    _pending_expense = {
+        "message_id": message_id,
+        "amount": 0,
+        "vault": None,
+        "reason": None,
+        "photo_file_id": pending["file_id"],
+        "awaiting_manual_amount": False,
+        "awaiting_manual_reason": False,
+    }
+    try:
+        await query.edit_message_caption(
+            caption=format_expense_summary(_pending_expense),
+            reply_markup=build_expense_amount_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to start expense flow from photo")
+
+
+async def edit_expense_message(query, expense: dict, text: str, reply_markup) -> None:
+    """
+    يعدل رسالة تسجيل المصروف — نص عادي (edit_message_text) لو الفلو
+    بدأ من زر اللوحة الثابتة، أو caption لو الفلو بدأ من صورة مصروف
+    مؤكدة (expense["photo_file_id"] موجود).
+    """
+    if expense.get("photo_file_id"):
+        await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+    else:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+
+
 async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل ضغطات الأزرار الخاصة بفلو تسجيل مصروف."""
     global _pending_expense
@@ -2059,23 +2183,21 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "exp_amount_add_small":
         expense["amount"] = expense.get("amount", 0) + PAYMENT_AMOUNT_STEP_SMALL
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_amount_keyboard()
-        )
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_amount_keyboard())
         return
 
     if data == "exp_amount_add_large":
         expense["amount"] = expense.get("amount", 0) + PAYMENT_AMOUNT_STEP_LARGE
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_amount_keyboard()
-        )
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_amount_keyboard())
         return
 
     if data == "exp_amount_manual":
         expense["awaiting_manual_amount"] = True
-        await query.edit_message_text(
-            text=format_expense_summary(expense) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            reply_markup=None,
+        await edit_expense_message(
+            query,
+            expense,
+            format_expense_summary(expense) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            None,
         )
         return
 
@@ -2083,17 +2205,13 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         if not expense.get("amount"):
             await query.answer("لازم تحدد مبلغ أكبر من صفر أول.", show_alert=True)
             return
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_vault_keyboard()
-        )
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_vault_keyboard())
         return
 
     if data.startswith("exp_vault_"):
         vault_key = data[len("exp_vault_"):]
         expense["vault"] = None if vault_key == "none" else vault_key
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_reason_keyboard()
-        )
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
         return
 
     if data.startswith("exp_reason_") and data not in ("exp_reason_list", "exp_reason_manual"):
@@ -2108,29 +2226,29 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
         try:
-            await query.edit_message_text(text=final_text, reply_markup=None)
+            await edit_expense_message(query, expense, final_text, None)
         except Exception:
             logger.exception("Failed to update final expense confirmation message")
         _pending_expense = None
         return
 
     if data == "exp_reason_list":
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_reason_list_keyboard()
+        await edit_expense_message(
+            query, expense, format_expense_summary(expense), build_expense_reason_list_keyboard()
         )
         return
 
     if data == "exp_back_to_reason":
-        await query.edit_message_text(
-            text=format_expense_summary(expense), reply_markup=build_expense_reason_keyboard()
-        )
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
         return
 
     if data == "exp_reason_manual":
         expense["awaiting_manual_reason"] = True
-        await query.edit_message_text(
-            text=format_expense_summary(expense) + "\n\nاكتب سبب المصروف بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            reply_markup=None,
+        await edit_expense_message(
+            query,
+            expense,
+            format_expense_summary(expense) + "\n\nاكتب سبب المصروف بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            None,
         )
         return
 
@@ -2314,6 +2432,21 @@ async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEF
     return True
 
 
+async def edit_expense_message_by_bot(context: ContextTypes.DEFAULT_TYPE, expense: dict, text: str, reply_markup) -> None:
+    """
+    نسخة من edit_expense_message تستخدم context.bot مباشرة (بدل query)
+    — للاستدعاء من مكان ما فيه callback_query (مثل رد نصي على رسالة).
+    """
+    if expense.get("photo_file_id"):
+        await context.bot.edit_message_caption(
+            chat_id=OWNER_USER_ID, message_id=expense["message_id"], caption=text, reply_markup=reply_markup
+        )
+    else:
+        await context.bot.edit_message_text(
+            chat_id=OWNER_USER_ID, message_id=expense["message_id"], text=text, reply_markup=reply_markup
+        )
+
+
 async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يلتقط رد نصي منك أثناء تسجيل مصروف — إما مبلغ يدوي أو سبب حر،
@@ -2342,11 +2475,8 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
         expense["amount"] = amount
         expense["awaiting_manual_amount"] = False
         try:
-            await context.bot.edit_message_text(
-                chat_id=OWNER_USER_ID,
-                message_id=expense["message_id"],
-                text=format_expense_summary(expense),
-                reply_markup=build_expense_amount_keyboard(),
+            await edit_expense_message_by_bot(
+                context, expense, format_expense_summary(expense), build_expense_amount_keyboard()
             )
         except Exception:
             logger.exception("Failed to update expense caption after manual amount entry")
@@ -2369,9 +2499,7 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
         try:
-            await context.bot.edit_message_text(
-                chat_id=OWNER_USER_ID, message_id=expense["message_id"], text=final_text, reply_markup=None
-            )
+            await edit_expense_message_by_bot(context, expense, final_text, None)
         except Exception:
             logger.exception("Failed to update final expense confirmation after manual reason entry")
         _pending_expense = None
@@ -2545,6 +2673,18 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
     return True
 
 
+async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يعالج صور مرسلة مباشرة لمحادثتك مع البوت (مو Business، مو رد على
+    رسالة قديمة) — محتملة إثبات مصروف، نفس معاملة الصور اللي ترسلها
+    بمحادثة زبون.
+    """
+    message = update.message
+    if not message or not message.photo:
+        return
+    await handle_owner_expense_photo(update, context, message.photo)
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
@@ -2598,6 +2738,12 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # البوت مع أزرار تأكيد/إلغاء عشان تبدأ تسجيل عملية الدفع
     if bm.photo and not is_from_owner:
         await handle_incoming_payment_photo(update, context, bm)
+        return
+
+    # صورة أرسلتها أنت (owner) بمحادثتك مع زبون معين — محتملة إثبات
+    # مصروف، نحولها لمحادثتك مع البوت ونسألك تأكيد
+    if bm.photo and is_from_owner:
+        await handle_owner_expense_photo(update, context, bm.photo)
         return
 
     if not bm.text:
@@ -2739,6 +2885,9 @@ def main() -> None:
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
 
+    # زرين تأكيد صورة مصروف محتملة (✅ مصروف / ❌ ليس مصروف)
+    app.add_handler(CallbackQueryHandler(handle_expense_photo_callback, pattern=r"^expphoto_"))
+
     # أزرار الإحصائيات — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_stats_callback, pattern=r"^stats_"))
 
@@ -2755,6 +2904,15 @@ def main() -> None:
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & filters.User(OWNER_USER_ID),
             on_owner_private_message,
+        )
+    )
+
+    # صور مرسلة مباشرة لمحادثتك مع البوت (مو رد، مو Business) — محتملة
+    # إثبات مصروف
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.PHOTO & filters.User(OWNER_USER_ID),
+            on_owner_private_photo,
         )
     )
 
