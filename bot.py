@@ -59,6 +59,13 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])  # الـ Telegram User ID تبعك انت (owner)
+NOTIFICATIONS_GROUP_ID = int(os.environ.get("NOTIFICATIONS_GROUP_ID", "-1003771659131"))  # قروب سجل الردود
+
+# أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
+TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشاكل الكود
+TOPIC_PAYMENTS = 8        # إشعار كل عملية دفع/إضافة منتج
+TOPIC_EXPENSES = 10       # إشعار كل عملية مصروف
+TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر مع البوت
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -467,20 +474,22 @@ def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_product_keyboard() -> InlineKeyboardMarkup:
-    """أول شاشة بعد التأكيد — اختيار سريع لأكثر منتج مبيع + بقية المنتجات."""
+    """أول شاشة بعد التأكيد — اختيار سريع لأكثر منتج مبيع + بقية المنتجات + إدخال حر."""
     quick_pick = PAYMENT_PRODUCTS[0]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(quick_pick, callback_data=f"pay_product_{quick_pick}")],
         [InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")],
+        [InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")],
     ])
 
 
 def build_product_list_keyboard() -> InlineKeyboardMarkup:
-    """قائمة كل المنتجات ما عدا الاختيار السريع (اللي طلع بالشاشة السابقة) + زر رجوع."""
+    """قائمة كل المنتجات ما عدا الاختيار السريع + إدخال حر + زر رجوع."""
     rows = [
         [InlineKeyboardButton(p, callback_data=f"pay_product_{p}")]
         for p in PAYMENT_PRODUCTS[1:]
     ]
+    rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")])
     rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_product")])
     return InlineKeyboardMarkup(rows)
 
@@ -516,6 +525,7 @@ def build_summary_keyboard(has_product: bool, has_payment: bool) -> InlineKeyboa
     if not has_product:
         rows.append([InlineKeyboardButton(PAYMENT_PRODUCTS[0], callback_data=f"pay_product_{PAYMENT_PRODUCTS[0]}")])
         rows.append([InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")])
+        rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")])
     else:
         rows.append([InlineKeyboardButton(PAYMENT_METHODS[0], callback_data=f"pay_method_{PAYMENT_METHODS[0]}")])
         rows.append([InlineKeyboardButton("بقية الطرق ▾", callback_data="pay_method_list")])
@@ -749,6 +759,23 @@ def format_expense_summary(expense: dict) -> str:
     lines.append(f"الخزنة: {vault if vault else '— لم تُحدد بعد —'}")
     lines.append(f"السبب: {reason if reason else '— لم يُحدد بعد —'}")
     return "\n".join(lines)
+
+
+async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
+    """يبعث إشعار مصروف مكتمل لفرع 'مصروفات' بقروب الإشعارات."""
+    vault_line = expense.get("vault") or "بدون خزنة محددة"
+    notification = (
+        f"💸 مصروف جديد\n"
+        f"السبب: {expense.get('reason')}\n"
+        f"المبلغ: {expense.get('amount')}\n"
+        f"الخزنة: {vault_line}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_EXPENSES, text=notification
+        )
+    except Exception:
+        logger.exception("Failed to send expense notification to topic")
 
 
 def append_expense_row(amount: int, reason: str) -> bool:
@@ -1664,9 +1691,9 @@ async def notify_owner(
     bot_reply: str,
 ) -> None:
     """
-    يرسل تنبيه حقيقي (بإشعار عادي) للأونر يوضح اسم الزبون، chat_id،
-    شنو كتب، وشنو رد البوت — لأن ردود البوت نفسها ما توصل إشعار
-    (لأنها تنرسل بحساب الأونر نفسه عبر business_connection_id).
+    يرسل تنبيه (اسم الزبون، chat_id، شنو كتب، وشنو رد البوت) لقروب
+    الإشعارات المخصص — لأن ردود البوت نفسها ما توصل إشعار (لأنها
+    تنرسل بحساب الأونر نفسه عبر business_connection_id).
     """
     username_part = f" (@{customer_username})" if customer_username else ""
     notification = (
@@ -1676,7 +1703,9 @@ async def notify_owner(
         f"🤖 رد البوت:\n{bot_reply}"
     )
     try:
-        await context.bot.send_message(chat_id=OWNER_USER_ID, text=notification)
+        await context.bot.send_message(
+            chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_NOTIFICATIONS, text=notification
+        )
     except Exception:
         logger.exception("Failed to notify owner")
 
@@ -1723,6 +1752,7 @@ async def handle_incoming_payment_photo(
         "pending_method": None,
         "pending_amount": 0,
         "awaiting_manual_amount": False,
+        "awaiting_manual_product": False,
     }
 
 
@@ -1765,7 +1795,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # -------------------- اختيار منتج مباشر (سريع أو من القائمة) --------------------
-    if data.startswith("pay_product_") and data != "pay_product_list":
+    if data.startswith("pay_product_") and data not in ("pay_product_list", "pay_product_manual"):
         product = data[len("pay_product_"):]
         state["product"] = product
         await query.edit_message_caption(
@@ -1779,6 +1809,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_caption(
             caption=format_payment_summary(state),
             reply_markup=build_product_list_keyboard(),
+        )
+        return
+
+    # -------------------- طلب إدخال اسم منتج حر (ينتظر رسالة نصية جاية كرد) --------------------
+    if data == "pay_product_manual":
+        state["awaiting_manual_product"] = True
+        await query.edit_message_caption(
+            caption=format_payment_summary(state) + "\n\nاكتب اسم المنتج بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
         )
         return
 
@@ -1874,6 +1913,22 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 if method in VAULT_NAMES:
                     adjust_vault_balance(method, amount)
 
+        # نبعث إشعار لفرع "مدفوعات" بكل تفاصيل العملية — سطر منفصل لكل
+        # طريقة دفع لو دفع الزبون بأكثر من طريقة بنفس العملية
+        if saved:
+            payment_lines = "\n".join(f"{method}: {amount}" for method, amount in state["payments"])
+            payment_notification = (
+                f"✅ عملية دفع جديدة\n"
+                f"المنتج: {state['product']}\n"
+                f"{payment_lines}"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_PAYMENTS, text=payment_notification
+                )
+            except Exception:
+                logger.exception("Failed to send payment notification to topic")
+
         # نحفظ نسخة خفيفة من بيانات الزبون بعد التثبيت — عشان نقدر نربطها
         # لاحقاً لو رديت على رسالة التأكيد بإيميل/خاص (حساب ChatGPT خاص)
         _completed_payments[message_id] = {
@@ -1894,6 +1949,42 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception("Failed to update final payment confirmation message")
         return
+
+
+async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
+    البوت ينتظر إدخال اسم منتج حر لعملية دفع جارية (رد على رسالة الصورة).
+    يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
+    """
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+
+    replied_id = message.reply_to_message.message_id
+    state = _pending_payments.get(replied_id)
+    if state is None or not state.get("awaiting_manual_product"):
+        return False
+
+    product = message.text.strip()
+    if not product:
+        await message.reply_text("الرجاء كتابة اسم منتج غير فارغ.")
+        return True
+
+    state["product"] = product
+    state["awaiting_manual_product"] = False
+
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=OWNER_USER_ID,
+            message_id=replied_id,
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(has_product=True, has_payment=bool(state["payments"])),
+        )
+    except Exception:
+        logger.exception("Failed to update caption after manual product entry")
+
+    return True
 
 
 async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2000,6 +2091,8 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         saved = append_expense_row(expense["amount"], reason)
         if saved and expense.get("vault"):
             adjust_vault_balance(expense["vault"], -expense["amount"])
+        if saved:
+            await send_expense_notification(context, expense)
         final_text = format_expense_summary(expense) + (
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
@@ -2259,6 +2352,8 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
         saved = append_expense_row(expense["amount"], reason)
         if saved and expense.get("vault"):
             adjust_vault_balance(expense["vault"], -expense["amount"])
+        if saved:
+            await send_expense_notification(context, expense)
         final_text = format_expense_summary(expense) + (
             "\n\n✅ تم الحفظ بنجاح." if saved else "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
         )
@@ -2442,10 +2537,13 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
-    مع البوت — إدخال مبلغ يدوي أثناء تسجيل دفع، تسجيل حساب ChatGPT
-    خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل رصيد خزنة
-    يدوياً، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة حساب تفاعلي.
+    مع البوت — إدخال اسم منتج حر أو مبلغ يدوي أثناء تسجيل دفع، تسجيل
+    حساب ChatGPT خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل
+    رصيد خزنة يدوياً، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة حساب
+    تفاعلي.
     """
+    if await handle_manual_product_entry(update, context):
+        return
     if await handle_manual_amount_entry(update, context):
         return
     if await handle_expense_manual_entry(update, context):
@@ -2550,7 +2648,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"البوت ما رد تلقائياً — يحتاج تدخلك المباشر."
         )
         try:
-            await context.bot.send_message(chat_id=OWNER_USER_ID, text=complaint_notification)
+            await context.bot.send_message(
+                chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_NOTIFICATIONS, text=complaint_notification
+            )
         except Exception:
             logger.exception("Failed to send complaint notification to owner")
 
@@ -2563,7 +2663,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"للمحاولات التلقائية. يحتاج تدخلك المباشر."
         )
         try:
-            await context.bot.send_message(chat_id=OWNER_USER_ID, text=stopped_notification)
+            await context.bot.send_message(
+                chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_NOTIFICATIONS, text=stopped_notification
+            )
         except Exception:
             logger.exception("Failed to send stopped-retry notification to owner")
 
