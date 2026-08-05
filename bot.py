@@ -66,6 +66,7 @@ TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشا�
 TOPIC_PAYMENTS = 8        # إشعار كل عملية دفع/إضافة منتج
 TOPIC_EXPENSES = 10       # إشعار كل عملية مصروف
 TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر مع البوت
+TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط زبون بحساب
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -1669,6 +1670,14 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=OWNER_USER_ID,
                 text=f"✅ تمت اضافة الحساب.\nرمز الربط: {link_code}\nملاحظة: {label or '—'}",
             )
+            try:
+                await context.bot.send_message(
+                    chat_id=NOTIFICATIONS_GROUP_ID,
+                    message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
+                    text=f"➕ حساب مشترك جديد\nرمز الربط: {link_code}\nملاحظة: {label or '—'}",
+                )
+            except Exception:
+                logger.exception("Failed to send new-account notification to topic")
         except Exception as e:
             logger.exception("addaccount failed")
             await context.bot.send_message(
@@ -1714,6 +1723,19 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             chat_id=OWNER_USER_ID,
             text=f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}",
         )
+        try:
+            customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
+            customer_username_for_topic = bm.chat.username if bm is not None else None
+            customer_line_for_topic = customer_name_for_topic
+            if customer_username_for_topic:
+                customer_line_for_topic += f" (@{customer_username_for_topic})"
+            await context.bot.send_message(
+                chat_id=NOTIFICATIONS_GROUP_ID,
+                message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
+                text=f"🔗 ربط زبون بحساب مشترك\nالزبون: {customer_line_for_topic}\nالحساب: {label or link_code}",
+            )
+        except Exception:
+            logger.exception("Failed to send account-link notification to topic")
         return True
 
     # /resetcode  (يُرسل داخل محادثة الزبون نفسه — يصفر عداد محاولات الكود)
@@ -2590,6 +2612,14 @@ async def handle_add_account_flow(update: Update, context: ContextTypes.DEFAULT_
                 {"link_code": link_code, "secret": secret, "label": label}
             ).execute()
             await message.reply_text(f"✅ تمت اضافة الحساب.\nرمز الربط: {link_code}\nملاحظة: {label or '—'}")
+            try:
+                await context.bot.send_message(
+                    chat_id=NOTIFICATIONS_GROUP_ID,
+                    message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
+                    text=f"➕ حساب مشترك جديد\nرمز الربط: {link_code}\nملاحظة: {label or '—'}",
+                )
+            except Exception:
+                logger.exception("Failed to send new-account notification to topic")
         except Exception as e:
             logger.exception("Failed to add account via interactive flow")
             await message.reply_text(f"⚠️ فشلت الاضافة — تأكد ان رمز الربط '{link_code}' غير مستخدم سابقاً.\n{e}")
