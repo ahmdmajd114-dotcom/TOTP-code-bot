@@ -1242,9 +1242,13 @@ async def classify_chatgpt_context(text: str) -> str:
     قصد الزبون الحقيقي وقت أي ذكر لـ chatgpt بالرسالة. يرجع 'شراء' أو
     'شكوى' أو 'غير_متعلق' (افتراضي 'شراء' لو فشل الاتصال، عشان البوت
     يرد بأسعار chatgpt بدل ما يسكت أو يتجاهل رسالة قد تكون طلب حقيقي).
+
+    ملاحظة: موديلات gpt-oss هي "reasoning models" — تحتاج reasoning_effort
+    منخفض (عشان السرعة وتقليل التكلفة لمهمة تصنيف بسيطة) و max_completion_tokens
+    كافي لاستيعاب أي تفكير داخلي قبل الجواب النهائي، وإلا ينقطع الرد.
     """
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
@@ -1254,7 +1258,8 @@ async def classify_chatgpt_context(text: str) -> str:
                 json={
                     "model": CHATGPT_CONTEXT_MODEL,
                     "temperature": 0,
-                    "max_tokens": 10,
+                    "max_completion_tokens": 500,
+                    "reasoning_effort": "low",
                     "messages": [
                         {"role": "system", "content": CHATGPT_CONTEXT_PROMPT},
                         {"role": "user", "content": text},
@@ -1264,6 +1269,7 @@ async def classify_chatgpt_context(text: str) -> str:
         resp.raise_for_status()
         data = resp.json()
         raw = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"classify_chatgpt_context raw response: {raw!r} (input: {text!r})")
         if "شكوى" in raw:
             return "شكوى"
         if "غير" in raw:
