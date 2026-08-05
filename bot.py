@@ -403,14 +403,6 @@ FAQ_RULES = [
     ),
 ]
 
-# كلمات تدل على وجود شكوى/مشكلة تقنية — تستخدم مع كلمات chatgpt عشان
-# نقرر هل نفعّل فحص الذكاء الاصطناعي (شوف classify_chatgpt_context)
-COMPLAINT_KEYWORDS = [
-    "مشكلة", "مشكله", "ما يشتغل", "خربان", "وقف", "ما يفتح",
-    "خطأ", "غلط", "ما يدخل", "ما يقبل", "طلع", "طلعت", "رفض", "عطل",
-    "معطل", "خرب",
-]
-
 SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
 PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
 TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
@@ -1218,22 +1210,38 @@ def build_vault_edit_mode_keyboard(vault_name: str) -> InlineKeyboardMarkup:
 # شراء/سؤال سعر فعلي، أو شكوى بمشكلة باشتراك موجود اصلا (يوقف الرد،
 # وينبه الأونر). كل باقي التصنيف يعتمد على الكلمات المفتاحية مباشرة.
 # ------------------------------------------------------------------
+# موديل مخصص لفحص قصد الزبون وقت ذكر chatgpt — أدق بفهم اللهجة
+# العراقية من الموديل الافتراضي، يستخدم بس لهذا الفحص المحدد
+CHATGPT_CONTEXT_MODEL = "openai/gpt-oss-120b"
+
 CHATGPT_CONTEXT_PROMPT = (
-    "رسالة زبون بمتجر عراقي تحتوي ذكر ChatGPT (جات/چات/جي بي تي). "
-    "حدد هل هذي شكوى بمشكلة باشتراك ChatGPT موجود اصلا عنده، او طلب "
-    "شراء/سؤال سعر/توفر فعلي. رد بكلمة وحدة بالضبط: 'شكوى' او 'شراء'. "
-    "امثلة: 'عندي مشكلة بجات' → شكوى. 'جات ما يشتغل' → شكوى. "
-    "'اريد جات' → شراء. 'اشتراك جات موجود؟' → شراء. "
-    "'كم سعر جات' → شراء."
+    "انت تحلل رسائل زبائن عراقيين بمتجر يبيع اشتراكات ChatGPT، باللهجة "
+    "العراقية العامية. الرسالة الجاية فيها ذكر لـ ChatGPT (جات/چات/جي بي تي). "
+    "صنف قصد الزبون الحقيقي لفئة وحدة بالضبط:\n\n"
+    "شراء: يريد يشتري اشتراك جديد، يسأل عن السعر، يسأل هل متوفر، يريد يجدد.\n"
+    "شكوى: عنده اشتراك جات موجود اصلا وفيه مشكلة (ما يشتغل، توقف، خطأ، رفض).\n"
+    "غير_متعلق: يذكر كلمة جات بس مب بخصوص الشراء أو الاشتراك إطلاقاً — "
+    "مثل سؤال عام، رأي، دردشة، أو حتى لو يسأل عن جات كموضوع عام مب متعلق "
+    "بالمتجر (مثل \"شكو جات زين؟\" أو \"جات يفهم عربي؟\").\n\n"
+    "امثلة:\n"
+    "'عندي مشكلة بجات' → شكوى\n"
+    "'جات ما يشتغل' → شكوى\n"
+    "'اريد جات' → شراء\n"
+    "'اشتراك جات موجود؟' → شراء\n"
+    "'كم سعر جات' → شراء\n"
+    "'شكو جات زين وياكم؟' → غير_متعلق\n"
+    "'جات افضل لو جيميناي؟' → غير_متعلق\n"
+    "'شنو رايكم بجات الجديد؟' → غير_متعلق\n\n"
+    "رد بكلمة وحدة بالضبط: شراء، او شكوى، او غير_متعلق."
 )
 
 
 async def classify_chatgpt_context(text: str) -> str:
     """
-    يستخدم الذكاء الاصطناعي (Groq) بس لتمييز شكوى عن شراء وقت وجود
-    ذكر لـ chatgpt بالرسالة. يرجع 'شكوى' او 'شراء' (افتراضي 'شراء' لو
-    فشل الاتصال، عشان البوت يرد بأسعار chatgpt بدل ما يسكت — الاحتمال
-    الأكثر شيوعاً هو طلب شراء فعلي).
+    يستخدم الذكاء الاصطناعي (Groq، موديل CHATGPT_CONTEXT_MODEL) لتمييز
+    قصد الزبون الحقيقي وقت أي ذكر لـ chatgpt بالرسالة. يرجع 'شراء' أو
+    'شكوى' أو 'غير_متعلق' (افتراضي 'شراء' لو فشل الاتصال، عشان البوت
+    يرد بأسعار chatgpt بدل ما يسكت أو يتجاهل رسالة قد تكون طلب حقيقي).
     """
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -1244,7 +1252,7 @@ async def classify_chatgpt_context(text: str) -> str:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": GROQ_MODEL,
+                    "model": CHATGPT_CONTEXT_MODEL,
                     "temperature": 0,
                     "max_tokens": 10,
                     "messages": [
@@ -1258,6 +1266,8 @@ async def classify_chatgpt_context(text: str) -> str:
         raw = data["choices"][0]["message"]["content"].strip()
         if "شكوى" in raw:
             return "شكوى"
+        if "غير" in raw:
+            return "غير_متعلق"
         return "شراء"
     except Exception:
         logger.exception("Groq chatgpt-context check failed — defaulting to شراء")
@@ -1291,17 +1301,13 @@ def keyword_match_categories(text: str) -> list[str]:
     return [category for _, category in matches]
 
 
-def has_complaint_keyword(text: str) -> bool:
-    normalized = text.strip().lower()
-    return any(kw in normalized for kw in COMPLAINT_KEYWORDS)
-
-
 async def classify_intent(text: str) -> tuple[list[str], bool]:
     """
     المصنف الرئيسي المستخدم بكل رسالة. الأساس مطابقة كلمات مفتاحية
     مباشرة (سريع وموثوق، بدون ذكاء اصطناعي). الذكاء الاصطناعي يتفعل
-    بس لو الرسالة تحتوي كلمة مفتاحية لـ chatgpt، عشان يميز شكوى عن
-    شراء (شي ما تقدر الكلمات المفتاحية وحدها تميزه بدقة).
+    بس لو الرسالة تحتوي كلمة مفتاحية لـ chatgpt، عشان يميز قصد الزبون
+    الحقيقي (شراء/شكوى/غير متعلق) — شي ما تقدر الكلمات المفتاحية وحدها
+    تميزه بدقة، خصوصاً لما زبون يذكر "جات" بسياق عام مب متعلق بالشراء.
 
     يرجع (categories, is_chatgpt_complaint):
     - categories: قائمة فئات (ممكن فيها "شكوى_منتج" اذا كانت شكوى
@@ -1310,15 +1316,22 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     """
     categories = keyword_match_categories(text)
 
-    if "chatgpt" in categories and has_complaint_keyword(text):
-        # فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة — هذا بالضبط الحالة
-        # اللي تحتاج فهم AI للتمييز (الكلمات المفتاحية وحدها ما تكفي)
+    if "chatgpt" in categories:
+        # أي ذكر لـ chatgpt يحتاج فحص AI يحدد القصد الحقيقي — مب بس
+        # حالة الشكوى، عشان نمنع رد أسعار خاطئ على رسائل مب متعلقة
         verdict = await classify_chatgpt_context(text)
+
         if verdict == "شكوى":
-            # نشيل chatgpt من الفئات ونضيف فئة خاصة "شكوى_منتج"
             categories = [c for c in categories if c != "chatgpt"]
             categories.append("شكوى_منتج")
             return categories, True
+
+        if verdict == "غير_متعلق":
+            # الزبون ذكر جات بس مب طالب شراء ولا عنده شكوى — نشيل فئة
+            # chatgpt بالكامل، ما نرد عليها إطلاقاً (نتجاهل هذا الجزء)
+            categories = [c for c in categories if c != "chatgpt"]
+
+        # verdict == "شراء" → نخلي فئة chatgpt كما هي، يطلع رد الأسعار
 
     return categories, False
 
