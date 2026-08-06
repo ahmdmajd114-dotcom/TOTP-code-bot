@@ -67,6 +67,7 @@ TOPIC_PAYMENTS = 8        # إشعار كل عملية دفع/إضافة منت�
 TOPIC_EXPENSES = 10       # إشعار كل عملية مصروف
 TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر مع البوت
 TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط زبون بحساب
+TOPIC_DEBTS = int(os.environ.get("TOPIC_DEBTS", "0"))  # تسجيل دين جديد + تسديد دين — لازم تحدد رقمه الحقيقي
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
@@ -189,6 +190,116 @@ def get_vaults_worksheet():
         return None
 
 
+_debts_sheet = None
+
+# أعمدة صفحة الديون بالترتيب
+DEBT_COL_DATE = 1
+DEBT_COL_CHAT_ID = 2
+DEBT_COL_CUSTOMER = 3
+DEBT_COL_PRODUCT = 4
+DEBT_COL_AMOUNT = 5
+DEBT_COL_STATUS = 6  # "غير مدفوع" أو "مدفوع"
+DEBT_COL_PAID_DATE = 7
+
+
+def get_debts_worksheet():
+    """
+    يرجع كائن صفحة (Tab) الديون، وينشئها تلقائياً لو مو موجودة —
+    (التاريخ، Chat ID، الزبون، المنتج، المبلغ، الحالة، تاريخ التسديد).
+    يرجع None لو فشل الاتصال.
+    """
+    global _debts_sheet
+    if _debts_sheet is not None:
+        return _debts_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _debts_sheet = spreadsheet.worksheet(DEBTS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            _debts_sheet = spreadsheet.add_worksheet(
+                title=DEBTS_WORKSHEET_NAME, rows=1000, cols=7
+            )
+            _debts_sheet.append_row(
+                ["التاريخ", "Chat ID", "الزبون", "المنتج", "المبلغ", "الحالة", "تاريخ التسديد"],
+                value_input_option="USER_ENTERED",
+            )
+            logger.info(f"Created new debts worksheet: {DEBTS_WORKSHEET_NAME}")
+        return _debts_sheet
+    except Exception:
+        logger.exception("Failed to connect to debts worksheet")
+        return None
+
+
+def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int) -> bool:
+    """يضيف سطر دين جديد (غير مدفوع) لصفحة الديون. يرجع True لو نجح الحفظ."""
+    sheet = get_debts_worksheet()
+    if sheet is None:
+        return False
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    row = [date_str, str(chat_id), customer_line, product, amount, "غير مدفوع", ""]
+
+    try:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        logger.exception("Failed to append debt row to Google Sheet")
+        return False
+
+
+def find_unpaid_debt(chat_id: int, product: str) -> int | None:
+    """
+    يدور عن أول دين غير مدفوع لنفس الزبون ونفس المنتج بصفحة الديون.
+    يرجع رقم الصف (1-indexed لـ gspread) لو لقى، أو None.
+    """
+    sheet = get_debts_worksheet()
+    if sheet is None:
+        return None
+
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read debts rows while searching for unpaid debt")
+        return None
+
+    chat_id_str = str(chat_id)
+    for i in range(1, len(rows)):  # نتجاوز صف العناوين
+        row = rows[i]
+        if len(row) < DEBT_COL_STATUS:
+            continue
+        row_chat_id = row[DEBT_COL_CHAT_ID - 1].strip()
+        row_product = row[DEBT_COL_PRODUCT - 1].strip()
+        row_status = row[DEBT_COL_STATUS - 1].strip()
+        if row_chat_id == chat_id_str and row_product == product and row_status == "غير مدفوع":
+            return i + 1
+
+    return None
+
+
+def mark_debt_paid(row_number: int) -> bool:
+    """يحدث حالة دين معين لـ'مدفوع' مع تاريخ التسديد. يرجع True لو نجح."""
+    sheet = get_debts_worksheet()
+    if sheet is None:
+        return False
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    try:
+        sheet.update_cell(row_number, DEBT_COL_STATUS, "مدفوع")
+        sheet.update_cell(row_number, DEBT_COL_PAID_DATE, date_str)
+        return True
+    except Exception:
+        logger.exception("Failed to mark debt as paid")
+        return False
+
+
 # ------------------------------------------------------------------
 # منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
 # القديم. مخزن بذاكرة البرنامج (ينمحي عند اعادة تشغيل البوت، وهذا
@@ -276,6 +387,20 @@ _pending_stats_period: dict | None = None
 # {message_id, vault_name, mode} — mode: "set" | "add" | "sub"
 # ------------------------------------------------------------------
 _pending_vault_edit: dict | None = None
+
+# ------------------------------------------------------------------
+# حالة مؤقتة لفلو تسجيل دين جديد — بس عملية وحدة بنفس الوقت.
+# {
+#   "message_id": int,
+#   "step": "chat_id" | "product" | "amount",
+#   "chat_id": int | None,
+#   "customer_line": str | None,
+#   "product": str | None,
+#   "amount": int,
+#   "awaiting_manual_amount": bool,
+# }
+# ------------------------------------------------------------------
+_pending_debt: dict | None = None
 
 # ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
@@ -484,17 +609,22 @@ EXPENSES_WORKSHEET_NAME = "ورقة المصروفات"
 # اسم صفحة (Tab) خزائن الرصيد بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
 VAULTS_WORKSHEET_NAME = "خزائن الرصيد"
 
+# اسم صفحة (Tab) الديون بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
+DEBTS_WORKSHEET_NAME = "ديون"
+
 # نصوص أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق الكتابة
 BTN_EXPENSE = "💸 تسجيل مصروف"
 BTN_INCOME = "📊 تقرير الدخل"
 BTN_ADD_ACCOUNT = "➕ إضافة حساب"
 BTN_STATS = "📈 إحصائيات"
+BTN_DEBT = "💳 تسجيل دين"
 BTN_BACK = "◀️ رجوع"
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
+        [KeyboardButton(BTN_DEBT)],
     ],
     resize_keyboard=True,
 )
@@ -563,10 +693,12 @@ def build_amount_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_summary_keyboard(has_product: bool, has_payment: bool) -> InlineKeyboardMarkup:
+def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repayment: bool = False) -> InlineKeyboardMarkup:
     """
     الشاشة الرئيسية بعد ما فيه منتج أو طريقة دفع واحدة محفوظة على الأقل —
     زر المرحلة الحالية (منتج أو طريقة دفع جديدة) + زر التثبيت النهائي دايماً.
+    show_debt_repayment=True يضيف زر "تسديد دين" جنب زر التثبيت، لما
+    الزبون عليه دين غير مدفوع يطابق المنتج المختار حالياً.
     """
     rows = []
     if not has_product:
@@ -577,6 +709,8 @@ def build_summary_keyboard(has_product: bool, has_payment: bool) -> InlineKeyboa
         rows.append([InlineKeyboardButton(PAYMENT_METHODS[0], callback_data=f"pay_method_{PAYMENT_METHODS[0]}")])
         rows.append([InlineKeyboardButton("بقية الطرق ▾", callback_data="pay_method_list")])
     rows.append([InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")])
+    if show_debt_repayment:
+        rows.append([InlineKeyboardButton("💳 تسديد دين", callback_data="pay_debt_repay")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -806,6 +940,60 @@ def format_expense_summary(expense: dict) -> str:
     lines.append(f"الخزنة: {vault if vault else '— لم تُحدد بعد —'}")
     lines.append(f"السبب: {reason if reason else '— لم يُحدد بعد —'}")
     return "\n".join(lines)
+
+
+def build_debt_product_keyboard() -> InlineKeyboardMarkup:
+    """شاشة اختيار منتج الدين — منتج سريع + بقية المنتجات + إدخال حر."""
+    quick_pick = PAYMENT_PRODUCTS[0]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(quick_pick, callback_data=f"debt_product_{quick_pick}")],
+        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="debt_product_list")],
+        [InlineKeyboardButton("✏️ إدخال حر", callback_data="debt_product_manual")],
+    ])
+
+
+def build_debt_product_list_keyboard() -> InlineKeyboardMarkup:
+    """قائمة كل المنتجات ما عدا الاختيار السريع + زر رجوع، لمنتج الدين."""
+    rows = [
+        [InlineKeyboardButton(p, callback_data=f"debt_product_{p}")]
+        for p in PAYMENT_PRODUCTS[1:]
+    ]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_debt_amount_keyboard() -> InlineKeyboardMarkup:
+    """شاشة تحديد مبلغ الدين — نفس أزرار مبلغ الدفع، بس callback_data مختلف."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="debt_amount_add_small"),
+            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_LARGE}", callback_data="debt_amount_add_large"),
+        ],
+        [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="debt_amount_manual")],
+        [InlineKeyboardButton("✅ تثبيت الدين", callback_data="debt_amount_commit")],
+    ])
+
+
+def format_debt_summary(debt: dict) -> str:
+    """يبني نص الملخص المعروض فوق أزرار تسجيل الدين."""
+    lines = ["تسجيل دين"]
+    customer_line = debt.get("customer_line")
+    product = debt.get("product")
+    amount = debt.get("amount", 0)
+    lines.append(f"الزبون: {customer_line if customer_line else '— لم يُحدد بعد —'}")
+    lines.append(f"المنتج: {product if product else '— لم يُحدد بعد —'}")
+    lines.append(f"المبلغ: {amount if amount else '— لم يُحدد بعد —'}")
+    return "\n".join(lines)
+
+
+async def send_debt_notification(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """يبعث إشعار دين (تسجيل جديد أو تسديد) لفرع 'ديون' بقروب الإشعارات."""
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_DEBTS, text=text
+        )
+    except Exception:
+        logger.exception("Failed to send debt notification to topic")
 
 
 async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
@@ -1893,9 +2081,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("pay_product_") and data not in ("pay_product_list", "pay_product_manual"):
         product = data[len("pay_product_"):]
         state["product"] = product
+        customer_chat_id = state.get("customer_chat_id")
+        has_debt = (
+            customer_chat_id is not None and find_unpaid_debt(customer_chat_id, product) is not None
+        )
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(has_product=True, has_payment=bool(state["payments"])),
+            reply_markup=build_summary_keyboard(
+                has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
+            ),
         )
         return
 
@@ -1945,9 +2139,16 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     # -------------------- رجوع من قائمة طرق الدفع لشاشة الملخص (اختيار سريع للطريقة) --------------------
     if data == "pay_back_to_method":
+        customer_chat_id = state.get("customer_chat_id")
+        has_debt = (
+            state["product"] and customer_chat_id is not None
+            and find_unpaid_debt(customer_chat_id, state["product"]) is not None
+        )
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(has_product=bool(state["product"]), has_payment=bool(state["payments"])),
+            reply_markup=build_summary_keyboard(
+                has_product=bool(state["product"]), has_payment=bool(state["payments"]), show_debt_repayment=has_debt
+            ),
         )
         return
 
@@ -1988,9 +2189,16 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             state["payments"].append((method, amount))
         state["pending_method"] = None
         state["pending_amount"] = 0
+        customer_chat_id = state.get("customer_chat_id")
+        has_debt = (
+            state["product"] and customer_chat_id is not None
+            and find_unpaid_debt(customer_chat_id, state["product"]) is not None
+        )
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(has_product=bool(state["product"]), has_payment=True),
+            reply_markup=build_summary_keyboard(
+                has_product=bool(state["product"]), has_payment=True, show_debt_repayment=has_debt
+            ),
         )
         return
 
@@ -2045,6 +2253,49 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             logger.exception("Failed to update final payment confirmation message")
         return
 
+    # -------------------- تسديد دين — تستخدم نفس بيانات العملية الحالية --------------------
+    if data == "pay_debt_repay":
+        if not state["product"] or not state["payments"]:
+            await query.answer("لازم تختار منتج وطريقة دفع وحدة على الأقل قبل التسديد.", show_alert=True)
+            return
+
+        customer_chat_id = state.get("customer_chat_id")
+        if customer_chat_id is None:
+            await query.answer("تعذر تحديد الزبون لهذي العملية.", show_alert=True)
+            return
+
+        debt_row = find_unpaid_debt(customer_chat_id, state["product"])
+        if debt_row is None:
+            await query.answer("ماكو دين غير مدفوع مطابق لهذا الزبون والمنتج حالياً.", show_alert=True)
+            return
+
+        repay_amount = sum(amount for _, amount in state["payments"])
+        marked = mark_debt_paid(debt_row)
+
+        # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بالتسديد
+        if marked:
+            for method, amount in state["payments"]:
+                if method in VAULT_NAMES:
+                    adjust_vault_balance(method, amount)
+
+        if marked:
+            customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
+            await send_debt_notification(
+                context,
+                f"✅ تسديد دين\nالزبون: {customer_line}\nالمنتج: {state['product']}\nالمبلغ المسدد: {repay_amount}",
+            )
+            final_text = format_payment_summary(state) + "\n\n✅ تم تسديد الدين بنجاح."
+        else:
+            final_text = format_payment_summary(state) + "\n\n⚠️ فشل تحديث حالة الدين بـ Google Sheet — تحقق من الاتصال يدوياً."
+
+        del _pending_payments[message_id]
+
+        try:
+            await query.edit_message_caption(caption=final_text, reply_markup=None)
+        except Exception:
+            logger.exception("Failed to update final debt-repayment confirmation message")
+        return
+
 
 async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
@@ -2069,12 +2320,19 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
     state["product"] = product
     state["awaiting_manual_product"] = False
 
+    customer_chat_id = state.get("customer_chat_id")
+    has_debt = (
+        customer_chat_id is not None and find_unpaid_debt(customer_chat_id, product) is not None
+    )
+
     try:
         await context.bot.edit_message_caption(
             chat_id=OWNER_USER_ID,
             message_id=replied_id,
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(has_product=True, has_payment=bool(state["payments"])),
+            reply_markup=build_summary_keyboard(
+                has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
+            ),
         )
     except Exception:
         logger.exception("Failed to update caption after manual product entry")
@@ -2122,6 +2380,96 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
         logger.exception("Failed to update caption after manual amount entry")
 
     return True
+
+
+async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج كل ضغطات الأزرار الخاصة بفلو تسجيل دين جديد."""
+    global _pending_debt
+
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    if _pending_debt is None or _pending_debt.get("message_id") != query.message.message_id:
+        await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
+        return
+
+    data = query.data
+    await query.answer()
+    debt = _pending_debt
+
+    if data.startswith("debt_product_") and data not in ("debt_product_list", "debt_product_manual"):
+        product = data[len("debt_product_"):]
+        debt["product"] = product
+        debt["step"] = "amount"
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard())
+        return
+
+    if data == "debt_product_list":
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_product_list_keyboard())
+        return
+
+    if data == "debt_product_manual":
+        debt["awaiting_manual_product"] = True
+        await query.edit_message_text(
+            text=format_debt_summary(debt) + "\n\nاكتب اسم المنتج بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
+        )
+        return
+
+    if data == "debt_back_to_product":
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_product_keyboard())
+        return
+
+    if data == "debt_amount_add_small":
+        debt["amount"] = debt.get("amount", 0) + PAYMENT_AMOUNT_STEP_SMALL
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard())
+        return
+
+    if data == "debt_amount_add_large":
+        debt["amount"] = debt.get("amount", 0) + PAYMENT_AMOUNT_STEP_LARGE
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard())
+        return
+
+    if data == "debt_amount_manual":
+        debt["awaiting_manual_amount"] = True
+        await query.edit_message_text(
+            text=format_debt_summary(debt) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            reply_markup=None,
+        )
+        return
+
+    if data == "debt_amount_commit":
+        if not debt.get("amount") or not debt.get("product") or debt.get("chat_id") is None:
+            await query.answer("لازم تحدد الزبون والمنتج والمبلغ قبل التثبيت.", show_alert=True)
+            return
+
+        saved_main = append_payment_row({
+            "customer_name": debt["customer_line"],
+            "customer_username": None,
+            "customer_chat_id": debt["chat_id"],
+            "product": debt["product"],
+            "payments": [("دين", debt["amount"])],
+        })
+        saved_debt = append_debt_row(debt["chat_id"], debt["customer_line"], debt["product"], debt["amount"])
+
+        if saved_main and saved_debt:
+            final_text = format_debt_summary(debt) + "\n\n✅ تم تسجيل الدين بنجاح."
+            await send_debt_notification(
+                context,
+                f"💳 دين جديد\nالزبون: {debt['customer_line']}\nالمنتج: {debt['product']}\nالمبلغ: {debt['amount']}",
+            )
+        else:
+            final_text = format_debt_summary(debt) + "\n\n⚠️ فشل جزء من الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
+
+        try:
+            await query.edit_message_text(text=final_text, reply_markup=None)
+        except Exception:
+            logger.exception("Failed to update final debt confirmation message")
+        _pending_debt = None
+        return
+
 
 
 async def handle_expense_photo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2533,9 +2881,10 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
 async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يعالج ضغطات أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق
-    الكتابة: تسجيل مصروف، تقرير الدخل، إضافة حساب. يرجع True لو عالج.
+    الكتابة: تسجيل مصروف، تقرير الدخل، إضافة حساب، تسجيل دين. يرجع
+    True لو عالج.
     """
-    global _pending_expense, _pending_add_account
+    global _pending_expense, _pending_add_account, _pending_debt
 
     message = update.message
     if not message or not message.text:
@@ -2570,6 +2919,129 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     if text == BTN_STATS:
         await message.reply_text("الإحصائيات", reply_markup=build_stats_main_keyboard())
+        return True
+
+    if text == BTN_DEBT:
+        sent = await message.reply_text("أرسل chat_id تبع الزبون (رقم فقط):")
+        _pending_debt = {
+            "message_id": sent.message_id,
+            "step": "chat_id",
+            "chat_id": None,
+            "customer_line": None,
+            "product": None,
+            "amount": 0,
+            "awaiting_manual_product": False,
+            "awaiting_manual_amount": False,
+        }
+        return True
+
+    return False
+
+
+async def handle_debt_chat_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط ردك الأول بفلو تسجيل الدين (chat_id الزبون كرد على الرسالة
+    اللي طلبته). يتحقق من صحة الرقم، يجيب اسم/يوزر الزبون من تيليجرام
+    لو ممكن، وينتقل لخطوة اختيار المنتج.
+    """
+    global _pending_debt
+
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+    if _pending_debt is None or _pending_debt.get("message_id") != message.reply_to_message.message_id:
+        return False
+    if _pending_debt["step"] != "chat_id":
+        return False
+
+    text = message.text.strip()
+    try:
+        chat_id = int(text)
+    except ValueError:
+        await message.reply_text("الرجاء إدخال رقم chat_id صحيح فقط.")
+        return True
+
+    # نحاول نجيب اسم الزبون من تيليجرام (لو البوت إله وصول سابق لهذي المحادثة)
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        customer_name = chat.full_name or chat.first_name or "غير معروف"
+        customer_username = chat.username
+        customer_line = format_customer_line(customer_name, customer_username)
+    except Exception:
+        customer_line = f"chat_id: {chat_id}"
+
+    _pending_debt["chat_id"] = chat_id
+    _pending_debt["customer_line"] = customer_line
+    _pending_debt["step"] = "product"
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=OWNER_USER_ID,
+            message_id=_pending_debt["message_id"],
+            text=format_debt_summary(_pending_debt),
+            reply_markup=build_debt_product_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to update debt message after chat_id entry")
+
+    return True
+
+
+async def handle_debt_manual_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رد نصي منك أثناء تسجيل دين — إما اسم منتج حر أو مبلغ يدوي،
+    حسب أي خطوة بانتظار إدخال. يرجع True لو عالج الرسالة.
+    """
+    global _pending_debt
+
+    message = update.message
+    if not message or not message.text or not message.reply_to_message:
+        return False
+    if _pending_debt is None or _pending_debt.get("message_id") != message.reply_to_message.message_id:
+        return False
+
+    debt = _pending_debt
+
+    if debt.get("step") == "product" and debt.get("awaiting_manual_product"):
+        product = message.text.strip()
+        if not product:
+            await message.reply_text("الرجاء كتابة اسم منتج غير فارغ.")
+            return True
+        debt["product"] = product
+        debt["awaiting_manual_product"] = False
+        debt["step"] = "amount"
+        try:
+            await context.bot.edit_message_text(
+                chat_id=OWNER_USER_ID,
+                message_id=debt["message_id"],
+                text=format_debt_summary(debt),
+                reply_markup=build_debt_amount_keyboard(),
+            )
+        except Exception:
+            logger.exception("Failed to update debt message after manual product entry")
+        return True
+
+    if debt.get("awaiting_manual_amount"):
+        try:
+            amount = int(re.sub(r"[^\d]", "", message.text))
+        except ValueError:
+            await message.reply_text("الرجاء إدخال رقم صحيح فقط.")
+            return True
+        if amount <= 0:
+            await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
+            return True
+
+        debt["amount"] = amount
+        debt["awaiting_manual_amount"] = False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=OWNER_USER_ID,
+                message_id=debt["message_id"],
+                text=format_debt_summary(debt),
+                reply_markup=build_debt_amount_keyboard(),
+            )
+        except Exception:
+            logger.exception("Failed to update debt message after manual amount entry")
         return True
 
     return False
@@ -2720,8 +3192,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
     مع البوت — إدخال اسم منتج حر أو مبلغ يدوي أثناء تسجيل دفع، تسجيل
     حساب ChatGPT خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل
-    رصيد خزنة يدوياً، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة حساب
-    تفاعلي.
+    رصيد خزنة يدوياً، فلو تسجيل دين، أزرار لوحة المفاتيح الثابتة، أو
+    فلو إضافة حساب تفاعلي.
     """
     if await handle_manual_product_entry(update, context):
         return
@@ -2732,6 +3204,10 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     if await handle_stats_manual_period_entry(update, context):
         return
     if await handle_vault_edit_manual_entry(update, context):
+        return
+    if await handle_debt_chat_id_entry(update, context):
+        return
+    if await handle_debt_manual_entry(update, context):
         return
     if await handle_chatgpt_account_reply(update, context):
         return
@@ -2920,6 +3396,9 @@ def main() -> None:
 
     # أزرار الإحصائيات — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_stats_callback, pattern=r"^stats_"))
+
+    # أزرار فلو تسجيل الدين
+    app.add_handler(CallbackQueryHandler(handle_debt_callback, pattern=r"^debt_"))
 
     # أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب)
     app.add_handler(CommandHandler("start", cmd_start))
