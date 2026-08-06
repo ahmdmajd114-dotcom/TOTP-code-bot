@@ -1389,6 +1389,16 @@ def get_shared_accounts_list() -> list[dict]:
         return []
 
 
+def get_all_accounts_with_secrets() -> list[dict]:
+    """يرجع كل الحسابات (id, link_code, label, secret) — تستخدم لتوليد أكواد TOTP بفرع التفاعل."""
+    try:
+        res = supabase.table("totp_accounts").select("id, link_code, label, secret").execute()
+        return res.data or []
+    except Exception:
+        logger.exception("Failed to fetch accounts with secrets")
+        return []
+
+
 def get_customers_for_account(account_id) -> list[int]:
     """يرجع قائمة chat_id تبع كل الزباين المرتبطين بحساب مشترك معين."""
     try:
@@ -3231,6 +3241,96 @@ async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(report)
 
 
+def build_getcode_show_keyboard(account_id) -> InlineKeyboardMarkup:
+    """زر 'عرض الكود' — يطلع لما الرسالة تعرض اسم الحساب بس."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👁 عرض الكود", callback_data=f"getcode_show_{account_id}")]])
+
+
+def build_getcode_back_keyboard(account_id) -> InlineKeyboardMarkup:
+    """زر 'رجوع' — يطلع لما الرسالة تعرض الكود نفسه."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع", callback_data=f"getcode_back_{account_id}")]])
+
+
+async def cmd_getcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    أمر /getcode — يشتغل بس بفرع 'تفاعل' بالقروب، من الأونر. يرسل
+    رسالة منفصلة لكل حساب TOTP موجود، فيها اسم الحساب وزر 'عرض الكود'.
+    """
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if update.message is None or update.message.message_thread_id != TOPIC_INTERACTIVE:
+        return  # يشتغل بس بفرع التفاعل، نتجاهل أي استخدام بمكان ثاني
+
+    accounts = get_all_accounts_with_secrets()
+    if not accounts:
+        await update.message.reply_text("ماكو حسابات مسجلة حالياً.")
+        return
+
+    for acc in accounts:
+        display_name = acc.get("label") or acc.get("link_code", "بدون اسم")
+        try:
+            await context.bot.send_message(
+                chat_id=NOTIFICATIONS_GROUP_ID,
+                message_thread_id=TOPIC_INTERACTIVE,
+                text=display_name,
+                reply_markup=build_getcode_show_keyboard(acc["id"]),
+            )
+        except Exception:
+            logger.exception(f"Failed to send getcode message for account {acc.get('id')}")
+
+
+async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج ضغطات زر 'عرض الكود' / 'رجوع' بفرع التفاعل."""
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    data = query.data
+
+    if data.startswith("getcode_show_"):
+        account_id = data[len("getcode_show_"):]
+        try:
+            res = supabase.table("totp_accounts").select("secret, label, link_code").eq("id", account_id).execute()
+        except Exception:
+            logger.exception("Failed to fetch account secret for getcode")
+            await query.answer("صار خطأ أثناء جلب الكود.", show_alert=True)
+            return
+
+        if not res.data:
+            await query.answer("هذا الحساب ما عاد موجود.", show_alert=True)
+            return
+
+        secret = res.data[0]["secret"]
+        code = generate_totp_code(secret)
+        await query.answer()
+        try:
+            await query.edit_message_text(text=code, reply_markup=build_getcode_back_keyboard(account_id))
+        except Exception:
+            logger.exception("Failed to update message with TOTP code")
+        return
+
+    if data.startswith("getcode_back_"):
+        account_id = data[len("getcode_back_"):]
+        try:
+            res = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).execute()
+        except Exception:
+            logger.exception("Failed to fetch account label for getcode back")
+            await query.answer("صار خطأ.", show_alert=True)
+            return
+
+        display_name = "بدون اسم"
+        if res.data:
+            display_name = res.data[0].get("label") or res.data[0].get("link_code", "بدون اسم")
+
+        await query.answer()
+        try:
+            await query.edit_message_text(text=display_name, reply_markup=build_getcode_show_keyboard(account_id))
+        except Exception:
+            logger.exception("Failed to revert message to account name")
+        return
+
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل الرسائل الجاية عن طريق Telegram Business (محادثتك الشخصية)."""
     bm = update.business_message
@@ -3400,12 +3500,19 @@ def main() -> None:
     # أزرار فلو تسجيل الدين
     app.add_handler(CallbackQueryHandler(handle_debt_callback, pattern=r"^debt_"))
 
+    # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
+    app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
+
     # أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب)
     app.add_handler(CommandHandler("start", cmd_start))
 
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
+
+    # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
+    # لكل حساب TOTP مع زر لعرض الكود
+    app.add_handler(CommandHandler("getcode", cmd_getcode))
 
     # رسائل نصية عادية منك بمحادثتك الخاصة مع البوت — تستخدم حالياً
     # بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع (رد على رسالة الصورة)
