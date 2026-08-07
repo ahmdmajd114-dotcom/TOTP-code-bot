@@ -18,6 +18,7 @@
 
 import os
 import re
+import uuid
 import asyncio
 import logging
 import pyotp
@@ -419,6 +420,7 @@ _pending_debt: dict | None = None
 # حالة جلسة تلقين نشطة (الطريقة 3 — تلقين يدوي مباشر) — بس جلسة وحدة
 # بنفس الوقت. تفعل بزر BTN_TEACH، وتضل نشطة لين تضغط "إنهاء الجلسة".
 # {
+#   "session_id": str,                # معرف فريد لهذي الجلسة (يربط كل أمثلتها مع بعض)
 #   "customer_messages": list[str],   # رسائل الزبون المجمّعة (قبل الرد)
 #   "customer_chat_id": int | None,   # لو عرفناه من forward_origin
 #   "awaiting_reply": bool,           # صار ضغط "هذا ردي"، ننتظر نص الرد الجاي
@@ -1049,10 +1051,11 @@ def format_teaching_status(session: dict) -> str:
     )
 
 
-def save_style_example(customer_chat_id, customer_message: str, owner_reply: str, source: str) -> bool:
-    """يحفظ مثال تعلم جديد بجدول style_examples. يرجع True لو نجح."""
+def save_style_example(session_id: str, customer_chat_id, customer_message: str, owner_reply: str, source: str) -> bool:
+    """يحفظ مثال تعلم جديد بجدول style_examples، مربوط بجلسة تلقين معينة. يرجع True لو نجح."""
     try:
         supabase.table("style_examples").insert({
+            "session_id": session_id,
             "customer_chat_id": customer_chat_id,
             "customer_message": customer_message,
             "owner_reply": owner_reply,
@@ -1062,6 +1065,27 @@ def save_style_example(customer_chat_id, customer_message: str, owner_reply: str
     except Exception:
         logger.exception("Failed to save style example")
         return False
+
+
+def archive_conversation_message(
+    customer_chat_id: int, customer_name: str, customer_username: str | None,
+    customer_message: str, bot_reply: str | None,
+) -> None:
+    """
+    يؤرشف رسالة زبون + رد البوت (لو رد) بجدول conversation_archive —
+    الأساس اللي بعدين نختار منه أمثلة تعلم يدوياً. لا يوقف تنفيذ
+    الرسالة الأساسي لو فشل (نسجل الخطأ بس، ما نرفعه للمستدعي).
+    """
+    try:
+        supabase.table("conversation_archive").insert({
+            "customer_chat_id": customer_chat_id,
+            "customer_name": customer_name,
+            "customer_username": customer_username,
+            "customer_message": customer_message,
+            "bot_reply": bot_reply,
+        }).execute()
+    except Exception:
+        logger.exception("Failed to archive conversation message")
 
 
 async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
@@ -3068,7 +3092,12 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         if _teaching_session is not None:
             await message.reply_text("فيه جلسة تلقين شغالة أصلاً — أنهيها أول قبل ما تبدأ وحدة جديدة.")
             return True
-        _teaching_session = {"customer_messages": [], "customer_chat_id": None, "awaiting_reply": False}
+        _teaching_session = {
+            "session_id": str(uuid.uuid4()),
+            "customer_messages": [],
+            "customer_chat_id": None,
+            "awaiting_reply": False,
+        }
         await message.reply_text(
             format_teaching_status(_teaching_session),
             reply_markup=build_teaching_keyboard(has_customer_message=False),
@@ -3369,7 +3398,7 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
 
     # awaiting_reply=True — هذا النص هو الرد، نحفظ المثال ونبدأ مثال جديد
     combined_customer_message = "\n".join(session["customer_messages"])
-    saved = save_style_example(session["customer_chat_id"], combined_customer_message, text, source="manual")
+    saved = save_style_example(session["session_id"], session["customer_chat_id"], combined_customer_message, text, source="manual")
 
     session["customer_messages"] = []
     session["awaiting_reply"] = False
@@ -3623,6 +3652,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to send stopped-retry notification to owner")
 
     if not replies_to_send:
+        archive_conversation_message(chat_id, customer_name, customer_username, text, None)
         return
 
     await human_like_reply_sequence(
@@ -3636,6 +3666,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     logger.info(f"Sent {len(replies_to_send)} reply(ies) to chat_id={chat_id}")
     combined_reply = "\n---\n".join(replies_to_send)
+    archive_conversation_message(chat_id, customer_name, customer_username, text, combined_reply)
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
 
 
