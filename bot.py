@@ -2511,6 +2511,7 @@ async def handle_teaching_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 
+async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج كل ضغطات الأزرار الخاصة بفلو تسجيل دين جديد."""
     global _pending_debt
 
