@@ -19,6 +19,7 @@
 import os
 import re
 import uuid
+import base64
 import asyncio
 import logging
 import pyotp
@@ -1067,22 +1068,58 @@ def save_style_example(session_id: str, customer_chat_id, customer_message: str,
         return False
 
 
-def archive_conversation_message(
-    customer_chat_id: int, customer_name: str, customer_username: str | None,
-    customer_message: str, bot_reply: str | None,
-) -> None:
+CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
+
+
+def get_or_create_conversation_session_id(customer_chat_id: int) -> str:
     """
-    يؤرشف رسالة زبون + رد البوت (لو رد) بجدول conversation_archive —
-    الأساس اللي بعدين نختار منه أمثلة تعلم يدوياً. لا يوقف تنفيذ
-    الرسالة الأساسي لو فشل (نسجل الخطأ بس، ما نرفعه للمستدعي).
+    يرجع conversation_session_id المناسب لرسالة جديدة من هذا الزبون —
+    لو آخر رسالة مؤرشفة لنفس الزبون أقل من 12 ساعة، يرجع نفس رقمها
+    (نفس السياق يستمر). لو أقدم من 12 ساعة أو ماكو رسائل سابقة،
+    يولّد رقم جديد (سياق محادثة جديد).
     """
     try:
+        res = (
+            supabase.table("conversation_archive")
+            .select("conversation_session_id, created_at")
+            .eq("customer_chat_id", customer_chat_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            last_created_at = datetime.fromisoformat(res.data[0]["created_at"].replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - last_created_at < timedelta(hours=CONVERSATION_SESSION_GAP_HOURS):
+                return res.data[0]["conversation_session_id"]
+    except Exception:
+        logger.exception("Failed to check last archived message for session continuity")
+
+    return str(uuid.uuid4())
+
+
+def archive_message(
+    customer_chat_id: int,
+    customer_name: str | None,
+    customer_username: str | None,
+    sender_type: str,
+    message_text: str | None = None,
+    image_description: str | None = None,
+) -> None:
+    """
+    يؤرشف رسالة وحدة (من زبون، أونر، أو بوت) بجدول conversation_archive
+    — يحدد تلقائياً السياق (conversation_session_id) المناسب حسب منطق
+    فاصل الـ 12 ساعة. لا يوقف تنفيذ الرسالة الأساسي لو فشل.
+    """
+    session_id = get_or_create_conversation_session_id(customer_chat_id)
+    try:
         supabase.table("conversation_archive").insert({
+            "conversation_session_id": session_id,
             "customer_chat_id": customer_chat_id,
             "customer_name": customer_name,
             "customer_username": customer_username,
-            "customer_message": customer_message,
-            "bot_reply": bot_reply,
+            "sender_type": sender_type,
+            "message_text": message_text,
+            "image_description": image_description,
         }).execute()
     except Exception:
         logger.exception("Failed to archive conversation message")
@@ -1578,6 +1615,10 @@ def build_vault_edit_mode_keyboard(vault_name: str) -> InlineKeyboardMarkup:
 # العراقية من الموديل الافتراضي، يستخدم بس لهذا الفحص المحدد
 CHATGPT_CONTEXT_MODEL = "openai/gpt-oss-120b"
 
+# موديل مخصص لقراءة ووصف الصور (Vision) — الموديل الوحيد المدعوم
+# رسمياً لقراءة الصور بـ Groq حالياً (يدعم صور + نص بنفس الوقت)
+IMAGE_VISION_MODEL = "qwen/qwen3.6-27b"
+
 CHATGPT_CONTEXT_PROMPT = (
     "انت تحلل رسائل زبائن عراقيين بمتجر يبيع اشتراكات ChatGPT، باللهجة "
     "العراقية العامية. الرسالة الجاية فيها ذكر لـ ChatGPT (جات/چات/جي بي تي). "
@@ -1642,6 +1683,54 @@ async def classify_chatgpt_context(text: str) -> str:
     except Exception:
         logger.exception("Groq chatgpt-context check failed — defaulting to شراء")
         return "شراء"
+
+
+IMAGE_DESCRIPTION_PROMPT = (
+    "صف هذي الصورة بالتفصيل باللغة العربية — وضح شنو محتواها الأساسي، "
+    "وأهم المعلومات الظاهرة فيها (نصوص، أرقام، مبالغ، أسماء تطبيقات، "
+    "أو أي تفاصيل مهمة تساعد فهم سياق الرسالة). رد بوصف واحد شامل "
+    "ومباشر، بدون مقدمات."
+)
+
+
+async def describe_image(file_bytes: bytes) -> str | None:
+    """
+    يستخدم Groq Vision (موديل IMAGE_VISION_MODEL) لوصف محتوى صورة.
+    يرجع الوصف النصي، أو None لو فشل الاتصال أو التحليل.
+    """
+    try:
+        base64_image = base64.b64encode(file_bytes).decode("utf-8")
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": IMAGE_VISION_MODEL,
+                    "temperature": 0.3,
+                    "max_completion_tokens": 500,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": IMAGE_DESCRIPTION_PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        logger.exception("Groq image description failed")
+        return None
 
 
 def keyword_match_categories(text: str) -> list[str]:
@@ -2066,6 +2155,33 @@ async def notify_owner(
         )
     except Exception:
         logger.exception("Failed to notify owner")
+
+
+async def describe_and_archive_customer_photo(context: ContextTypes.DEFAULT_TYPE, bm) -> None:
+    """
+    يحمّل صورة زبون، يوصفها بالذكاء الاصطناعي (Groq Vision)، ويؤرشف
+    الوصف بجدول conversation_archive — بشكل مستقل تماماً عن فلو تأكيد
+    الدفع الموجود، ما يأثر عليه ولا يبطئه (يُستدعى كـ task موازي).
+    """
+    customer_chat_id = bm.chat.id
+    customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
+    customer_username = bm.chat.username
+
+    try:
+        file = await context.bot.get_file(bm.photo[-1].file_id)
+        file_bytes = bytes(await file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download customer photo for description")
+        return
+
+    description = await describe_image(file_bytes)
+    if description is None:
+        return
+
+    archive_message(
+        customer_chat_id, customer_name, customer_username,
+        sender_type="customer", message_text=None, image_description=description,
+    )
 
 
 async def handle_incoming_payment_photo(
@@ -3562,6 +3678,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # صورة دفع جاية من الزبون (مو منك) — نحولها لمحادثتك الخاصة مع
     # البوت مع أزرار تأكيد/إلغاء عشان تبدأ تسجيل عملية الدفع
     if bm.photo and not is_from_owner:
+        # نشغل وصف الصورة بالأرشيف كـ task موازي منفصل — ما يبطئ ولا
+        # يأثر على فلو تأكيد الدفع الأساسي (كل وحدة تشتغل لحالها)
+        asyncio.create_task(describe_and_archive_customer_photo(context, bm))
         await handle_incoming_payment_photo(update, context, bm)
         return
 
@@ -3652,7 +3771,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to send stopped-retry notification to owner")
 
     if not replies_to_send:
-        archive_conversation_message(chat_id, customer_name, customer_username, text, None)
+        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
 
     await human_like_reply_sequence(
@@ -3666,7 +3785,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     logger.info(f"Sent {len(replies_to_send)} reply(ies) to chat_id={chat_id}")
     combined_reply = "\n---\n".join(replies_to_send)
-    archive_conversation_message(chat_id, customer_name, customer_username, text, combined_reply)
+    archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+    archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=combined_reply)
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
 
 
