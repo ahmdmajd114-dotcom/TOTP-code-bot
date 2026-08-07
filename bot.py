@@ -197,15 +197,15 @@ DEBT_COL_DATE = 1
 DEBT_COL_CHAT_ID = 2
 DEBT_COL_CUSTOMER = 3
 DEBT_COL_PRODUCT = 4
-DEBT_COL_AMOUNT = 5
+DEBT_COL_AMOUNT = 5  # المبلغ المتبقي من الدين (يتحدث لأقل عند تسديد جزئي)
 DEBT_COL_STATUS = 6  # "غير مدفوع" أو "مدفوع"
-DEBT_COL_PAID_DATE = 7
+DEBT_COL_PAID_DATE = 7  # يتحدث بتاريخ آخر تسديد (جزئي أو نهائي)
 
 
 def get_debts_worksheet():
     """
     يرجع كائن صفحة (Tab) الديون، وينشئها تلقائياً لو مو موجودة —
-    (التاريخ، Chat ID، الزبون، المنتج، المبلغ، الحالة، تاريخ التسديد).
+    (التاريخ، Chat ID، الزبون، المنتج، المبلغ المتبقي، الحالة، تاريخ آخر تسديد).
     يرجع None لو فشل الاتصال.
     """
     global _debts_sheet
@@ -228,7 +228,7 @@ def get_debts_worksheet():
                 title=DEBTS_WORKSHEET_NAME, rows=1000, cols=7
             )
             _debts_sheet.append_row(
-                ["التاريخ", "Chat ID", "الزبون", "المنتج", "المبلغ", "الحالة", "تاريخ التسديد"],
+                ["التاريخ", "Chat ID", "الزبون", "المنتج", "المبلغ المتبقي", "الحالة", "تاريخ آخر تسديد"],
                 value_input_option="USER_ENTERED",
             )
             logger.info(f"Created new debts worksheet: {DEBTS_WORKSHEET_NAME}")
@@ -239,7 +239,7 @@ def get_debts_worksheet():
 
 
 def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int) -> bool:
-    """يضيف سطر دين جديد (غير مدفوع) لصفحة الديون. يرجع True لو نجح الحفظ."""
+    """يضيف سطر دين جديد (غير مدفوع، المبلغ المتبقي = المبلغ الكامل). يرجع True لو نجح الحفظ."""
     sheet = get_debts_worksheet()
     if sheet is None:
         return False
@@ -255,10 +255,10 @@ def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int)
         return False
 
 
-def find_unpaid_debt(chat_id: int, product: str) -> int | None:
+def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
     """
     يدور عن أول دين غير مدفوع لنفس الزبون ونفس المنتج بصفحة الديون.
-    يرجع رقم الصف (1-indexed لـ gspread) لو لقى، أو None.
+    يرجع (رقم الصف 1-indexed لـ gspread، المبلغ المتبقي الحالي) لو لقى، أو None.
     """
     sheet = get_debts_worksheet()
     if sheet is None:
@@ -279,25 +279,38 @@ def find_unpaid_debt(chat_id: int, product: str) -> int | None:
         row_product = row[DEBT_COL_PRODUCT - 1].strip()
         row_status = row[DEBT_COL_STATUS - 1].strip()
         if row_chat_id == chat_id_str and row_product == product and row_status == "غير مدفوع":
-            return i + 1
+            try:
+                remaining = int(float(row[DEBT_COL_AMOUNT - 1]))
+            except (ValueError, IndexError):
+                remaining = 0
+            return i + 1, remaining
 
     return None
 
 
-def mark_debt_paid(row_number: int) -> bool:
-    """يحدث حالة دين معين لـ'مدفوع' مع تاريخ التسديد. يرجع True لو نجح."""
+def process_debt_repayment(row_number: int, remaining_before: int, paid_amount: int) -> tuple[bool, int]:
+    """
+    يعالج تسديد دين (كامل أو جزئي). يطرح paid_amount من remaining_before:
+    - لو الناتج <= 0: الدين يقفل بالكامل (المبلغ المتبقي يصير 0، الحالة "مدفوع")
+    - لو الناتج > 0: تسديد جزئي (المبلغ المتبقي يتحدث للفرق، الحالة تضل "غير مدفوع")
+    يرجع (نجح الحفظ أو لا، المبلغ المتبقي الجديد بعد التسديد).
+    """
     sheet = get_debts_worksheet()
     if sheet is None:
-        return False
+        return False, remaining_before
 
+    new_remaining = max(0, remaining_before - paid_amount)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
     try:
-        sheet.update_cell(row_number, DEBT_COL_STATUS, "مدفوع")
+        sheet.update_cell(row_number, DEBT_COL_AMOUNT, new_remaining)
         sheet.update_cell(row_number, DEBT_COL_PAID_DATE, date_str)
-        return True
+        if new_remaining <= 0:
+            sheet.update_cell(row_number, DEBT_COL_STATUS, "مدفوع")
+        return True, new_remaining
     except Exception:
-        logger.exception("Failed to mark debt as paid")
-        return False
+        logger.exception("Failed to process debt repayment")
+        return False, remaining_before
 
 
 # ------------------------------------------------------------------
@@ -401,6 +414,17 @@ _pending_vault_edit: dict | None = None
 # }
 # ------------------------------------------------------------------
 _pending_debt: dict | None = None
+
+# ------------------------------------------------------------------
+# حالة جلسة تلقين نشطة (الطريقة 3 — تلقين يدوي مباشر) — بس جلسة وحدة
+# بنفس الوقت. تفعل بزر BTN_TEACH، وتضل نشطة لين تضغط "إنهاء الجلسة".
+# {
+#   "customer_messages": list[str],   # رسائل الزبون المجمّعة (قبل الرد)
+#   "customer_chat_id": int | None,   # لو عرفناه من forward_origin
+#   "awaiting_reply": bool,           # صار ضغط "هذا ردي"، ننتظر نص الرد الجاي
+# }
+# ------------------------------------------------------------------
+_teaching_session: dict | None = None
 
 # ------------------------------------------------------------------
 # حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
@@ -618,13 +642,14 @@ BTN_INCOME = "📊 تقرير الدخل"
 BTN_ADD_ACCOUNT = "➕ إضافة حساب"
 BTN_STATS = "📈 إحصائيات"
 BTN_DEBT = "💳 تسجيل دين"
+BTN_TEACH = "📝 بدء تلقين جديد"
 BTN_BACK = "◀️ رجوع"
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
-        [KeyboardButton(BTN_DEBT)],
+        [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
     ],
     resize_keyboard=True,
 )
@@ -994,6 +1019,49 @@ async def send_debt_notification(context: ContextTypes.DEFAULT_TYPE, text: str) 
         )
     except Exception:
         logger.exception("Failed to send debt notification to topic")
+
+
+def build_teaching_keyboard(has_customer_message: bool) -> InlineKeyboardMarkup:
+    """
+    شاشة جلسة التلقين — زر "هذا ردي" يطلع بس لو فيه رسالة زبون واحدة
+    على الأقل متجمعة، بالإضافة لزر "إنهاء الجلسة" دايماً.
+    """
+    rows = []
+    if has_customer_message:
+        rows.append([InlineKeyboardButton("✅ هذا ردي", callback_data="teach_mark_reply")])
+    rows.append([InlineKeyboardButton("⏹ إنهاء الجلسة", callback_data="teach_end_session")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_teaching_status(session: dict) -> str:
+    """يبني نص حالة جلسة التلقين الحالية."""
+    count = len(session["customer_messages"])
+    if session.get("awaiting_reply"):
+        return (
+            f"جلسة تلقين نشطة\n"
+            f"رسائل الزبون المجمّعة: {count}\n\n"
+            f"الحين حوّل أو اكتب ردك — راح يُحفظ كمثال ويبدأ مثال جديد تلقائياً."
+        )
+    return (
+        f"جلسة تلقين نشطة\n"
+        f"رسائل الزبون المجمّعة: {count}\n\n"
+        f"حوّل رسائل الزبون (وحدة أو أكثر)، وبعدها اضغط ✅ هذا ردي."
+    )
+
+
+def save_style_example(customer_chat_id, customer_message: str, owner_reply: str, source: str) -> bool:
+    """يحفظ مثال تعلم جديد بجدول style_examples. يرجع True لو نجح."""
+    try:
+        supabase.table("style_examples").insert({
+            "customer_chat_id": customer_chat_id,
+            "customer_message": customer_message,
+            "owner_reply": owner_reply,
+            "source": source,
+        }).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to save style example")
+        return False
 
 
 async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
@@ -2274,27 +2342,36 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("تعذر تحديد الزبون لهذي العملية.", show_alert=True)
             return
 
-        debt_row = find_unpaid_debt(customer_chat_id, state["product"])
-        if debt_row is None:
+        debt_info = find_unpaid_debt(customer_chat_id, state["product"])
+        if debt_info is None:
             await query.answer("ماكو دين غير مدفوع مطابق لهذا الزبون والمنتج حالياً.", show_alert=True)
             return
 
+        debt_row, remaining_before = debt_info
         repay_amount = sum(amount for _, amount in state["payments"])
-        marked = mark_debt_paid(debt_row)
+        saved, new_remaining = process_debt_repayment(debt_row, remaining_before, repay_amount)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بالتسديد
-        if marked:
+        if saved:
             for method, amount in state["payments"]:
                 if method in VAULT_NAMES:
                     adjust_vault_balance(method, amount)
 
-        if marked:
+        if saved:
             customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
-            await send_debt_notification(
-                context,
-                f"✅ تسديد دين\nالزبون: {customer_line}\nالمنتج: {state['product']}\nالمبلغ المسدد: {repay_amount}",
-            )
-            final_text = format_payment_summary(state) + "\n\n✅ تم تسديد الدين بنجاح."
+            if new_remaining <= 0:
+                await send_debt_notification(
+                    context,
+                    f"✅ تسديد دين بالكامل\nالزبون: {customer_line}\nالمنتج: {state['product']}\nالمبلغ المسدد: {repay_amount}",
+                )
+                final_text = format_payment_summary(state) + "\n\n✅ تم تسديد الدين بالكامل."
+            else:
+                await send_debt_notification(
+                    context,
+                    f"💳 تسديد جزئي لدين\nالزبون: {customer_line}\nالمنتج: {state['product']}\n"
+                    f"المبلغ المسدد: {repay_amount}\nالمتبقي: {new_remaining}",
+                )
+                final_text = format_payment_summary(state) + f"\n\n✅ تم تسديد جزء من الدين. المتبقي: {new_remaining}"
         else:
             final_text = format_payment_summary(state) + "\n\n⚠️ فشل تحديث حالة الدين بـ Google Sheet — تحقق من الاتصال يدوياً."
 
@@ -2392,7 +2469,48 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
     return True
 
 
-async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_teaching_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعالج ضغطات أزرار جلسة التلقين: ✅ هذا ردي، ⏹ إنهاء الجلسة."""
+    global _teaching_session
+
+    query = update.callback_query
+    if query.from_user.id != OWNER_USER_ID:
+        await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+
+    if _teaching_session is None:
+        await query.answer("ماكو جلسة تلقين نشطة حالياً.", show_alert=True)
+        return
+
+    data = query.data
+    session = _teaching_session
+
+    if data == "teach_mark_reply":
+        if not session["customer_messages"]:
+            await query.answer("لازم تحوّل رسالة زبون وحدة على الأقل أول.", show_alert=True)
+            return
+        session["awaiting_reply"] = True
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                text=format_teaching_status(session),
+                reply_markup=build_teaching_keyboard(has_customer_message=True),
+            )
+        except Exception:
+            logger.exception("Failed to update teaching status after mark_reply")
+        return
+
+    if data == "teach_end_session":
+        _teaching_session = None
+        await query.answer()
+        try:
+            await query.edit_message_text(text="⏹ تم إنهاء جلسة التلقين.", reply_markup=None)
+        except Exception:
+            logger.exception("Failed to update message after ending teaching session")
+        return
+
+
+
     """يعالج كل ضغطات الأزرار الخاصة بفلو تسجيل دين جديد."""
     global _pending_debt
 
@@ -2891,10 +3009,10 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
 async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يعالج ضغطات أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق
-    الكتابة: تسجيل مصروف، تقرير الدخل، إضافة حساب، تسجيل دين. يرجع
+    الكتابة: تسجيل مصروف، تقرير الدخل، إضافة حساب، تسجيل دين، بدء تلقين. يرجع
     True لو عالج.
     """
-    global _pending_expense, _pending_add_account, _pending_debt
+    global _pending_expense, _pending_add_account, _pending_debt, _teaching_session
 
     message = update.message
     if not message or not message.text:
@@ -2943,6 +3061,17 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
             "awaiting_manual_product": False,
             "awaiting_manual_amount": False,
         }
+        return True
+
+    if text == BTN_TEACH:
+        if _teaching_session is not None:
+            await message.reply_text("فيه جلسة تلقين شغالة أصلاً — أنهيها أول قبل ما تبدأ وحدة جديدة.")
+            return True
+        _teaching_session = {"customer_messages": [], "customer_chat_id": None, "awaiting_reply": False}
+        await message.reply_text(
+            format_teaching_status(_teaching_session),
+            reply_markup=build_teaching_keyboard(has_customer_message=False),
+        )
         return True
 
     return False
@@ -3197,14 +3326,74 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
     await handle_owner_expense_photo(update, context, message.photo)
 
 
+async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يلتقط رسائل نصية (محولة أو مكتوبة مباشرة) بمحادثتك الخاصة مع البوت
+    وقت ما فيه جلسة تلقين نشطة. يرجع True لو عالج الرسالة (يوقف أي
+    معالجة ثانية للرسالة)، False لو ما فيه جلسة نشطة.
+
+    - لو الجلسة بانتظار رسائل الزبون (awaiting_reply=False): يضيف
+      الرسالة لقائمة customer_messages المتجمعة، ويحاول يستخرج
+      customer_chat_id من forward_origin لو متوفر ومو معروف أصلاً.
+    - لو الجلسة بانتظار الرد (awaiting_reply=True): يحفظ المثال
+      الكامل بـ style_examples، ويصفر الجلسة لمثال جديد تلقائياً.
+    """
+    global _teaching_session
+
+    message = update.message
+    if not message or not message.text or _teaching_session is None:
+        return False
+
+    text = message.text.strip()
+    if not text:
+        return True  # رسالة فاضية بجلسة نشطة — نتجاهلها بصمت بدل ما نمررها لمعالج ثاني
+
+    session = _teaching_session
+
+    # نحاول نجيب معلومة الزبون الأصلي من forward_origin لو الرسالة محولة
+    # ومو معروف عندنا chat_id لهذي الجلسة أصلاً
+    if session["customer_chat_id"] is None and message.forward_origin is not None:
+        origin = message.forward_origin
+        origin_chat = getattr(origin, "sender_user", None) or getattr(origin, "chat", None)
+        if origin_chat is not None:
+            session["customer_chat_id"] = origin_chat.id
+
+    if not session["awaiting_reply"]:
+        session["customer_messages"].append(text)
+        await message.reply_text(
+            format_teaching_status(session),
+            reply_markup=build_teaching_keyboard(has_customer_message=True),
+        )
+        return True
+
+    # awaiting_reply=True — هذا النص هو الرد، نحفظ المثال ونبدأ مثال جديد
+    combined_customer_message = "\n".join(session["customer_messages"])
+    saved = save_style_example(session["customer_chat_id"], combined_customer_message, text, source="manual")
+
+    session["customer_messages"] = []
+    session["awaiting_reply"] = False
+    # نبقي customer_chat_id كما هو (غالباً نفس الزبون للمثال الجاي بنفس الجلسة)
+
+    status_line = "✅ تم حفظ المثال." if saved else "⚠️ فشل حفظ المثال — تحقق من الاتصال."
+    await message.reply_text(
+        status_line + "\n\n" + format_teaching_status(session),
+        reply_markup=build_teaching_keyboard(has_customer_message=False),
+    )
+    return True
+
+
+
 async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج رسائل نصية عادية (مو Business) جاية منك بمحادثتك المباشرة
-    مع البوت — إدخال اسم منتج حر أو مبلغ يدوي أثناء تسجيل دفع، تسجيل
-    حساب ChatGPT خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل
-    رصيد خزنة يدوياً، فلو تسجيل دين، أزرار لوحة المفاتيح الثابتة، أو
-    فلو إضافة حساب تفاعلي.
+    مع البوت — جلسة تلقين نشطة (أولوية قصوى، تلتقط أي رسالة أثناءها)،
+    إدخال اسم منتج حر أو مبلغ يدوي أثناء تسجيل دفع، تسجيل حساب ChatGPT
+    خاص، إدخال مصروف يدوي، تاريخ يدوي بالإحصائيات، تعديل رصيد خزنة
+    يدوياً، فلو تسجيل دين، أزرار لوحة المفاتيح الثابتة، أو فلو إضافة
+    حساب تفاعلي.
     """
+    if await handle_teaching_message(update, context):
+        return
     if await handle_manual_product_entry(update, context):
         return
     if await handle_manual_amount_entry(update, context):
@@ -3499,6 +3688,9 @@ def main() -> None:
 
     # أزرار فلو تسجيل الدين
     app.add_handler(CallbackQueryHandler(handle_debt_callback, pattern=r"^debt_"))
+
+    # أزرار جلسة التلقين اليدوي
+    app.add_handler(CallbackQueryHandler(handle_teaching_callback, pattern=r"^teach_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
