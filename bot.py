@@ -1125,6 +1125,109 @@ def archive_message(
         logger.exception("Failed to archive conversation message")
 
 
+CONVERSATION_SUMMARY_GAP_MINUTES = 30  # فترة صمت تستدعي دمج الرسائل الجديدة بالملخص التراكمي
+
+SUMMARY_MERGE_PROMPT = (
+    "انت تلخص محادثة بين بوت ومستخدم بشكل تراكمي. عندك ملخص سابق "
+    "(ممكن يكون فاضي لو أول مرة) + رسائل جديدة صارت بعده. ادمجهم بملخص "
+    "واحد جديد شامل، بحدود 150 كلمة، باللهجة العراقية، يحافظ على أهم "
+    "المعلومات والسياق من الملخص القديم والرسائل الجديدة مع بعض. "
+    "رد بالملخص النهائي بس، بدون مقدمات."
+)
+
+
+def get_conversation_summary(customer_chat_id: int) -> dict | None:
+    """يرجع صف الملخص التراكمي الحالي لزبون معين، أو None لو ماكو."""
+    try:
+        res = (
+            supabase.table("conversation_summaries")
+            .select("summary_text, last_message_at")
+            .eq("customer_chat_id", customer_chat_id)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception:
+        logger.exception("Failed to fetch conversation summary")
+        return None
+
+
+async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
+    """
+    يفحص هل مرت 30 دقيقة بدون رسائل جديدة منذ آخر تحديث للملخص —
+    لو إي، يجمع الرسائل الجديدة من conversation_archive منذ آخر
+    ملخص، يدمجها مع الملخص القديم (لو موجود) بطلب AI واحد، ويحدث
+    conversation_summaries. يُستدعى "بالكسل" (lazy) وقت وصول رسالة
+    جديدة، بدل مؤقت خارجي.
+    """
+    existing = get_conversation_summary(customer_chat_id)
+    now = datetime.now(timezone.utc)
+
+    if existing and existing.get("last_message_at"):
+        last_at = datetime.fromisoformat(existing["last_message_at"].replace("Z", "+00:00"))
+        if now - last_at < timedelta(minutes=CONVERSATION_SUMMARY_GAP_MINUTES):
+            return  # لسا داخل نفس الجلسة، ما نلخص
+
+    # نجمع الرسائل الجديدة منذ آخر تحديث ملخص (أو كل التاريخ لو أول مرة)
+    try:
+        query = (
+            supabase.table("conversation_archive")
+            .select("sender_type, message_text, created_at")
+            .eq("customer_chat_id", customer_chat_id)
+            .order("created_at")
+        )
+        if existing and existing.get("last_message_at"):
+            query = query.gt("created_at", existing["last_message_at"])
+        res = query.execute()
+        new_messages = res.data or []
+    except Exception:
+        logger.exception("Failed to fetch new messages for summary update")
+        return
+
+    if not new_messages:
+        return
+
+    transcript = "\n".join(
+        f"{'المستخدم' if m['sender_type'] == 'customer' else 'البوت'}: {m['message_text']}"
+        for m in new_messages if m.get("message_text")
+    )
+    old_summary = existing["summary_text"] if existing and existing.get("summary_text") else "لا يوجد ملخص سابق."
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": CHATGPT_CONTEXT_MODEL,
+                    "temperature": 0.3,
+                    "max_completion_tokens": 500,
+                    "reasoning_effort": "low",
+                    "messages": [
+                        {"role": "system", "content": SUMMARY_MERGE_PROMPT},
+                        {"role": "user", "content": f"الملخص السابق:\n{old_summary}\n\nالرسائل الجديدة:\n{transcript}"},
+                    ],
+                },
+            )
+        resp.raise_for_status()
+        new_summary = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        logger.exception("Failed to merge conversation summary")
+        return
+
+    latest_message_at = new_messages[-1]["created_at"]
+    try:
+        supabase.table("conversation_summaries").upsert({
+            "customer_chat_id": customer_chat_id,
+            "summary_text": new_summary,
+            "last_message_at": latest_message_at,
+        }).execute()
+    except Exception:
+        logger.exception("Failed to save updated conversation summary")
+
+
 async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
     """يبعث إشعار مصروف مكتمل لفرع 'مصروفات' بقروب الإشعارات."""
     vault_line = expense.get("vault") or "بدون خزنة محددة"
@@ -1697,6 +1800,11 @@ async def describe_image(file_bytes: bytes) -> str | None:
     """
     يستخدم Groq Vision (موديل IMAGE_VISION_MODEL) لوصف محتوى صورة.
     يرجع الوصف النصي، أو None لو فشل الاتصال أو التحليل.
+
+    ملاحظة: qwen3.6 موديل "hybrid thinking" — نوقف وضع التفكير الداخلي
+    (reasoning_effort="none") و نخفي أي تفكير لو صار رغم ذلك
+    (reasoning_format="hidden")، عشان توفير التوكنز — وصف صورة مهمة
+    بسيطة ما تحتاج تفكير عميق مثل رياضيات أو برمجة.
     """
     try:
         base64_image = base64.b64encode(file_bytes).decode("utf-8")
@@ -1709,8 +1817,11 @@ async def describe_image(file_bytes: bytes) -> str | None:
                 },
                 json={
                     "model": IMAGE_VISION_MODEL,
-                    "temperature": 0.3,
+                    "temperature": 0.7,
+                    "top_p": 0.8,
                     "max_completion_tokens": 500,
+                    "reasoning_effort": "none",
+                    "reasoning_format": "hidden",
                     "messages": [
                         {
                             "role": "user",
@@ -1730,6 +1841,71 @@ async def describe_image(file_bytes: bytes) -> str | None:
         return data["choices"][0]["message"]["content"].strip()
     except Exception:
         logger.exception("Groq image description failed")
+        return None
+
+
+TEST_CHAT_SYSTEM_PROMPT = (
+    "انت تجرب تتصرف مثل صاحب متجر عراقي يبيع اشتراكات رقمية (ChatGPT، "
+    "Anki، Canva، إلخ) عبر تيليجرام. جاوب بأسلوب طبيعي، عراقي، مباشر، "
+    "زي ما يحجي صاحب متجر حقيقي — مو رسمي زايد ولا طويل بلا داعي."
+)
+
+
+async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> str | None:
+    """
+    يرد على رسالة تجريبية بفرع 'تفاعل' — يستخدم الملخص التراكمي
+    الحالي (لو موجود) + الرسائل الأخيرة غير الملخصة كسياق، عن طريق
+    gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
+    """
+    summary_row = get_conversation_summary(customer_chat_id)
+    summary_text = summary_row["summary_text"] if summary_row and summary_row.get("summary_text") else None
+
+    # نجيب الرسائل الأخيرة غير الملخصة بعد (منذ آخر تحديث ملخص) كسياق حي
+    try:
+        query = (
+            supabase.table("conversation_archive")
+            .select("sender_type, message_text")
+            .eq("customer_chat_id", customer_chat_id)
+            .order("created_at")
+        )
+        if summary_row and summary_row.get("last_message_at"):
+            query = query.gt("created_at", summary_row["last_message_at"])
+        res = query.execute()
+        recent_messages = res.data or []
+    except Exception:
+        logger.exception("Failed to fetch recent messages for test chat context")
+        recent_messages = []
+
+    messages = [{"role": "system", "content": TEST_CHAT_SYSTEM_PROMPT}]
+    if summary_text:
+        messages.append({"role": "system", "content": f"ملخص المحادثة السابقة:\n{summary_text}"})
+    for m in recent_messages:
+        if not m.get("message_text"):
+            continue
+        role = "user" if m["sender_type"] == "customer" else "assistant"
+        messages.append({"role": role, "content": m["message_text"]})
+    messages.append({"role": "user", "content": new_message})
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": CHATGPT_CONTEXT_MODEL,
+                    "temperature": 0.7,
+                    "max_completion_tokens": 500,
+                    "reasoning_effort": "low",
+                    "messages": messages,
+                },
+            )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        logger.exception("Failed to generate test chat reply")
         return None
 
 
@@ -3460,6 +3636,45 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
     return True
 
 
+async def on_interactive_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يعالج رسائل نصية عادية (مو أوامر) بفرع 'تفاعل' بالقروب — تجربة
+    شات حر مباشر مع gpt-oss-120b، يستخدم ملخص متراكم (30 دقيقة صمت
+    يستدعي دمج جديد) كذاكرة سياق بدل الاحتفاظ بكل التاريخ الخام.
+    """
+    message = update.message
+    if not message or not message.text:
+        return
+    if message.text.startswith("/"):
+        return  # الأوامر (زي /getcode) تُعالج بـ handlers منفصلة
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if message.message_thread_id != TOPIC_INTERACTIVE:
+        return
+
+    customer_chat_id = OWNER_USER_ID  # بالتجربة، الأونر نفسه يمثل الطرف اللي نبني له السياق
+
+    # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
+    archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=message.text)
+
+    # نفحص/نحدث الملخص التراكمي لو مرت 30 دقيقة صمت
+    await maybe_update_conversation_summary(customer_chat_id)
+
+    reply = await generate_test_chat_reply(customer_chat_id, message.text)
+    if reply is None:
+        await message.reply_text("⚠️ صار خطأ أثناء توليد الرد — تحقق من الاتصال بـ Groq.")
+        return
+
+    archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
+
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_INTERACTIVE, text=reply
+        )
+    except Exception:
+        logger.exception("Failed to send test chat reply to interactive topic")
+
+
 async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     يعالج صور مرسلة مباشرة لمحادثتك مع البوت (مو Business، مو رد على
@@ -3873,6 +4088,14 @@ def main() -> None:
         MessageHandler(
             filters.ChatType.PRIVATE & filters.PHOTO & filters.User(OWNER_USER_ID),
             on_owner_private_photo,
+        )
+    )
+
+    # رسائل نصية عادية بفرع "تفاعل" بالقروب — تجربة شات حر مع الذكاء الاصطناعي
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.SUPERGROUP & filters.TEXT & filters.User(OWNER_USER_ID),
+            on_interactive_topic_message,
         )
     )
 
