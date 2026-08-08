@@ -2237,13 +2237,15 @@ def get_reply_for_category(category: str) -> str | None:
     return None
 
 
-TEST_EXACT_FAQ_CATEGORIES = {"سلام", "ترحيب", "شكر"}
+# كل فئات الـFAQ الحالية هي معرفة معتمدة؛ فرع التفاعل يعرضها كما هي
+# بدل أن يترك للـAI إعادة صياغتها أو إضافة تسويق غير مطلوب.
+TEST_EXACT_FAQ_CATEGORIES = {category for category, _, _ in FAQ_RULES}
 
 
 def get_exact_test_faq_reply(text: str) -> str | None:
     """
-    في التفاعل، التحية الخالصة ليست مكانًا للارتجال بالـAI. نرجع صيغة
-    الـFAQ المعتمدة حرفيًا، لكن نترك الرسائل التي تضم طلبًا فعليًا للـAI.
+    في التفاعل، أي سؤال يغطيه الـFAQ ليس مكانًا للارتجال بالـAI. نرجع
+    صيغة الـFAQ المعتمدة حرفيًا، ونترك الحالات الجديدة أو المركبة للـAI.
     """
     categories = keyword_match_categories(text)
     if not categories or not set(categories).issubset(TEST_EXACT_FAQ_CATEGORIES):
