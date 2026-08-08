@@ -3952,7 +3952,9 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     else:
         user_text = message.text
 
-    customer_chat_id = OWNER_USER_ID  # بالتجربة، الأونر نفسه يمثل الطرف اللي نبني له السياق
+    # لكل /newtest رقم سياق اصطناعي مستقل، حتى ما تختلط سيناريوهات الاختبار.
+    # إذا ما بدأ الأونر جلسة يظل السلوك القديم متاحًا للتوافق.
+    customer_chat_id = context.user_data.get("interactive_test_chat_id", OWNER_USER_ID)
 
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
     archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=user_text)
@@ -4219,6 +4221,22 @@ async def cmd_getcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception:
             logger.exception(f"Failed to send getcode message for account {acc.get('id')}")
+
+
+async def cmd_newtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يبدأ سياقًا مستقلاً لتجربة جديدة داخل فرع التفاعل فقط."""
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if update.message is None or update.message.message_thread_id != TOPIC_INTERACTIVE:
+        return
+
+    # رقم اصطناعي سالب حتى لا يختلط تاريخ اختبار جديد مع chat_id زبون حقيقي.
+    test_chat_id = -((OWNER_USER_ID * 1_000_000) + update.message.message_id)
+    context.user_data["interactive_test_chat_id"] = test_chat_id
+    await update.message.reply_text(
+        "🧪 بدأت جلسة اختبار جديدة ومعزولة. اكتب الآن رسائل الزبون بالتسلسل؛ "
+        "ولبدء سيناريو مختلف اكتب /newtest مرة ثانية."
+    )
 
 
 async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4488,6 +4506,9 @@ def main() -> None:
     # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
     # لكل حساب TOTP مع زر لعرض الكود
     app.add_handler(CommandHandler("getcode", cmd_getcode))
+
+    # أمر /newtest — يبدأ سياق اختبار مستقل بفرع التفاعل.
+    app.add_handler(CommandHandler("newtest", cmd_newtest))
 
     # رسائل نصية عادية منك بمحادثتك الخاصة مع البوت — تستخدم حالياً
     # بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع (رد على رسالة الصورة)
