@@ -1115,8 +1115,12 @@ def save_style_example(session_id: str, customer_chat_id, customer_message: str,
         return False
 
 
-def get_style_examples(limit: int = 5) -> list[dict] | None:
-    """يرجع آخر N أمثلة تعلم من جدول style_examples (الأحدث أول)."""
+def get_style_examples(limit: int = 12) -> list[dict]:
+    """
+    يرجع آخر N أمثلة تعلم من جدول style_examples، مرتبة من الأقدم
+    للأحدث (عشان تنضاف كـ محادثة فعلية بالـ prompt — الأحدث آخرها،
+    وهذا يعطيها وزن أكبر بتأثيرها على أسلوب الرد).
+    """
     try:
         res = (
             supabase.table("style_examples")
@@ -1125,23 +1129,12 @@ def get_style_examples(limit: int = 5) -> list[dict] | None:
             .limit(limit)
             .execute()
         )
-        return res.data if res.data else []
+        examples = res.data if res.data else []
+        examples.reverse()
+        return examples
     except Exception:
         logger.exception("Failed to fetch style examples")
         return []
-
-
-def format_style_examples_for_prompt(examples: list[dict]) -> str:
-    """يصيغ أمثلة التعلم بصيغة مناسبة للإضافة للـ AI prompt."""
-    if not examples:
-        return ""
-
-    lines = ["أمثلة على الأسلوب المطلوب:"]
-    for i, example in enumerate(examples, 1):
-        lines.append(f"\nمثال {i}:")
-        lines.append(f"المستخدم: {example.get('customer_message', '')}")
-        lines.append(f"الرد: {example.get('owner_reply', '')}")
-    return "\n".join(lines)
 
 
 CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
@@ -1934,17 +1927,35 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 
 
 TEST_CHAT_SYSTEM_PROMPT = (
-    "انت تجرب تتصرف مثل صاحب متجر عراقي يبيع اشتراكات رقمية (ChatGPT، "
-    "Anki، Canva، إلخ) عبر تيليجرام. جاوب بأسلوب طبيعي، عراقي، مباشر، "
-    "زي ما يحجي صاحب متجر حقيقي — مو رسمي زايد ولا طويل بلا داعي."
+    "راح تشوف بعدها أمثلة حقيقية (محادثات فعلية) هي ردود صاحب المتجر "
+    "نفسه على زبائنه. مهمتك تقلد نفس أسلوبه بالضبط — نفس طول الجملة، "
+    "نفس اللهجة والكلمات اللي يستخدمها، نفس درجة الاختصار أو التفصيل، "
+    "ونفس علامات الترقيم (أو عدمها). لا تخترع أسلوب من عندك، ولا تكون "
+    "رسمي أو مهذب أكثر من الأمثلة، ولا تضيف مقدمات أو خواتيم مو موجودة "
+    "بالأمثلة. لو الأمثلة مختصرة، ردك يكون مختصر بنفس القدر. لا تذكر "
+    "أسعار أو تفاصيل منتجات مو مذكورة صراحة بالأمثلة أو بالمحادثة."
 )
+
+
+def build_style_example_turns(examples: list[dict]) -> list[dict]:
+    """يحول أمثلة التعلم لسلسلة رسائل user/assistant فعلية (few-shot) بدل وصف نصي."""
+    turns = []
+    for example in examples:
+        customer_message = (example.get("customer_message") or "").strip()
+        owner_reply = (example.get("owner_reply") or "").strip()
+        if not customer_message or not owner_reply:
+            continue
+        turns.append({"role": "user", "content": customer_message})
+        turns.append({"role": "assistant", "content": owner_reply})
+    return turns
 
 
 async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> str | None:
     """
-    يرد على رسالة تجريبية بفرع 'تفاعل' — يستخدم الملخص التراكمي
-    الحالي (لو موجود) + الرسائل الأخيرة غير الملخصة + أمثلة التعلم المحفوظة
-    كسياق، عن طريق gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
+    يرد على رسالة تجريبية بفرع 'تفاعل' — يقلد أسلوب الأونر الفعلي عن
+    طريق أمثلة تعلم محفوظة (تُحقن كمحادثة few-shot حقيقية، مو كوصف)،
+    بالإضافة للملخص التراكمي والرسائل الأخيرة غير الملخصة كسياق، عن
+    طريق gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
     """
     summary_row = get_conversation_summary(customer_chat_id)
     summary_text = summary_row["summary_text"] if summary_row and summary_row.get("summary_text") else None
@@ -1965,18 +1976,14 @@ async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> s
         logger.exception("Failed to fetch recent messages for test chat context")
         recent_messages = []
 
-    # نجيب أمثلة التعلم المحفوظة
-    style_examples = get_style_examples(limit=3)
+    # نجيب أمثلة التعلم المحفوظة ونحقنها كمحادثة فعلية (few-shot)
+    style_examples = get_style_examples(limit=12)
 
     messages = [{"role": "system", "content": TEST_CHAT_SYSTEM_PROMPT}]
-
-    # نضيف أمثلة التعلم لو موجودة
-    if style_examples:
-        examples_prompt = format_style_examples_for_prompt(style_examples)
-        messages.append({"role": "system", "content": examples_prompt})
+    messages.extend(build_style_example_turns(style_examples))
 
     if summary_text:
-        messages.append({"role": "system", "content": f"ملخص المحادثة السابقة:\n{summary_text}"})
+        messages.append({"role": "system", "content": f"ملخص المحادثة الحالية مع هذا الزبون:\n{summary_text}"})
     for m in recent_messages:
         if not m.get("message_text"):
             continue
