@@ -1115,6 +1115,35 @@ def save_style_example(session_id: str, customer_chat_id, customer_message: str,
         return False
 
 
+def get_style_examples(limit: int = 5) -> list[dict] | None:
+    """يرجع آخر N أمثلة تعلم من جدول style_examples (الأحدث أول)."""
+    try:
+        res = (
+            supabase.table("style_examples")
+            .select("customer_message, owner_reply")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data if res.data else []
+    except Exception:
+        logger.exception("Failed to fetch style examples")
+        return []
+
+
+def format_style_examples_for_prompt(examples: list[dict]) -> str:
+    """يصيغ أمثلة التعلم بصيغة مناسبة للإضافة للـ AI prompt."""
+    if not examples:
+        return ""
+
+    lines = ["أمثلة على الأسلوب المطلوب:"]
+    for i, example in enumerate(examples, 1):
+        lines.append(f"\nمثال {i}:")
+        lines.append(f"المستخدم: {example.get('customer_message', '')}")
+        lines.append(f"الرد: {example.get('owner_reply', '')}")
+    return "\n".join(lines)
+
+
 CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
 
 
@@ -1914,8 +1943,8 @@ TEST_CHAT_SYSTEM_PROMPT = (
 async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> str | None:
     """
     يرد على رسالة تجريبية بفرع 'تفاعل' — يستخدم الملخص التراكمي
-    الحالي (لو موجود) + الرسائل الأخيرة غير الملخصة كسياق، عن طريق
-    gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
+    الحالي (لو موجود) + الرسائل الأخيرة غير الملخصة + أمثلة التعلم المحفوظة
+    كسياق، عن طريق gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
     """
     summary_row = get_conversation_summary(customer_chat_id)
     summary_text = summary_row["summary_text"] if summary_row and summary_row.get("summary_text") else None
@@ -1936,7 +1965,16 @@ async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> s
         logger.exception("Failed to fetch recent messages for test chat context")
         recent_messages = []
 
+    # نجيب أمثلة التعلم المحفوظة
+    style_examples = get_style_examples(limit=3)
+
     messages = [{"role": "system", "content": TEST_CHAT_SYSTEM_PROMPT}]
+
+    # نضيف أمثلة التعلم لو موجودة
+    if style_examples:
+        examples_prompt = format_style_examples_for_prompt(style_examples)
+        messages.append({"role": "system", "content": examples_prompt})
+
     if summary_text:
         messages.append({"role": "system", "content": f"ملخص المحادثة السابقة:\n{summary_text}"})
     for m in recent_messages:
