@@ -464,6 +464,10 @@ _pending_vault_edit: dict | None = None
 # ------------------------------------------------------------------
 _pending_debt: dict | None = None
 
+# حالة مؤقتة لإدخال بيانات الكتالوج من الأونر.
+# {"message_id": int, "step": "product_name" | "plan_data" | "plan_price", "product_id": str | None, "plan_id": str | None}
+_pending_catalog_input: dict | None = None
+
 # ------------------------------------------------------------------
 # حالة جلسة تلقين نشطة (الطريقة 3 — تلقين يدوي مباشر) — بس جلسة وحدة
 # بنفس الوقت. تفعل بزر BTN_TEACH، وتضل نشطة لين تضغط "إنهاء الجلسة".
@@ -693,6 +697,7 @@ BTN_ADD_ACCOUNT = "➕ إضافة حساب"
 BTN_STATS = "📈 إحصائيات"
 BTN_DEBT = "💳 تسجيل دين"
 BTN_TEACH = "📝 بدء تلقين جديد"
+BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_BACK = "◀️ رجوع"
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
@@ -700,9 +705,194 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
+        [KeyboardButton(BTN_CATALOG)],
     ],
     resize_keyboard=True,
 )
+
+
+def get_catalog_products() -> list[dict]:
+    try:
+        return (supabase.table("catalog_products").select("id, name, is_active").order("name").execute().data or [])
+    except Exception:
+        logger.exception("Failed to fetch catalog products")
+        return []
+
+
+def get_catalog_product(product_id: str) -> dict | None:
+    try:
+        result = supabase.table("catalog_products").select("id, name, is_active").eq("id", product_id).execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        logger.exception("Failed to fetch catalog product")
+        return None
+
+
+def get_catalog_plans(product_id: str) -> list[dict]:
+    try:
+        return (
+            supabase.table("catalog_plans")
+            .select("id, name, price, duration, description, is_active")
+            .eq("product_id", product_id).order("price").execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to fetch catalog plans")
+        return []
+
+
+def build_catalog_main_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        f"{'✅' if product['is_active'] else '⏸️'} {product['name']}",
+        callback_data=f"catalog_product_{product['id']}",
+    )] for product in products]
+    rows.append([InlineKeyboardButton("➕ إضافة منتج", callback_data="catalog_add_product")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_catalog_product_keyboard(product: dict, plans: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        f"{'✅' if plan['is_active'] else '⏸️'} {plan['name']} — {plan['price']}",
+        callback_data=f"catalog_plan_{plan['id']}",
+    )] for plan in plans]
+    rows.append([InlineKeyboardButton("➕ إضافة باقة", callback_data=f"catalog_add_plan_{product['id']}")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="catalog_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_catalog_product(product: dict, plans: list[dict]) -> str:
+    status = "مفعّل" if product["is_active"] else "متوقف"
+    lines = [f"{product['name']} — {status}", "", "الباقات:"]
+    if not plans:
+        lines.append("ماكو باقات بعد.")
+    for plan in plans:
+        plan_status = "مفعلة" if plan["is_active"] else "متوقفة"
+        details = f" — {plan['duration']}" if plan.get("duration") else ""
+        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status})")
+    return "\n".join(lines)
+
+
+async def show_catalog_main(message) -> None:
+    products = get_catalog_products()
+    await message.reply_text(
+        "🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.",
+        reply_markup=build_catalog_main_keyboard(products),
+    )
+
+
+async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _pending_catalog_input
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    data = query.data
+    await query.answer()
+
+    if data == "catalog_main":
+        products = get_catalog_products()
+        await query.edit_message_text("🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.", reply_markup=build_catalog_main_keyboard(products))
+        return
+
+    if data == "catalog_add_product":
+        _pending_catalog_input = {"message_id": query.message.message_id, "step": "product_name"}
+        await query.edit_message_text("اكتب اسم المنتج الجديد كـرد على هذي الرسالة:", reply_markup=None)
+        return
+
+    if data.startswith("catalog_product_"):
+        product = get_catalog_product(data[len("catalog_product_"):])
+        if product is None:
+            await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
+            return
+        plans = get_catalog_plans(product["id"])
+        await query.edit_message_text(format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
+        return
+
+    if data.startswith("catalog_add_plan_"):
+        product_id = data[len("catalog_add_plan_"):]
+        _pending_catalog_input = {"message_id": query.message.message_id, "step": "plan_data", "product_id": product_id}
+        await query.edit_message_text("اكتب الباقة بهذا الشكل كـرد على هذي الرسالة:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
+        return
+
+    if data.startswith("catalog_plan_"):
+        plan_id = data[len("catalog_plan_"):]
+        try:
+            result = supabase.table("catalog_plans").select("id, product_id, name, price, duration, description, is_active").eq("id", plan_id).execute()
+            plan = result.data[0] if result.data else None
+        except Exception:
+            logger.exception("Failed to fetch catalog plan")
+            plan = None
+        if plan is None:
+            await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
+            return
+        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ تعديل السعر", callback_data=f"catalog_price_{plan_id}")],
+            [InlineKeyboardButton("⏸️ إيقاف" if plan["is_active"] else "✅ تفعيل", callback_data=f"catalog_toggle_{plan_id}")],
+            [InlineKeyboardButton(BTN_BACK, callback_data=f"catalog_product_{plan['product_id']}")],
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+
+    if data.startswith("catalog_price_"):
+        _pending_catalog_input = {
+            "message_id": query.message.message_id,
+            "step": "plan_price",
+            "plan_id": data[len("catalog_price_"):],
+        }
+        await query.edit_message_text("اكتب السعر الجديد رقم فقط كـرد على هذي الرسالة:", reply_markup=None)
+        return
+
+    if data.startswith("catalog_toggle_"):
+        plan_id = data[len("catalog_toggle_"):]
+        try:
+            result = supabase.table("catalog_plans").select("id, product_id, is_active").eq("id", plan_id).execute()
+            plan = result.data[0] if result.data else None
+            if plan:
+                supabase.table("catalog_plans").update({"is_active": not plan["is_active"]}).eq("id", plan_id).execute()
+                product = get_catalog_product(plan["product_id"])
+                if product:
+                    plans = get_catalog_plans(product["id"])
+                    await query.edit_message_text(format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
+        except Exception:
+            logger.exception("Failed to toggle catalog plan")
+            await query.edit_message_text("⚠️ فشل تحديث حالة الباقة.")
+
+
+async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    global _pending_catalog_input
+    message = update.message
+    state = _pending_catalog_input
+    if not message or not message.text or state is None or not message.reply_to_message:
+        return False
+    if message.reply_to_message.message_id != state["message_id"]:
+        return False
+
+    text = message.text.strip()
+    try:
+        if state["step"] == "product_name":
+            supabase.table("catalog_products").insert({"name": text}).execute()
+            await message.reply_text("✅ تم إضافة المنتج.")
+        elif state["step"] == "plan_data":
+            parts = [part.strip() for part in text.split("|", 3)]
+            if len(parts) < 2 or not parts[0] or not parts[1].isdigit():
+                await message.reply_text("الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | المدة | وصف")
+                return True
+            supabase.table("catalog_plans").insert({"product_id": state["product_id"], "name": parts[0], "price": int(parts[1]), "duration": parts[2] if len(parts) > 2 else None, "description": parts[3] if len(parts) > 3 else None}).execute()
+            await message.reply_text("✅ تم إضافة الباقة.")
+        elif state["step"] == "plan_price":
+            if not text.isdigit():
+                await message.reply_text("اكتب السعر رقم فقط.")
+                return True
+            supabase.table("catalog_plans").update({"price": int(text)}).eq("id", state["plan_id"]).execute()
+            await message.reply_text("✅ تم تعديل السعر.")
+        else:
+            return False
+    except Exception:
+        logger.exception("Catalog input failed")
+        await message.reply_text("⚠️ فشل الحفظ. تأكد أن جداول الكتالوج موجودة في Supabase.")
+        return True
+
+    _pending_catalog_input = None
+    return True
 
 
 def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
@@ -3641,6 +3831,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     text = message.text.strip()
 
+    if text == BTN_CATALOG:
+        await show_catalog_main(message)
+        return True
+
     if text == BTN_EXPENSE:
         sent = await message.reply_text(
             format_expense_summary({"amount": 0, "vault": None, "reason": None}),
@@ -4005,6 +4199,8 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
     مصروف، نفس معاملة الصور اللي ترسلها بمحادثة زبون.
     """
     if await handle_teaching_message(update, context):
+        return
+    if await handle_catalog_input(update, context):
         return
 
     message = update.message
@@ -4509,6 +4705,9 @@ def main() -> None:
 
     # أزرار جلسة التلقين اليدوي
     app.add_handler(CallbackQueryHandler(handle_teaching_callback, pattern=r"^teach_"))
+
+    # إدارة المنتجات والباقات — للأونر فقط داخل محادثته الخاصة مع البوت.
+    app.add_handler(CallbackQueryHandler(handle_catalog_callback, pattern=r"^catalog_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
