@@ -2237,6 +2237,22 @@ def get_reply_for_category(category: str) -> str | None:
     return None
 
 
+TEST_EXACT_FAQ_CATEGORIES = {"سلام", "ترحيب", "شكر"}
+
+
+def get_exact_test_faq_reply(text: str) -> str | None:
+    """
+    في التفاعل، التحية الخالصة ليست مكانًا للارتجال بالـAI. نرجع صيغة
+    الـFAQ المعتمدة حرفيًا، لكن نترك الرسائل التي تضم طلبًا فعليًا للـAI.
+    """
+    categories = keyword_match_categories(text)
+    if not categories or not set(categories).issubset(TEST_EXACT_FAQ_CATEGORIES):
+        return None
+
+    replies = [get_reply_for_category(category) for category in categories]
+    return "\n".join(reply for reply in replies if reply) or None
+
+
 def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
     """يرجع (secret, label) للحساب المربوط بهذا الزبون، أو None اذا مو مربوط."""
     link_res = (
@@ -3959,13 +3975,16 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
     archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=user_text)
 
-    # نفحص/نحدث الملخص التراكمي لو مرت 30 دقيقة صمت
-    await maybe_update_conversation_summary(customer_chat_id)
-
-    reply = await generate_test_chat_reply(customer_chat_id, user_text)
+    # ردود التحية والشكر المعتمدة تبقى حرفية، بدون إضافة تسويق من الـAI.
+    reply = get_exact_test_faq_reply(user_text)
     if reply is None:
-        await message.reply_text("⚠️ صار خطأ أثناء توليد الرد — تحقق من الاتصال بـ Groq.")
-        return
+        # نفحص/نحدث الملخص التراكمي لو مرت 30 دقيقة صمت
+        await maybe_update_conversation_summary(customer_chat_id)
+
+        reply = await generate_test_chat_reply(customer_chat_id, user_text)
+        if reply is None:
+            await message.reply_text("⚠️ صار خطأ أثناء توليد الرد — تحقق من الاتصال بـ Groq.")
+            return
 
     archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
 
