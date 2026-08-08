@@ -3795,6 +3795,13 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
     - لو الرسالة صوتية: تُحول لنص (Groq Whisper).
     - النص/الوصف الناتج يُعامل بنفس منطق النص العادي (يضاف لرسائل
       الزبون، أو يُحفظ كرد).
+    - كل رسالة (نص/صورة/صوت) تُؤرشف بالتوازي بجدول conversation_archive
+      (لو customer_chat_id معروف لهذي الجلسة)، بنفس آلية أرشفة رسائل
+      Business العادية — عشان جلسات التلقين ما تضل غايبة عن الأرشيف.
+      رسائل الزبون المجمّعة تُؤرشف كـ sender_type="customer"، والرد
+      المكتوب/المحوّل بعد "هذا ردي" يُؤرشف كـ sender_type="owner".
+      لو ماكو customer_chat_id معروف لهذي الجلسة، نتجاهل الأرشفة
+      بهدوء (الجدول محتاج قيمة صحيحة له) بدون ما يوقف باقي الفلو.
     - لو الجلسة بانتظار رسائل الزبون (awaiting_reply=False): يضيف
       الرسالة لقائمة customer_messages المتجمعة، ويحاول يستخرج
       customer_chat_id من forward_origin لو متوفر.
@@ -3819,6 +3826,7 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
         if origin_chat is not None:
             session["customer_chat_id"] = origin_chat.id
 
+    is_image = False
     if message.photo:
         try:
             file = await context.bot.get_file(message.photo[-1].file_id)
@@ -3833,6 +3841,7 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
             await message.reply_text("⚠️ فشل تحليل الصورة — تحقق من الاتصال.")
             return True
         text = f"[صورة: {description}]"
+        is_image = True
     elif message.voice:
         try:
             file = await context.bot.get_file(message.voice.file_id)
@@ -3851,6 +3860,24 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
         text = message.text.strip()
         if not text:
             return True  # رسالة فاضية بجلسة نشطة — نتجاهلها بصمت بدل ما نمررها لمعالج ثاني
+
+    # ------------------------------------------------------------------
+    # أرشفة موازية (الإضافة الجديدة) — تسجل كل رسالة بجلسة التلقين
+    # (نص/صورة/صوت) بجدول conversation_archive، بنفس sender_type
+    # المستخدم بباقي البوت ("customer" أو "owner"). لا تعطل ولا تؤخر
+    # فلو التلقين نفسه لو فشلت (archive_message تبتلع أخطاءها داخلياً)،
+    # وتُتجاهل كلياً لو customer_chat_id مو معروف بعد لهذي الجلسة.
+    # ------------------------------------------------------------------
+    if session["customer_chat_id"] is not None:
+        archive_sender_type = "owner" if session["awaiting_reply"] else "customer"
+        archive_message(
+            session["customer_chat_id"],
+            None,
+            None,
+            sender_type=archive_sender_type,
+            message_text=None if is_image else text,
+            image_description=text if is_image else None,
+        )
 
     if not session["awaiting_reply"]:
         session["customer_messages"].append(text)
