@@ -1115,6 +1115,137 @@ def save_style_example(session_id: str, customer_chat_id, customer_message: str,
         return False
 
 
+ARCHIVE_IMPORT_PAGE_SIZE = 500
+ARCHIVE_STYLE_CONTEXT_MAX_MESSAGES = 10
+ARCHIVE_STYLE_CONTEXT_MAX_CHARS = 4_000
+
+
+def fetch_all_table_rows(table_name: str, columns: str) -> list[dict]:
+    """يجلب الصفوف على دفعات حتى لا يقتصر الاستيراد على أول 1000 سجل."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        try:
+            res = (
+                supabase.table(table_name)
+                .select(columns)
+                .order("created_at")
+                .range(start, start + ARCHIVE_IMPORT_PAGE_SIZE - 1)
+                .execute()
+            )
+        except Exception:
+            logger.exception("Failed to fetch %s while importing archive", table_name)
+            raise
+
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < ARCHIVE_IMPORT_PAGE_SIZE:
+            return rows
+        start += ARCHIVE_IMPORT_PAGE_SIZE
+
+
+def format_archive_style_context(messages: list[str]) -> str:
+    """يبقي آخر جزء مفيد من الحوار ضمن حد آمن لطول المثال والـprompt."""
+    selected = messages[-ARCHIVE_STYLE_CONTEXT_MAX_MESSAGES:]
+    context = "\n".join(selected)
+    if len(context) <= ARCHIVE_STYLE_CONTEXT_MAX_CHARS:
+        return context
+    return "…\n" + context[-ARCHIVE_STYLE_CONTEXT_MAX_CHARS:]
+
+
+def build_style_examples_from_archive() -> tuple[list[dict], int]:
+    """
+    يحوّل الأرشيف إلى أمثلة تلقين نظيفة:
+    - يحافظ على تسلسل الحوار داخل نفس conversation_session_id (زبون/بوت/أونر).
+    - ينشئ مثالاً عند أي رد نصي للمتجر: من الأونر أو من البوت.
+    - يحتفظ بمصدر الرد، حتى نعرف هل المثال من أسلوب الأونر أو رد FAQ للبوت.
+    - يستبعد الصور الفارغة فقط لأنها لا تحتوي نصاً صالحاً كمثال.
+    - لا يعيد إدخال زوج (رسالة الزبون، رد الأونر) الموجود مسبقاً.
+
+    يرجع (الأمثلة الجديدة، عدد الأزواج التي تم تخطيها لأنها مكررة).
+    """
+    archive_rows = fetch_all_table_rows(
+        "conversation_archive",
+        "conversation_session_id, customer_chat_id, sender_type, message_text, created_at",
+    )
+    existing_examples = fetch_all_table_rows(
+        "style_examples", "customer_message, owner_reply"
+    )
+    existing_pairs = {
+        ((row.get("customer_message") or "").strip(), (row.get("owner_reply") or "").strip())
+        for row in existing_examples
+    }
+
+    histories: dict[str, list[str]] = {}
+    sessions_with_customer: set[str] = set()
+    candidates: list[dict] = []
+    skipped_duplicates = 0
+
+    for row in archive_rows:
+        session_id = row.get("conversation_session_id")
+        sender_type = row.get("sender_type")
+        message_text = (row.get("message_text") or "").strip()
+        if not session_id or not message_text:
+            continue
+
+        if sender_type == "customer":
+            histories.setdefault(session_id, []).append(f"الزبون: {message_text}")
+            sessions_with_customer.add(session_id)
+            continue
+
+        if sender_type not in {"owner", "bot"}:
+            continue
+
+        # لا قيمة لمثال ما لم يبدأ الحوار برسالة زبون واحدة على الأقل.
+        if session_id not in sessions_with_customer:
+            continue
+
+        conversation_context = format_archive_style_context(histories.get(session_id, []))
+        if not conversation_context:
+            continue
+
+        pair = (conversation_context, message_text)
+        if pair in existing_pairs:
+            skipped_duplicates += 1
+        else:
+            candidates.append({
+                "customer_chat_id": row.get("customer_chat_id"),
+                "customer_message": conversation_context,
+                "owner_reply": message_text,
+                "source": f"conversation_archive:{sender_type}",
+            })
+            existing_pairs.add(pair)
+
+        responder = "البوت" if sender_type == "bot" else "صاحب المتجر"
+        histories.setdefault(session_id, []).append(f"{responder}: {message_text}")
+
+    return candidates, skipped_duplicates
+
+
+def import_archive_as_style_examples() -> tuple[int, int, int]:
+    """يحفظ أمثلة الأرشيف الجديدة دفعات، ويرجع (المضاف، المكرر، الإجمالي المرشح)."""
+    candidates, skipped_duplicates = build_style_examples_from_archive()
+    if not candidates:
+        return 0, skipped_duplicates, 0
+
+    import_session_id = str(uuid.uuid4())
+    records = [
+        {
+            "session_id": import_session_id,
+            "customer_chat_id": item["customer_chat_id"],
+            "customer_message": item["customer_message"],
+            "owner_reply": item["owner_reply"],
+            "source": item["source"],
+        }
+        for item in candidates
+    ]
+    for start in range(0, len(records), ARCHIVE_IMPORT_PAGE_SIZE):
+        supabase.table("style_examples").insert(
+            records[start : start + ARCHIVE_IMPORT_PAGE_SIZE]
+        ).execute()
+    return len(records), skipped_duplicates, len(candidates)
+
+
 CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
 
 
@@ -1905,10 +2036,77 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
 
 
 TEST_CHAT_SYSTEM_PROMPT = (
-    "انت تجرب تتصرف مثل صاحب متجر عراقي يبيع اشتراكات رقمية (ChatGPT، "
-    "Anki، Canva، إلخ) عبر تيليجرام. جاوب بأسلوب طبيعي، عراقي، مباشر، "
-    "زي ما يحجي صاحب متجر حقيقي — مو رسمي زايد ولا طويل بلا داعي."
+    "انت مساعد تجريبي لصاحب متجر عراقي يبيع اشتراكات رقمية (ChatGPT، "
+    "Anki، Canva، إلخ) عبر تيليجرام. اكتب الرد باللهجة العراقية الطبيعية "
+    "وبنفس روح وأسلوب الأمثلة التي يلقنك إياها صاحب المتجر. كن مباشرًا "
+    "ولا تكن رسميًا زيادة أو طويلًا بلا داعي. الأمثلة تعلّمك الأسلوب وطريقة "
+    "التعامل، وليست مصدرًا لحقائق عامة: لا تخترع سعرًا أو توفرًا أو طريقة دفع "
+    "أو وعدًا للزبون. إذا كانت المعلومة المطلوبة غير موجودة في سياق المحادثة "
+    "أو في الأمثلة المناسبة، قل إنك تتحقق منها أو اطلب توضيحًا قصيرًا. "
+    "هذا وضع اختبار: أخرج الرد الذي يصلح إرساله للزبون فقط، بلا شرح لتحليلك."
 )
+
+
+STYLE_EXAMPLE_CANDIDATE_LIMIT = 500
+
+
+def normalize_style_text(text: str) -> set[str]:
+    """تطبيع خفيف للهجة العربية حتى نختار أمثلة قريبة من رسالة الاختبار."""
+    normalized = text.lower()
+    normalized = re.sub(r"[أإآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"[^\w\u0600-\u06ff]+", " ", normalized)
+    return {word for word in normalized.split() if len(word) >= 2}
+
+
+def get_relevant_style_examples(query_text: str, limit: int = 8) -> list[dict]:
+    """
+    يرجّع أمثلة تلقين قريبة من رسالة الاختبار. هذا بحث معجمي بسيط ومقصود
+    لمرحلة التجربة؛ يحافظ على عدد أمثلة صغير وواضح داخل طلب الـAI.
+    """
+    try:
+        res = (
+            supabase.table("style_examples")
+            .select("customer_message, owner_reply, source, created_at")
+            .order("created_at", desc=True)
+            .limit(STYLE_EXAMPLE_CANDIDATE_LIMIT)
+            .execute()
+        )
+        examples = res.data or []
+    except Exception:
+        # جدول التلقين قد لا يكون منشأ بعد في بيئة جديدة؛ لا نوقف التجربة بسببه.
+        logger.exception("Failed to fetch style examples for interactive test")
+        return []
+
+    query_words = normalize_style_text(query_text)
+    if not query_words:
+        return examples[:limit]
+
+    ranked_examples = []
+    for index, example in enumerate(examples):
+        customer_words = normalize_style_text(example.get("customer_message") or "")
+        reply_words = normalize_style_text(example.get("owner_reply") or "")
+        # نعطي كلام الزبون وزن أعلى لأنه هو الذي يحدد نوع الطلب عادةً.
+        score = (2 * len(query_words & customer_words)) + len(query_words & reply_words)
+        ranked_examples.append((score, -index, example))
+
+    ranked_examples.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [example for _, _, example in ranked_examples[:limit]]
+
+
+def format_style_examples(examples: list[dict]) -> str:
+    """يحوّل أمثلة التلقين إلى نص واضح للموديل، مع استبعاد الصفوف الناقصة."""
+    formatted = []
+    for index, example in enumerate(examples, start=1):
+        customer_message = (example.get("customer_message") or "").strip()
+        owner_reply = (example.get("owner_reply") or "").strip()
+        if customer_message and owner_reply:
+            source = example.get("source") or ""
+            responder = "رد البوت" if source.endswith(":bot") else "رد صاحب المتجر"
+            formatted.append(
+                f"مثال {index}:\nسياق المحادثة:\n{customer_message}\n{responder}: {owner_reply}"
+            )
+    return "\n\n".join(formatted)
 
 
 async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> str | None:
@@ -1919,6 +2117,8 @@ async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> s
     """
     summary_row = get_conversation_summary(customer_chat_id)
     summary_text = summary_row["summary_text"] if summary_row and summary_row.get("summary_text") else None
+    style_examples = get_relevant_style_examples(new_message)
+    style_examples_text = format_style_examples(style_examples)
 
     # نجيب الرسائل الأخيرة غير الملخصة بعد (منذ آخر تحديث ملخص) كسياق حي
     try:
@@ -1937,6 +2137,11 @@ async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> s
         recent_messages = []
 
     messages = [{"role": "system", "content": TEST_CHAT_SYSTEM_PROMPT}]
+    if style_examples_text:
+        messages.append({
+            "role": "system",
+            "content": f"هذه أمثلة مرتبة من محادثات المتجر، تشمل ردود صاحب المتجر وردود البوت. قلد الأسلوب المناسب، وليس بالضرورة تفاصيل كل حالة:\n\n{style_examples_text}",
+        })
     if summary_text:
         messages.append({"role": "system", "content": f"ملخص المحادثة السابقة:\n{summary_text}"})
     for m in recent_messages:
@@ -3943,6 +4148,33 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("جاهز. استخدم الأزرار بالأسفل:", reply_markup=MAIN_REPLY_KEYBOARD)
 
 
+async def cmd_import_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    استيراد آمن لمرة أولى من conversation_archive إلى style_examples.
+    يستورد التسلسل: رسائل زبون ثم رد نصي للمتجر (أونر أو بوت).
+    """
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return
+
+    await update.message.reply_text("⏳ دا أرتب الأرشيف وأحوّل ردودك وردود البوت إلى أمثلة تلقين...")
+    try:
+        added, skipped_duplicates, total_candidates = import_archive_as_style_examples()
+    except Exception:
+        logger.exception("Archive-to-style import failed")
+        await update.message.reply_text("⚠️ فشل الاستيراد. تحقق من اتصال Supabase والـ logs.")
+        return
+
+    await update.message.reply_text(
+        "✅ اكتمل ترتيب الأرشيف.\n"
+        f"أمثلة جديدة محفوظة: {added}\n"
+        f"أمثلة مكررة تم تجاوزها: {skipped_duplicates}\n"
+        f"إجمالي الأمثلة المرشحة: {total_candidates}\n\n"
+        "الآن ردود فرع التفاعل تقدر تستخدم هذه الأمثلة كمرجع لأسلوبك."
+    )
+
+
 async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """أمر /دخل — يعرض تقرير الدخل (اليوم/الأسبوع/الشهر) من Google Sheet."""
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
@@ -4093,8 +4325,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
-        if handled:
-            return
+        if not handled:
+            # ردود الأونر الحقيقية هي أهم مصدر للتعلم. الأوامر لا نؤرشفها
+            # حتى لا تتحول إلى أمثلة أسلوب أو تدخل بسياق الزبون.
+            archive_message(
+                chat_id, customer_name, customer_username,
+                sender_type="owner", message_text=text,
+            )
         return
 
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
@@ -4243,6 +4480,10 @@ def main() -> None:
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
+
+    # أمر /importarchive — يحوّل محادثات الأرشيف القديمة إلى أمثلة أسلوب
+    # نظيفة، ويُستخدم من الأونر داخل محادثته الخاصة مع البوت فقط.
+    app.add_handler(CommandHandler("importarchive", cmd_import_archive))
 
     # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
     # لكل حساب TOTP مع زر لعرض الكود
