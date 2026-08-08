@@ -72,7 +72,11 @@ TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط 
 TOPIC_DEBTS = int(os.environ.get("TOPIC_DEBTS", "0"))  # تسجيل دين جديد + تسديد دين — لازم تحدد رقمه الحقيقي
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_API_KEYS = [
+    k.strip() for k in os.environ.get("GROQ_API_KEYS", os.environ.get("GROQ_API_KEY", "")).split(",") if k.strip()
+]
+if not GROQ_API_KEYS:
+    raise RuntimeError("لازم تحدد GROQ_API_KEYS (مفاتيح مفصولة بفاصلة) أو GROQ_API_KEY بمتغيرات البيئة")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # مسار ملف مفاتيح حساب خدمة Google (Service Account) — ملف JSON خارجي
@@ -86,6 +90,49 @@ GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]  # الـ ID تبع الشيت (
 GOOGLE_SHEET_WORKSHEET_NAME = os.environ.get("GOOGLE_SHEET_WORKSHEET_NAME", "Sheet1")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ------------------------------------------------------------------
+# إدارة مفاتيح Groq المتعددة — نحتفظ بمؤشر لآخر مفتاح ناجح، ونستمر
+# نستخدمه لحد ما يفشل هو نفسه (مو نرجع للأول كل مرة). لو فشل، ننتقل
+# للمفتاح الجاي بالقائمة تلقائياً، ونحدث المؤشر.
+# ------------------------------------------------------------------
+_current_groq_key_index = 0
+
+
+async def call_groq_api(payload: dict, timeout: float = 20.0) -> dict | None:
+    """
+    نقطة استدعاء موحدة لكل طلبات Groq API (نص، صور، صوت لاحقاً) —
+    تدير تعدد المفاتيح تلقائياً: تبدأ من آخر مفتاح ناجح، ولو فشل
+    (خطأ شبكة أو رد غير ناجح) تجرب باقي المفاتيح بالترتيب حتى تنجح
+    وحدة أو تنتهي القائمة. يرجع الـ JSON response كامل، أو None لو
+    فشلت كل المفاتيح.
+    """
+    global _current_groq_key_index
+
+    num_keys = len(GROQ_API_KEYS)
+    for attempt in range(num_keys):
+        key_index = (_current_groq_key_index + attempt) % num_keys
+        api_key = GROQ_API_KEYS[key_index]
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            resp.raise_for_status()
+            _current_groq_key_index = key_index  # هذا المفتاح نجح، نثبته للمرة الجاية
+            return resp.json()
+        except Exception:
+            logger.exception(f"Groq API call failed with key index {key_index} — trying next key if available")
+            continue
+
+    logger.error("All Groq API keys failed for this request")
+    return None
+
 
 # ------------------------------------------------------------------
 # اتصال Google Sheets (gspread) — يُبنى مرة وحدة عند بدء تشغيل البوت.
@@ -1193,26 +1240,19 @@ async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
     old_summary = existing["summary_text"] if existing and existing.get("summary_text") else "لا يوجد ملخص سابق."
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CHATGPT_CONTEXT_MODEL,
-                    "temperature": 0.3,
-                    "max_completion_tokens": 500,
-                    "reasoning_effort": "low",
-                    "messages": [
-                        {"role": "system", "content": SUMMARY_MERGE_PROMPT},
-                        {"role": "user", "content": f"الملخص السابق:\n{old_summary}\n\nالرسائل الجديدة:\n{transcript}"},
-                    ],
-                },
-            )
-        resp.raise_for_status()
-        new_summary = resp.json()["choices"][0]["message"]["content"].strip()
+        data = await call_groq_api({
+            "model": CHATGPT_CONTEXT_MODEL,
+            "temperature": 0.3,
+            "max_completion_tokens": 500,
+            "reasoning_effort": "low",
+            "messages": [
+                {"role": "system", "content": SUMMARY_MERGE_PROMPT},
+                {"role": "user", "content": f"الملخص السابق:\n{old_summary}\n\nالرسائل الجديدة:\n{transcript}"},
+            ],
+        }, timeout=15.0)
+        if data is None:
+            return
+        new_summary = data["choices"][0]["message"]["content"].strip()
     except Exception:
         logger.exception("Failed to merge conversation summary")
         return
@@ -1722,6 +1762,10 @@ CHATGPT_CONTEXT_MODEL = "openai/gpt-oss-120b"
 # رسمياً لقراءة الصور بـ Groq حالياً (يدعم صور + نص بنفس الوقت)
 IMAGE_VISION_MODEL = "qwen/qwen3.6-27b"
 
+# موديل مخصص لتحويل الصوت لنص (Speech-to-Text) — أسرع نسخة من Whisper
+# بحفاظ على دقة عالية، مناسب لرسائل صوتية قصيرة/متوسطة
+WHISPER_MODEL = "whisper-large-v3-turbo"
+
 CHATGPT_CONTEXT_PROMPT = (
     "انت تحلل رسائل زبائن عراقيين بمتجر يبيع اشتراكات ChatGPT، باللهجة "
     "العراقية العامية. الرسالة الجاية فيها ذكر لـ ChatGPT (جات/چات/جي بي تي). "
@@ -1756,26 +1800,18 @@ async def classify_chatgpt_context(text: str) -> str:
     كافي لاستيعاب أي تفكير داخلي قبل الجواب النهائي، وإلا ينقطع الرد.
     """
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CHATGPT_CONTEXT_MODEL,
-                    "temperature": 0,
-                    "max_completion_tokens": 500,
-                    "reasoning_effort": "low",
-                    "messages": [
-                        {"role": "system", "content": CHATGPT_CONTEXT_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
-                },
-            )
-        resp.raise_for_status()
-        data = resp.json()
+        data = await call_groq_api({
+            "model": CHATGPT_CONTEXT_MODEL,
+            "temperature": 0,
+            "max_completion_tokens": 500,
+            "reasoning_effort": "low",
+            "messages": [
+                {"role": "system", "content": CHATGPT_CONTEXT_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        }, timeout=15.0)
+        if data is None:
+            return "شراء"
         raw = data["choices"][0]["message"]["content"].strip()
         logger.info(f"classify_chatgpt_context raw response: {raw!r} (input: {text!r})")
         if "شكوى" in raw:
@@ -1808,40 +1844,64 @@ async def describe_image(file_bytes: bytes) -> str | None:
     """
     try:
         base64_image = base64.b64encode(file_bytes).decode("utf-8")
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": IMAGE_VISION_MODEL,
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "max_completion_tokens": 500,
-                    "reasoning_effort": "none",
-                    "reasoning_format": "hidden",
-                    "messages": [
+        data = await call_groq_api({
+            "model": IMAGE_VISION_MODEL,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "max_completion_tokens": 500,
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": IMAGE_DESCRIPTION_PROMPT},
                         {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": IMAGE_DESCRIPTION_PROMPT},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                                },
-                            ],
-                        }
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                        },
                     ],
-                },
-            )
-        resp.raise_for_status()
-        data = resp.json()
+                }
+            ],
+        }, timeout=20.0)
+        if data is None:
+            return None
         return data["choices"][0]["message"]["content"].strip()
     except Exception:
         logger.exception("Groq image description failed")
         return None
+
+
+async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> str | None:
+    """
+    يستخدم Groq Whisper (موديل WHISPER_MODEL) لتحويل رسالة صوتية لنص.
+    يدير تعدد المفاتيح بنفسه (endpoint مختلف عن call_groq_api — طلب
+    multipart/form-data، مو JSON). يرجع النص المكتوب، أو None لو فشلت
+    كل المفاتيح.
+    """
+    global _current_groq_key_index
+
+    num_keys = len(GROQ_API_KEYS)
+    for attempt in range(num_keys):
+        key_index = (_current_groq_key_index + attempt) % num_keys
+        api_key = GROQ_API_KEYS[key_index]
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (filename, file_bytes)},
+                    data={"model": WHISPER_MODEL, "language": "ar"},
+                )
+            resp.raise_for_status()
+            _current_groq_key_index = key_index
+            return resp.json().get("text", "").strip()
+        except Exception:
+            logger.exception(f"Groq Whisper call failed with key index {key_index} — trying next key if available")
+            continue
+
+    logger.error("All Groq API keys failed for audio transcription")
+    return None
 
 
 TEST_CHAT_SYSTEM_PROMPT = (
@@ -1887,23 +1947,16 @@ async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> s
     messages.append({"role": "user", "content": new_message})
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CHATGPT_CONTEXT_MODEL,
-                    "temperature": 0.7,
-                    "max_completion_tokens": 500,
-                    "reasoning_effort": "low",
-                    "messages": messages,
-                },
-            )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        data = await call_groq_api({
+            "model": CHATGPT_CONTEXT_MODEL,
+            "temperature": 0.7,
+            "max_completion_tokens": 500,
+            "reasoning_effort": "low",
+            "messages": messages,
+        }, timeout=20.0)
+        if data is None:
+            return None
+        return data["choices"][0]["message"]["content"].strip()
     except Exception:
         logger.exception("Failed to generate test chat reply")
         return None
@@ -2357,6 +2410,34 @@ async def describe_and_archive_customer_photo(context: ContextTypes.DEFAULT_TYPE
     archive_message(
         customer_chat_id, customer_name, customer_username,
         sender_type="customer", message_text=None, image_description=description,
+    )
+
+
+async def describe_and_archive_owner_photo(context: ContextTypes.DEFAULT_TYPE, bm) -> None:
+    """
+    يحمّل صورة أرسلتها أنت (owner) بمحادثة زبون معين، يوصفها بالذكاء
+    الاصطناعي، ويؤرشفها بجدول conversation_archive بنفس سياق ذلك
+    الزبون — متوازي تماماً مع فلو "هل هذا مصروف؟" الموجود، بدون ما
+    يأثر عليه (يُستدعى كـ task موازي).
+    """
+    customer_chat_id = bm.chat.id
+    customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
+    customer_username = bm.chat.username
+
+    try:
+        file = await context.bot.get_file(bm.photo[-1].file_id)
+        file_bytes = bytes(await file.download_as_bytearray())
+    except Exception:
+        logger.exception("Failed to download owner photo for description")
+        return
+
+    description = await describe_image(file_bytes)
+    if description is None:
+        return
+
+    archive_message(
+        customer_chat_id, customer_name, customer_username,
+        sender_type="owner", message_text=None, image_description=description,
     )
 
 
@@ -3638,29 +3719,43 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
 
 async def on_interactive_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    يعالج رسائل نصية عادية (مو أوامر) بفرع 'تفاعل' بالقروب — تجربة
+    يعالج رسائل نصية أو صوتية (مو أوامر) بفرع 'تفاعل' بالقروب — تجربة
     شات حر مباشر مع gpt-oss-120b، يستخدم ملخص متراكم (30 دقيقة صمت
     يستدعي دمج جديد) كذاكرة سياق بدل الاحتفاظ بكل التاريخ الخام.
     """
     message = update.message
-    if not message or not message.text:
+    if not message or (not message.text and not message.voice):
         return
-    if message.text.startswith("/"):
+    if message.text and message.text.startswith("/"):
         return  # الأوامر (زي /getcode) تُعالج بـ handlers منفصلة
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
         return
     if message.message_thread_id != TOPIC_INTERACTIVE:
         return
 
+    if message.voice:
+        try:
+            file = await context.bot.get_file(message.voice.file_id)
+            file_bytes = bytes(await file.download_as_bytearray())
+            user_text = await transcribe_audio(file_bytes)
+        except Exception:
+            logger.exception("Failed to download/transcribe voice message in interactive topic")
+            user_text = None
+        if not user_text:
+            await message.reply_text("⚠️ فشل تحويل الصوت لنص.")
+            return
+    else:
+        user_text = message.text
+
     customer_chat_id = OWNER_USER_ID  # بالتجربة، الأونر نفسه يمثل الطرف اللي نبني له السياق
 
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
-    archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=message.text)
+    archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=user_text)
 
     # نفحص/نحدث الملخص التراكمي لو مرت 30 دقيقة صمت
     await maybe_update_conversation_summary(customer_chat_id)
 
-    reply = await generate_test_chat_reply(customer_chat_id, message.text)
+    reply = await generate_test_chat_reply(customer_chat_id, user_text)
     if reply is None:
         await message.reply_text("⚠️ صار خطأ أثناء توليد الرد — تحقق من الاتصال بـ Groq.")
         return
@@ -3677,10 +3772,13 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
 
 async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    يعالج صور مرسلة مباشرة لمحادثتك مع البوت (مو Business، مو رد على
-    رسالة قديمة) — محتملة إثبات مصروف، نفس معاملة الصور اللي ترسلها
-    بمحادثة زبون.
+    يعالج صور مرسلة مباشرة لمحادثتك مع البوت (مو Business) — لو فيه
+    جلسة تلقين نشطة، الصورة تروح لها أولاً. غير هيك، محتملة إثبات
+    مصروف، نفس معاملة الصور اللي ترسلها بمحادثة زبون.
     """
+    if await handle_teaching_message(update, context):
+        return
+
     message = update.message
     if not message or not message.photo:
         return
@@ -3689,25 +3787,27 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    يلتقط رسائل نصية (محولة أو مكتوبة مباشرة) بمحادثتك الخاصة مع البوت
-    وقت ما فيه جلسة تلقين نشطة. يرجع True لو عالج الرسالة (يوقف أي
-    معالجة ثانية للرسالة)، False لو ما فيه جلسة نشطة.
+    يلتقط رسائل نصية، صور، أو صوتية (محولة أو مباشرة) بمحادثتك الخاصة
+    مع البوت وقت ما فيه جلسة تلقين نشطة. يرجع True لو عالج الرسالة
+    (يوقف أي معالجة ثانية للرسالة)، False لو ما فيه جلسة نشطة.
 
+    - لو الرسالة صورة: تُوصف بالذكاء الاصطناعي (Groq Vision).
+    - لو الرسالة صوتية: تُحول لنص (Groq Whisper).
+    - النص/الوصف الناتج يُعامل بنفس منطق النص العادي (يضاف لرسائل
+      الزبون، أو يُحفظ كرد).
     - لو الجلسة بانتظار رسائل الزبون (awaiting_reply=False): يضيف
       الرسالة لقائمة customer_messages المتجمعة، ويحاول يستخرج
-      customer_chat_id من forward_origin لو متوفر ومو معروف أصلاً.
+      customer_chat_id من forward_origin لو متوفر.
     - لو الجلسة بانتظار الرد (awaiting_reply=True): يحفظ المثال
       الكامل بـ style_examples، ويصفر الجلسة لمثال جديد تلقائياً.
     """
     global _teaching_session
 
     message = update.message
-    if not message or not message.text or _teaching_session is None:
+    if not message or _teaching_session is None:
         return False
-
-    text = message.text.strip()
-    if not text:
-        return True  # رسالة فاضية بجلسة نشطة — نتجاهلها بصمت بدل ما نمررها لمعالج ثاني
+    if not message.text and not message.photo and not message.voice:
+        return False
 
     session = _teaching_session
 
@@ -3719,6 +3819,39 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
         if origin_chat is not None:
             session["customer_chat_id"] = origin_chat.id
 
+    if message.photo:
+        try:
+            file = await context.bot.get_file(message.photo[-1].file_id)
+            file_bytes = bytes(await file.download_as_bytearray())
+        except Exception:
+            logger.exception("Failed to download teaching session photo")
+            await message.reply_text("⚠️ فشل تحميل الصورة.")
+            return True
+
+        description = await describe_image(file_bytes)
+        if description is None:
+            await message.reply_text("⚠️ فشل تحليل الصورة — تحقق من الاتصال.")
+            return True
+        text = f"[صورة: {description}]"
+    elif message.voice:
+        try:
+            file = await context.bot.get_file(message.voice.file_id)
+            file_bytes = bytes(await file.download_as_bytearray())
+        except Exception:
+            logger.exception("Failed to download teaching session voice message")
+            await message.reply_text("⚠️ فشل تحميل الرسالة الصوتية.")
+            return True
+
+        transcript = await transcribe_audio(file_bytes)
+        if not transcript:
+            await message.reply_text("⚠️ فشل تحويل الصوت لنص — تحقق من الاتصال.")
+            return True
+        text = transcript
+    else:
+        text = message.text.strip()
+        if not text:
+            return True  # رسالة فاضية بجلسة نشطة — نتجاهلها بصمت بدل ما نمررها لمعالج ثاني
+
     if not session["awaiting_reply"]:
         session["customer_messages"].append(text)
         await message.reply_text(
@@ -3727,7 +3860,7 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
         )
         return True
 
-    # awaiting_reply=True — هذا النص هو الرد، نحفظ المثال ونبدأ مثال جديد
+    # awaiting_reply=True — هذا النص/الوصف هو الرد، نحفظ المثال ونبدأ مثال جديد
     combined_customer_message = "\n".join(session["customer_messages"])
     saved = save_style_example(session["session_id"], session["customer_chat_id"], combined_customer_message, text, source="manual")
 
@@ -3900,16 +4033,31 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # صورة أرسلتها أنت (owner) بمحادثتك مع زبون معين — محتملة إثبات
-    # مصروف، نحولها لمحادثتك مع البوت ونسألك تأكيد
+    # مصروف، نحولها لمحادثتك مع البوت ونسألك تأكيد. بالتوازي، نؤرشفها
+    # (وصف بالذكاء الاصطناعي) بدون ما يأثر على فلو المصروف
     if bm.photo and is_from_owner:
+        asyncio.create_task(describe_and_archive_owner_photo(context, bm))
         await handle_owner_expense_photo(update, context, bm.photo)
         return
 
-    if not bm.text:
+    # رسالة صوتية (من الزبون أو منك) — نحولها لنص عبر Whisper، ونعاملها
+    # بعدها بنفس آلية الرسالة النصية العادية (تصنيف، رد، أرشفة)
+    text = bm.text
+    if not text and bm.voice:
+        try:
+            file = await context.bot.get_file(bm.voice.file_id)
+            file_bytes = bytes(await file.download_as_bytearray())
+            text = await transcribe_audio(file_bytes)
+        except Exception:
+            logger.exception("Failed to download/transcribe voice message")
+            text = None
+        if not text:
+            return  # فشل تحويل الصوت — نتجاهل بصمت بدل ما نكرش
+
+    if not text:
         return
 
     chat_id = bm.chat.id
-    text = bm.text
 
     # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
@@ -4091,10 +4239,19 @@ def main() -> None:
         )
     )
 
-    # رسائل نصية عادية بفرع "تفاعل" بالقروب — تجربة شات حر مع الذكاء الاصطناعي
+    # رسائل صوتية مرسلة مباشرة لمحادثتك مع البوت (مو Business) — محتملة
+    # جزء من جلسة تلقين نشطة
     app.add_handler(
         MessageHandler(
-            filters.ChatType.SUPERGROUP & filters.TEXT & filters.User(OWNER_USER_ID),
+            filters.ChatType.PRIVATE & filters.VOICE & filters.User(OWNER_USER_ID),
+            handle_teaching_message,
+        )
+    )
+
+    # رسائل نصية أو صوتية بفرع "تفاعل" بالقروب — تجربة شات حر مع الذكاء الاصطناعي
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.SUPERGROUP & (filters.TEXT | filters.VOICE) & filters.User(OWNER_USER_ID),
             on_interactive_topic_message,
         )
     )
