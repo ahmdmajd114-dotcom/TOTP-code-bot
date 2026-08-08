@@ -1137,6 +1137,57 @@ def get_style_examples(limit: int = 12) -> list[dict]:
         return []
 
 
+def get_last_message_sender_type(customer_chat_id: int) -> str | None:
+    """يرجع sender_type لآخر رسالة مؤرشفة (أي نوع) لهذا الزبون، أو None لو ماكو أرشيف بعد."""
+    try:
+        res = (
+            supabase.table("conversation_archive")
+            .select("sender_type")
+            .eq("customer_chat_id", customer_chat_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0]["sender_type"] if res.data else None
+    except Exception:
+        logger.exception("Failed to fetch last archived message sender type")
+        return None
+
+
+def get_last_customer_message(customer_chat_id: int) -> str | None:
+    """يرجع آخر رسالة نصية أرسلها هذا الزبون (محفوظة بـ conversation_archive)، أو None لو ماكو."""
+    try:
+        res = (
+            supabase.table("conversation_archive")
+            .select("message_text")
+            .eq("customer_chat_id", customer_chat_id)
+            .eq("sender_type", "customer")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data and res.data[0].get("message_text"):
+            return res.data[0]["message_text"]
+        return None
+    except Exception:
+        logger.exception("Failed to fetch last customer message")
+        return None
+
+
+def capture_owner_reply_as_style_example(customer_chat_id: int, owner_reply: str) -> None:
+    """
+    لما ترد يدوياً على زبون حقيقي بمحادثة Business (نص حر، مو أمر)،
+    نربط الرد بآخر رسالة أرسلها نفس الزبون ونحفظهم كمثال تعلم جديد
+    بـ style_examples تلقائياً — بدون حاجة لجلسة تلقين يدوية. لو ماكو
+    رسالة زبون سابقة معروفة، نتجاهل الحفظ بهدوء.
+    """
+    last_customer_message = get_last_customer_message(customer_chat_id)
+    if not last_customer_message:
+        return
+    session_id = get_or_create_conversation_session_id(customer_chat_id)
+    save_style_example(session_id, customer_chat_id, last_customer_message, owner_reply, source="business_chat")
+
+
 CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
 
 
@@ -3996,6 +4047,79 @@ async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(report)
 
 
+async def cmd_migrate_style_examples(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    أمر /migratestyle (لمرة وحدة، يدوي) — يدور بكل جدول conversation_archive
+    عن أزواج حقيقية (رسالة زبون تليها مباشرة رسالة نصية منك أنت "owner"
+    لنفس الزبون)، ويحفظهم بجدول style_examples لو مو محفوظين أصلاً
+    (تجنب التكرار بمقارنة النص). ردود البوت التلقائية (FAQ/AI) ما
+    تُحسب كأزواج — بس ردودك الحقيقية المكتوبة.
+    """
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+
+    await update.message.reply_text("⏳ جاري فحص الأرشيف عن أزواج ردود حقيقية...")
+
+    try:
+        res = (
+            supabase.table("conversation_archive")
+            .select("customer_chat_id, sender_type, message_text")
+            .order("created_at")
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:
+        logger.exception("Failed to read conversation_archive for style migration")
+        await update.message.reply_text("⚠️ فشل قراءة الأرشيف.")
+        return
+
+    try:
+        existing_res = supabase.table("style_examples").select("customer_message, owner_reply").execute()
+        existing_pairs = {
+            (row.get("customer_message"), row.get("owner_reply")) for row in (existing_res.data or [])
+        }
+    except Exception:
+        logger.exception("Failed to read existing style_examples for dedup")
+        existing_pairs = set()
+
+    migration_session_id = str(uuid.uuid4())
+    pending_customer_message: dict[int, str] = {}
+    new_pairs: list[tuple[int, str, str]] = []
+
+    for row in rows:
+        chat_id = row.get("customer_chat_id")
+        sender_type = row.get("sender_type")
+        text = row.get("message_text")
+        if chat_id is None:
+            continue
+
+        if sender_type == "customer":
+            if text:
+                pending_customer_message[chat_id] = text
+            continue
+
+        if sender_type == "owner" and text:
+            pending = pending_customer_message.pop(chat_id, None)
+            if pending and (pending, text) not in existing_pairs:
+                new_pairs.append((chat_id, pending, text))
+                existing_pairs.add((pending, text))
+            continue
+
+        # أي نوع ثاني (رد بوت تلقائي) يصفر الانتظار — مو رد حقيقي منك
+        pending_customer_message.pop(chat_id, None)
+
+    saved_count = 0
+    for chat_id, customer_message, owner_reply in new_pairs:
+        if save_style_example(migration_session_id, chat_id, customer_message, owner_reply, source="archive_migration"):
+            saved_count += 1
+
+    await update.message.reply_text(
+        f"✅ انتهت المعالجة.\n"
+        f"أزواج جديدة لقيتها بالأرشيف: {len(new_pairs)}\n"
+        f"تم حفظها بنجاح بـ style_examples: {saved_count}"
+    )
+
+
 def build_getcode_show_keyboard(account_id) -> InlineKeyboardMarkup:
     """زر 'عرض الكود' — يطلع لما الرسالة تعرض اسم الحساب بس."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("👁 عرض الكود", callback_data=f"getcode_show_{account_id}")]])
@@ -4135,11 +4259,20 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
 
-    # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
+    # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept.
+    #    لو مو أمر، فهي رد حر منك على الزبون — نؤرشفها ونحفظها تلقائياً
+    #    كمثال تعلم أسلوب (مربوطة بآخر رسالة الزبون)، عشان الذكاء
+    #    الاصطناعي يتعلم من ردودك الحقيقية بدون حاجة لجلسة تلقين يدوية
     if is_from_owner:
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
         if handled:
             return
+        # نلتقط الرد كمثال تعلم بس لو هذا أول رد بعد رسالة الزبون —
+        # لو آخر رسالة مؤرشفة كانت منك أنت أصلاً (رد متعدد الأجزاء)،
+        # نتجنب حفظ نفس رسالة الزبون كمحفز لعدة أمثلة متكررة
+        if get_last_message_sender_type(chat_id) != "owner":
+            capture_owner_reply_as_style_example(chat_id, text)
+        archive_message(chat_id, customer_name, customer_username, sender_type="owner", message_text=text)
         return
 
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
@@ -4288,6 +4421,10 @@ def main() -> None:
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
+
+    # أمر /migratestyle (لمرة وحدة، يدوي) — يستخرج أزواج ردود حقيقية من
+    # conversation_archive القديم ويحفظها بـ style_examples
+    app.add_handler(CommandHandler("migratestyle", cmd_migrate_style_examples))
 
     # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
     # لكل حساب TOTP مع زر لعرض الكود
