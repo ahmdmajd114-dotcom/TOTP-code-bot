@@ -755,7 +755,7 @@ def build_catalog_product_keyboard(product: dict, plans: list[dict]) -> InlineKe
         InlineKeyboardButton("✏️ تعديل الاسم والكلمات", callback_data=f"catalog_edit_product_{product['id']}"),
         InlineKeyboardButton("⏸️ إيقاف المنتج" if product["is_active"] else "✅ تفعيل المنتج", callback_data=f"catalog_toggle_product_{product['id']}"),
     ])
-    rows.append([InlineKeyboardButton("🗑️ حذف المنتج", callback_data=f"catalog_delete_product_confirm_{product['id']}")])
+    rows.append([InlineKeyboardButton("🗑️ حذف المنتج", callback_data=f"catalog_pdelc_{product['id']}")])
     rows.append([InlineKeyboardButton(BTN_BACK, callback_data="catalog_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -839,8 +839,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text("⚠️ فشل تحديث حالة المنتج.")
         return
 
-    if data.startswith("catalog_delete_product_confirm_"):
-        product_id = data[len("catalog_delete_product_confirm_"):]
+    if data.startswith("catalog_pdelc_"):
+        product_id = data[len("catalog_pdelc_"):]
         product = get_catalog_product(product_id)
         if product is None:
             await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
@@ -848,14 +848,14 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             f"تأكيد حذف المنتج «{product['name']}» وكل باقاته؟\nهذا الإجراء ما يرجع.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"catalog_delete_product_{product_id}")],
+                [InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"catalog_pdel_{product_id}")],
                 [InlineKeyboardButton("◀️ إلغاء", callback_data=f"catalog_product_{product_id}")],
             ]),
         )
         return
 
-    if data.startswith("catalog_delete_product_"):
-        product_id = data[len("catalog_delete_product_"):]
+    if data.startswith("catalog_pdel_"):
+        product_id = data[len("catalog_pdel_"):]
         try:
             supabase.table("catalog_products").delete().eq("id", product_id).execute()
             products = get_catalog_products()
@@ -905,7 +905,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("✏️ تعديل السعر", callback_data=f"catalog_price_{plan_id}")],
             [InlineKeyboardButton("✏️ تعديل تفاصيل الباقة", callback_data=f"catalog_edit_plan_{plan_id}")],
             [InlineKeyboardButton("⏸️ إيقاف" if plan["is_active"] else "✅ تفعيل", callback_data=f"catalog_toggle_{plan_id}")],
-            [InlineKeyboardButton("🗑️ حذف الباقة", callback_data=f"catalog_delete_plan_confirm_{plan_id}")],
+            [InlineKeyboardButton("🗑️ حذف الباقة", callback_data=f"catalog_xdelc_{plan_id}")],
             [InlineKeyboardButton(BTN_BACK, callback_data=f"catalog_product_{plan['product_id']}")],
         ])
         await query.edit_message_text(text, reply_markup=keyboard)
@@ -940,8 +940,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل كـرد على هذي الرسالة:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
         return
 
-    if data.startswith("catalog_delete_plan_confirm_"):
-        plan_id = data[len("catalog_delete_plan_confirm_"):]
+    if data.startswith("catalog_xdelc_"):
+        plan_id = data[len("catalog_xdelc_"):]
         try:
             result = supabase.table("catalog_plans").select("id, product_id, name").eq("id", plan_id).execute()
             plan = result.data[0] if result.data else None
@@ -954,14 +954,14 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             f"تأكيد حذف باقة «{plan['name']}»؟\nهذا الإجراء ما يرجع.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"catalog_delete_plan_{plan_id}")],
+                [InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"catalog_xdel_{plan_id}")],
                 [InlineKeyboardButton("◀️ إلغاء", callback_data=f"catalog_plan_{plan_id}")],
             ]),
         )
         return
 
-    if data.startswith("catalog_delete_plan_"):
-        plan_id = data[len("catalog_delete_plan_"):]
+    if data.startswith("catalog_xdel_"):
+        plan_id = data[len("catalog_xdel_"):]
         try:
             result = supabase.table("catalog_plans").select("id, product_id").eq("id", plan_id).execute()
             plan = result.data[0] if result.data else None
