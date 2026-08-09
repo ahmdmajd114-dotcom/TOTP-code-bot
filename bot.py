@@ -694,6 +694,7 @@ BTN_STATS = "📈 إحصائيات"
 BTN_DEBT = "💳 تسجيل دين"
 BTN_TEACH = "📝 بدء تلقين جديد"
 BTN_CATALOG = "🗂️ المنتجات والباقات"
+BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_BACK = "◀️ رجوع"
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
@@ -701,7 +702,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
-        [KeyboardButton(BTN_CATALOG)],
+        [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
     ],
     resize_keyboard=True,
 )
@@ -1047,6 +1048,94 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
     # نرجع شاشة الكاتالوك مباشرة حتى تقدر تفتح المنتج وتضيف باقاته
     # بدون ما تحتاج تضغط زر لوحة المفاتيح مرة ثانية.
     await show_catalog_main(message)
+    return True
+
+
+def get_payment_methods() -> list[dict]:
+    try:
+        return supabase.table("payment_methods").select("id, name, instructions, is_active").order("display_order").order("name").execute().data or []
+    except Exception:
+        logger.exception("Failed to fetch payment methods")
+        return []
+
+
+def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"{'✅' if row['is_active'] else '⏸️'} {row['name']}", callback_data=f"pm_{row['id']}")] for row in methods]
+    rows.append([InlineKeyboardButton("➕ إضافة طريقة دفع", callback_data="pm_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_payment_methods(message) -> None:
+    await message.reply_text("💳 طرق الدفع\nاختَر طريقة لتعديلها، أو أضف طريقة جديدة.", reply_markup=payment_keyboard(get_payment_methods()))
+
+
+async def handle_payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    data = query.data
+    await query.answer()
+    if data == "pm_back":
+        await show_payment_methods(query.message)
+        return
+    if data == "pm_add":
+        context.user_data["pending_payment_input"] = {"message_id": query.message.message_id}
+        await query.edit_message_text("اكتب طريقة الدفع بهذا الشكل كـرد على هذي الرسالة:\nاسم الطريقة | التفاصيل التي تصل للزبون\n\nمثال: زين كاش | الرقم: 07xxxxxxxxx باسم أحمد")
+        return
+    if data.startswith("pm_edit_"):
+        context.user_data["pending_payment_input"] = {
+            "message_id": query.message.message_id,
+            "id": data[len("pm_edit_"):],
+        }
+        await query.edit_message_text("اكتب الاسم والتفاصيل الجديدة كـرد على هذي الرسالة:\nاسم الطريقة | التفاصيل التي تصل للزبون")
+        return
+    if data.startswith("pm_toggle_"):
+        method_id = data[len("pm_toggle_"):]
+        rows = supabase.table("payment_methods").select("is_active").eq("id", method_id).execute().data or []
+        if rows:
+            supabase.table("payment_methods").update({"is_active": not rows[0]["is_active"]}).eq("id", method_id).execute()
+        await show_payment_methods(query.message)
+        return
+    if data.startswith("pm_delc_"):
+        method_id = data[len("pm_delc_"):]
+        await query.edit_message_text("تأكيد حذف طريقة الدفع؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"pm_del_{method_id}")], [InlineKeyboardButton("◀️ إلغاء", callback_data=f"pm_{method_id}")]]))
+        return
+    if data.startswith("pm_del_"):
+        supabase.table("payment_methods").delete().eq("id", data[len("pm_del_"):]).execute()
+        await show_payment_methods(query.message)
+        return
+    if data.startswith("pm_"):
+        method_id = data[len("pm_"):]
+        rows = supabase.table("payment_methods").select("id, name, instructions, is_active").eq("id", method_id).execute().data or []
+        if not rows:
+            await query.message.reply_text("⚠️ طريقة الدفع ما عادت موجودة.")
+            return
+        method = rows[0]
+        await query.message.reply_text(f"{method['name']}\n\n{method['instructions']}\n\nالحالة: {'مفعلة' if method['is_active'] else 'متوقفة'}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ تعديل", callback_data=f"pm_edit_{method_id}")], [InlineKeyboardButton("⏸️ إيقاف" if method['is_active'] else "✅ تفعيل", callback_data=f"pm_toggle_{method_id}")], [InlineKeyboardButton("🗑️ حذف", callback_data=f"pm_delc_{method_id}")], [InlineKeyboardButton(BTN_BACK, callback_data="pm_back")]]))
+
+
+async def handle_payment_method_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    state = context.user_data.get("pending_payment_input")
+    if not message or not message.text or not state or not message.reply_to_message or message.reply_to_message.message_id != state["message_id"]:
+        return False
+    name, separator, instructions = message.text.strip().partition("|")
+    if not separator or not name.strip() or not instructions.strip():
+        await message.reply_text("الصيغة غير صحيحة. استخدم: اسم الطريقة | التفاصيل")
+        return True
+    payload = {"name": name.strip(), "instructions": instructions.strip()}
+    try:
+        if state.get("id"):
+            supabase.table("payment_methods").update(payload).eq("id", state["id"]).execute()
+        else:
+            supabase.table("payment_methods").insert(payload).execute()
+    except Exception:
+        logger.exception("Failed to save payment method")
+        await message.reply_text("⚠️ فشل حفظ طريقة الدفع.")
+        return True
+    context.user_data.pop("pending_payment_input", None)
+    await message.reply_text("✅ تم الحفظ.")
+    await show_payment_methods(message)
     return True
 
 
@@ -3990,6 +4079,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         await show_catalog_main(message)
         return True
 
+    if text == BTN_PAYMENT_METHODS:
+        await show_payment_methods(message)
+        return True
+
     if text == BTN_EXPENSE:
         sent = await message.reply_text(
             format_expense_summary({"amount": 0, "vault": None, "reason": None}),
@@ -4354,6 +4447,8 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
     مصروف، نفس معاملة الصور اللي ترسلها بمحادثة زبون.
     """
     if await handle_teaching_message(update, context):
+        return
+    if await handle_payment_method_input(update, context):
         return
     if await handle_catalog_input(update, context):
         return
@@ -4865,6 +4960,9 @@ def main() -> None:
 
     # إدارة المنتجات والباقات — للأونر فقط داخل محادثته الخاصة مع البوت.
     app.add_handler(CallbackQueryHandler(handle_catalog_callback, pattern=r"^catalog_"))
+
+    # إدارة تفاصيل الدفع المعتمدة — للأونر فقط.
+    app.add_handler(CallbackQueryHandler(handle_payment_method_callback, pattern=r"^pm_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
