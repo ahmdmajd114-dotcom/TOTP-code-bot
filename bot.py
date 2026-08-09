@@ -792,7 +792,10 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "catalog_main":
         products = get_catalog_products()
-        await query.edit_message_text("🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.", reply_markup=build_catalog_main_keyboard(products))
+        await query.message.reply_text(
+            "🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.",
+            reply_markup=build_catalog_main_keyboard(products),
+        )
         return
 
     if data == "catalog_add_product":
@@ -863,12 +866,21 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data.startswith("catalog_product_"):
-        product = get_catalog_product(data[len("catalog_product_"):])
-        if product is None:
-            await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
-            return
-        plans = get_catalog_plans(product["id"])
-        await query.edit_message_text(format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
+        try:
+            product = get_catalog_product(data[len("catalog_product_"):])
+            if product is None:
+                await query.message.reply_text("⚠️ المنتج ما عاد موجود.")
+                return
+            plans = get_catalog_plans(product["id"])
+            # نرسل رسالة جديدة: هذا أضمن من تعديل رسالة زر قديمة، خصوصاً
+            # إذا ضغطت عليها بعد إعادة نشر البوت.
+            await query.message.reply_text(
+                format_catalog_product(product, plans),
+                reply_markup=build_catalog_product_keyboard(product, plans),
+            )
+        except Exception:
+            logger.exception("Failed to open catalog product")
+            await query.message.reply_text("⚠️ ما انفتح المنتج. جرّب مرة ثانية بعد دقيقة.")
         return
 
     if data.startswith("catalog_add_plan_"):
