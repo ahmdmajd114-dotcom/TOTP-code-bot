@@ -1032,6 +1032,9 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return True
 
     context.user_data.pop("pending_catalog_input", None)
+    # نرجع شاشة الكاتالوك مباشرة حتى تقدر تفتح المنتج وتضيف باقاته
+    # بدون ما تحتاج تضغط زر لوحة المفاتيح مرة ثانية.
+    await show_catalog_main(message)
     return True
 
 
