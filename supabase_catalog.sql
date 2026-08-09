@@ -4,10 +4,15 @@
 create table if not exists public.catalog_products (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
+  aliases text[] not null default '{}',
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- للجدول المنشأ سابقاً قبل إضافة الكلمات البديلة.
+alter table public.catalog_products
+  add column if not exists aliases text[] not null default '{}';
 
 create table if not exists public.catalog_plans (
   id uuid primary key default gen_random_uuid(),
