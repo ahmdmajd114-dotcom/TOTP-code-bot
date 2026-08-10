@@ -1080,14 +1080,14 @@ async def handle_payment_method_callback(update: Update, context: ContextTypes.D
         return
     if data == "pm_add":
         context.user_data["pending_payment_input"] = {"message_id": query.message.message_id}
-        await query.edit_message_text("اكتب طريقة الدفع بهذا الشكل كـرد على هذي الرسالة:\nاسم الطريقة | التفاصيل التي تصل للزبون\n\nمثال: زين كاش | الرقم: 07xxxxxxxxx باسم أحمد")
+        await query.edit_message_text("اكتب طريقة الدفع بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون\n\nمثال: زين كاش | الرقم: 07xxxxxxxxx باسم أحمد")
         return
     if data.startswith("pm_edit_"):
         context.user_data["pending_payment_input"] = {
             "message_id": query.message.message_id,
             "id": data[len("pm_edit_"):],
         }
-        await query.edit_message_text("اكتب الاسم والتفاصيل الجديدة كـرد على هذي الرسالة:\nاسم الطريقة | التفاصيل التي تصل للزبون")
+        await query.edit_message_text("اكتب الاسم والتفاصيل الجديدة بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون")
         return
     if data.startswith("pm_toggle_"):
         method_id = data[len("pm_toggle_"):]
@@ -1117,7 +1117,7 @@ async def handle_payment_method_callback(update: Update, context: ContextTypes.D
 async def handle_payment_method_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     message = update.message
     state = context.user_data.get("pending_payment_input")
-    if not message or not message.text or not state or not message.reply_to_message or message.reply_to_message.message_id != state["message_id"]:
+    if not message or not message.text or not state:
         return False
     name, separator, instructions = message.text.strip().partition("|")
     if not separator or not name.strip() or not instructions.strip():
