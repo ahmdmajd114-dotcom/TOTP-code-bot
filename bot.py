@@ -4589,6 +4589,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     """
     if await handle_teaching_message(update, context):
         return
+    if await handle_payment_method_input(update, context):
+        return
     if await handle_catalog_input(update, context):
         return
     if await handle_manual_product_entry(update, context):
