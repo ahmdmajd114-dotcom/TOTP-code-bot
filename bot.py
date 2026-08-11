@@ -1701,14 +1701,79 @@ def import_archive_as_style_examples() -> tuple[int, int, int]:
     return len(records), skipped_duplicates, len(candidates)
 
 
-CONVERSATION_SESSION_GAP_HOURS = 12  # فاصل زمني بدون رسائل يبدأ سياق محادثة جديد
+CONVERSATION_SESSION_GAP_MINUTES = int(os.environ.get("CONVERSATION_SESSION_GAP_MINUTES", "30"))
+# هذه المرحلة للمراقبة فقط: تقسيم المحادثات وتسجيل سياقها، وليس اتخاذ قرار
+# أو إرسال رد جديد للزبون على أساس هذا السياق.
+
+
+def get_context_event_types(
+    sender_type: str,
+    message_text: str | None,
+    image_description: str | None,
+) -> list[str]:
+    """يلتقط مراحل عامة من النص كي نفهم تسلسل المحادثة لاحقاً.
+
+    النتائج علامات داخلية فقط، ولا تدخل بمنطق ردود FAQ أو الدفع حالياً.
+    """
+    text = f"{message_text or ''}\n{image_description or ''}".lower()
+    if not text:
+        return ["image_received"] if image_description else []
+
+    events: list[str] = []
+    def has(*terms: str) -> bool:
+        return any(term in text for term in terms)
+
+    if has("السلام عليكم", "هلا", "اهلا", "أهلا"):
+        events.append("greeting")
+    if has("chatgpt", "chat gpt", "تشات", "جات"):
+        events.append("chatgpt_interest")
+    if has("باقة", "باقات", "سعر", "اسعار", "أسعار", "شكد", "مشترك", "خاص", "شهر"):
+        events.append("plan_or_price_discussion")
+    if has("طرق الدفع", "طريقة الدفع", "اريد ادفع", "أريد أدفع", "ماستر", "زين كاش", "رصيد"):
+        events.append("payment_method_discussion")
+    if has("حولت", "حوّلت", "تم التحويل", "دفعت"):
+        events.append("payment_claimed")
+    if has("صورة التحويل", "وصل التحويل", "سكرين", "سكرين شوت", "لقطة شاشة") or image_description:
+        events.append("payment_or_support_image")
+    if has("كود", "رمز", "code"):
+        events.append("code_request_or_help")
+    if has("ما صار", "ما قبل", "ماقبل", "ما يشتغل", "مايشتغل", "مشكلة", "خطأ"):
+        events.append("support_issue")
+    if has("شكراً", "شكرا", "تعبتكم", "عاشت ايدكم", "عاشت إيدكم"):
+        events.append("thanks")
+    if sender_type in ("owner", "bot") and has("الايميل", "الإيميل", "password", "كلمة المرور", "بيانات الحساب"):
+        events.append("account_or_registration_guidance")
+    return events
+
+
+def stage_from_context_events(events: list[str], previous_stage: str = "observing") -> str:
+    """يحدث المرحلة للعرض والتحليل فقط؛ لا يحرّك أي إجراء تلقائي."""
+    if "thanks" in events:
+        return "completed"
+    if "support_issue" in events:
+        return "support_needed"
+    if "code_request_or_help" in events:
+        return "code_or_registration"
+    if "payment_or_support_image" in events:
+        return "payment_or_support_review"
+    if "payment_claimed" in events:
+        return "payment_claimed"
+    if "payment_method_discussion" in events:
+        return "payment_discussion"
+    if "plan_or_price_discussion" in events:
+        return "plan_discussion"
+    if "chatgpt_interest" in events:
+        return "product_interest"
+    if "greeting" in events:
+        return "greeting"
+    return previous_stage
 
 
 def get_or_create_conversation_session_id(customer_chat_id: int) -> str:
     """
     يرجع conversation_session_id المناسب لرسالة جديدة من هذا الزبون —
-    لو آخر رسالة مؤرشفة لنفس الزبون أقل من 12 ساعة، يرجع نفس رقمها
-    (نفس السياق يستمر). لو أقدم من 12 ساعة أو ماكو رسائل سابقة،
+    لو آخر رسالة مؤرشفة لنفس الزبون أقل من مدة السكوت المضبوطة، يرجع نفس رقمها
+    (نفس السياق يستمر). لو أقدم من هذا الفاصل أو ماكو رسائل سابقة،
     يولّد رقم جديد (سياق محادثة جديد).
     """
     try:
@@ -1722,8 +1787,12 @@ def get_or_create_conversation_session_id(customer_chat_id: int) -> str:
         )
         if res.data:
             last_created_at = datetime.fromisoformat(res.data[0]["created_at"].replace("Z", "+00:00"))
-            if datetime.now(timezone.utc) - last_created_at < timedelta(hours=CONVERSATION_SESSION_GAP_HOURS):
+            if datetime.now(timezone.utc) - last_created_at < timedelta(minutes=CONVERSATION_SESSION_GAP_MINUTES):
                 return res.data[0]["conversation_session_id"]
+            supabase.table("conversation_sessions").update({
+                "status": "closed",
+                "closed_at": last_created_at.isoformat(),
+            }).eq("id", res.data[0]["conversation_session_id"]).eq("status", "open").execute()
     except Exception:
         logger.exception("Failed to check last archived message for session continuity")
 
@@ -1741,11 +1810,33 @@ def archive_message(
     """
     يؤرشف رسالة وحدة (من زبون، أونر، أو بوت) بجدول conversation_archive
     — يحدد تلقائياً السياق (conversation_session_id) المناسب حسب منطق
-    فاصل الـ 12 ساعة. لا يوقف تنفيذ الرسالة الأساسي لو فشل.
+    فترة السكوت. لا يوقف تنفيذ الرسالة الأساسي لو فشل.
     """
     session_id = get_or_create_conversation_session_id(customer_chat_id)
+    now = datetime.now(timezone.utc).isoformat()
+    source = "interactive" if customer_chat_id < 0 else "live"
     try:
-        supabase.table("conversation_archive").insert({
+        # ننشئ صف الجلسة قبل الأرشفة حتى كل حدث يتبع سياقاً معروفاً.
+        session_rows = (
+            supabase.table("conversation_sessions")
+            .select("message_count, latest_stage")
+            .eq("id", session_id)
+            .limit(1)
+            .execute().data or []
+        )
+        if not session_rows:
+            supabase.table("conversation_sessions").insert({
+                "id": session_id,
+                "customer_chat_id": customer_chat_id,
+                "customer_name": customer_name,
+                "customer_username": customer_username,
+                "source": source,
+                "started_at": now,
+                "last_activity_at": now,
+            }).execute()
+            session_rows = [{"message_count": 0, "latest_stage": "observing"}]
+
+        archive_result = supabase.table("conversation_archive").insert({
             "conversation_session_id": session_id,
             "customer_chat_id": customer_chat_id,
             "customer_name": customer_name,
@@ -1754,6 +1845,29 @@ def archive_message(
             "message_text": message_text,
             "image_description": image_description,
         }).execute()
+
+        events = get_context_event_types(sender_type, message_text, image_description)
+        archive_rows = archive_result.data or []
+        archive_message_id = archive_rows[0].get("id") if archive_rows else None
+        if archive_message_id and events:
+            supabase.table("conversation_context_events").upsert([
+                {
+                    "conversation_session_id": session_id,
+                    "archive_message_id": archive_message_id,
+                    "sender_type": sender_type,
+                    "event_type": event_type,
+                }
+                for event_type in events
+            ], on_conflict="archive_message_id,event_type").execute()
+
+        current = session_rows[0]
+        supabase.table("conversation_sessions").update({
+            "customer_name": customer_name,
+            "customer_username": customer_username,
+            "last_activity_at": now,
+            "message_count": int(current.get("message_count") or 0) + 1,
+            "latest_stage": stage_from_context_events(events, current.get("latest_stage") or "observing"),
+        }).eq("id", session_id).execute()
     except Exception:
         logger.exception("Failed to archive conversation message")
 
