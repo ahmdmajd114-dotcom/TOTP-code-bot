@@ -696,6 +696,7 @@ BTN_TEACH = "📝 بدء تلقين جديد"
 BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_BACK = "◀️ رجوع"
+PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -1076,18 +1077,29 @@ async def handle_payment_method_callback(update: Update, context: ContextTypes.D
     data = query.data
     await query.answer()
     if data == "pm_back":
+        context.user_data.pop("pending_payment_input", None)
         await show_payment_methods(query.message)
         return
     if data == "pm_add":
-        context.user_data["pending_payment_input"] = {"message_id": query.message.message_id}
-        await query.edit_message_text("اكتب طريقة الدفع بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون\n\nمثال: زين كاش | الرقم: 07xxxxxxxxx باسم أحمد")
+        context.user_data["pending_payment_input"] = {
+            "message_id": query.message.message_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await query.edit_message_text(
+            "اكتب طريقة الدفع بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون\n\nمثال: زين كاش | الرقم: 07xxxxxxxxx باسم أحمد",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ إلغاء", callback_data="pm_back")]]),
+        )
         return
     if data.startswith("pm_edit_"):
         context.user_data["pending_payment_input"] = {
             "message_id": query.message.message_id,
             "id": data[len("pm_edit_"):],
+            "started_at": datetime.now(timezone.utc).isoformat(),
         }
-        await query.edit_message_text("اكتب الاسم والتفاصيل الجديدة بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون")
+        await query.edit_message_text(
+            "اكتب الاسم والتفاصيل الجديدة بهذا الشكل:\nاسم الطريقة | التفاصيل التي تصل للزبون",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ إلغاء", callback_data="pm_back")]]),
+        )
         return
     if data.startswith("pm_toggle_"):
         method_id = data[len("pm_toggle_"):]
@@ -1119,6 +1131,15 @@ async def handle_payment_method_input(update: Update, context: ContextTypes.DEFA
     state = context.user_data.get("pending_payment_input")
     if not message or not message.text or not state:
         return False
+    started_at = state.get("started_at")
+    if started_at:
+        try:
+            if datetime.now(timezone.utc) - datetime.fromisoformat(started_at) > PAYMENT_METHOD_INPUT_TIMEOUT:
+                context.user_data.pop("pending_payment_input", None)
+                return False
+        except (TypeError, ValueError):
+            context.user_data.pop("pending_payment_input", None)
+            return False
     name, separator, instructions = message.text.strip().partition("|")
     if not separator or not name.strip() or not instructions.strip():
         await message.reply_text("الصيغة غير صحيحة. استخدم: اسم الطريقة | التفاصيل")
@@ -4075,6 +4096,15 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     text = message.text.strip()
 
+    # هذا الزر يعني أن المستخدم بدأ مهمة جديدة، لذلك نلغي أوضاع الإدخال
+    # القديمة حتى ما تعترض المصروف أو التقرير أو أي وظيفة ثانية.
+    if text in {
+        BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
+        BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH,
+    }:
+        context.user_data.pop("pending_payment_input", None)
+        context.user_data.pop("pending_catalog_input", None)
+
     if text == BTN_CATALOG:
         await show_catalog_main(message)
         return True
@@ -4589,6 +4619,9 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     """
     if await handle_teaching_message(update, context):
         return
+    # أزرار الإدارة الرئيسية تأخذ الأولوية على أي وضع إدخال قديم.
+    if await handle_reply_keyboard_button(update, context):
+        return
     if await handle_payment_method_input(update, context):
         return
     if await handle_catalog_input(update, context):
@@ -4608,8 +4641,6 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     if await handle_debt_manual_entry(update, context):
         return
     if await handle_chatgpt_account_reply(update, context):
-        return
-    if await handle_reply_keyboard_button(update, context):
         return
     await handle_add_account_flow(update, context)
 
