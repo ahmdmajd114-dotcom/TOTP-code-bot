@@ -2721,17 +2721,30 @@ async def analyze_payment_proof(file_bytes: bytes, customer_chat_id: int) -> dic
         result["amount"] = amount
         result["expected_amount"] = expected_amount
         result["plan_name"] = plan_name
+        # أسعار الكاتالوج مخزنة بآلاف الدنانير (15 تعني 15,000 د.ع)، بينما
+        # الوصل قد يظهر المبلغ الكامل ومعه رسم التحويل الصغير، مثل 15,015.
+        # لا نعتبره مطابقاً إذا كان أقل من سعر الباقة.
+        amount_matches = amount == expected_amount
+        if expected_amount is not None and amount is not None and expected_amount < 1000:
+            required_iqd = expected_amount * 1000
+            amount_matches = required_iqd <= amount <= required_iqd + max(1000, required_iqd // 10)
+
         approved = (
             result.get("is_payment_receipt") is True
             and expected_amount is not None
-            and amount == expected_amount
+            and amount_matches
             and result.get("recipient_match") is True
             and result.get("recency") == "recent"
             and int(result.get("confidence") or 0) >= 85
         )
         if approved:
             result["decision"] = "approved"
-        elif result.get("is_payment_receipt") is False:
+        elif (
+            result.get("is_payment_receipt") is False
+            or result.get("recency") == "old"
+            or (expected_amount is not None and amount is not None and not amount_matches)
+            or result.get("recipient_match") is False
+        ):
             result["decision"] = "rejected"
         else:
             result["decision"] = "needs_review"
@@ -3042,6 +3055,11 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
     # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
     normalized = " ".join(normalize_style_text(new_message))
+    # بعد إرسال الوصل لا نسمح لأي كلمة لاحقة (مثل "هسة" أو "جات") أن ترجع
+    # المحادثة للباقات أو للردود العامة. النتيجة الوحيدة تكون فحص الصورة ثم
+    # التسليم تلقائياً عند القبول، أو طلب وصل صحيح عند الرفض.
+    if workflow_state == "payment_review":
+        return "payment_under_review"
     # التحيات دقيقة وحساسة للأسلوب: لا نتركها للموديل. هلو/هلا ليست
     # سلاماً شرعياً، وبالتالي ردها المعتمد "اهلا وسهلا" فقط.
     greeting_categories = set(keyword_match_categories(new_message))
