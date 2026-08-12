@@ -14,6 +14,7 @@ grant select, insert, update, delete on table public.interactive_response_templa
 insert into public.interactive_response_templates (action_key, label, response_text)
 values
   ('greeting', 'تحية', 'وعليكم السلام ورحمة الله وبركاته اهلا وسهلا'),
+  ('chatgpt_plans', 'باقات ChatGPT', ''),
   ('payment_methods', 'إرسال طرق الدفع', ''),
   ('request_plan_choice', 'طلب اختيار الباقة', 'تدلل، اختار الباقة اللي تناسبك حتى نكمل.'),
   ('request_payment_proof', 'طلب صورة التحويل', 'بلا زحمة عليك دزلي صورة التحويل حتى أتأكد منها.'),

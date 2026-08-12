@@ -2609,7 +2609,9 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "ولا تذكر معلومة أو سعر أو رقم. مهمتك اختيار action_key واحد فقط من القائمة "
     "المسموح بها. اعتمد على تسلسل المحادثة والأمثلة المؤرشفة لفهم المعنى. رد "
     "بـ action_key فقط بلا شرح. اختَر static_faq للسؤال المباشر الذي يغطيه رد "
-    "ثابت. اختَر payment_methods عندما يطلب الدفع أو طرق الدفع. اختَر "
+    "ثابت. اختَر chatgpt_plans عندما يطلب جات/ChatGPT أو يسأل عن باقاته، "
+    "حتى لو سأل فقط \"شنو الباقات\" وكان الطلب السابق داخل السياق عن جات. "
+    "اختَر payment_methods عندما يطلب الدفع أو طرق الدفع. اختَر "
     "request_plan_choice إذا يريد الشراء ولم يحدد باقة. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
@@ -2732,6 +2734,18 @@ def get_recent_interactive_context(customer_chat_id: int, limit: int = 16) -> tu
         return [], None
 
 
+def is_chatgpt_catalog_context(text: str) -> bool:
+    """يتعرف على طلب باقات ChatGPT من الكلمات المباشرة أو من استمرار السياق."""
+    normalized = " ".join(normalize_style_text(text))
+    direct_terms = {"chatgpt", "chat", "gpt", "جات", "تشات", "شات", "جيبيتي"}
+    return any(term in normalized for term in direct_terms)
+
+
+def is_plan_question(text: str) -> bool:
+    normalized = " ".join(normalize_style_text(text))
+    return any(term in normalized for term in {"باقه", "باقات", "سعر", "اسعار", "شكد", "خاص", "مشترك", "شهر"})
+
+
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
@@ -2745,6 +2759,20 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             speaker = "الزبون" if item.get("sender_type") == "customer" else "المتجر"
             context_lines.append(f"{speaker}: {redact_context_text(text)}")
     context_text = "\n".join(context_lines) or "لا يوجد سياق سابق."
+
+    # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
+    # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
+    normalized = " ".join(normalize_style_text(new_message))
+    if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
+        return "request_payment_proof"
+    if any(term in normalized for term in {"ادفع", "الدفع", "ماستر", "زين", "رصيد"}):
+        return "payment_methods"
+    if any(term in normalized for term in {"شكرا", "شكراً", "تعبتكم", "عاشت"}):
+        return "closing"
+    if is_chatgpt_catalog_context(new_message) or (
+        is_plan_question(new_message) and is_chatgpt_catalog_context(context_text)
+    ):
+        return "chatgpt_plans"
 
     messages = [{"role": "system", "content": TEST_ACTION_SELECTOR_PROMPT}]
     if style_examples_text:
@@ -2791,6 +2819,21 @@ def render_test_response(action_key: str, customer_text: str) -> str:
             )
             return f"طرق الدفع\n\n{details}"
         return "تدلل، خليني أتأكد من طرق الدفع وأرجعلك."
+    if action_key == "chatgpt_plans":
+        product = next(
+            (row for row in get_catalog_products()
+             if row.get("is_active") and row.get("name", "").strip().lower() == "chatgpt"),
+            None,
+        )
+        if product:
+            plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
+            if plans:
+                lines = ["بلي موجود هاي الباقات المتوفرة ChatGPT:", ""]
+                for plan in plans:
+                    duration = f" {plan['duration']}" if plan.get("duration") else ""
+                    lines.append(f"- {plan['name']}{duration} {plan['price']}")
+                return "\n".join(lines)
+        return get_reply_for_category("chatgpt") or "تدلل، خليني أتأكد من باقات الشات وأرجعلك."
     templates = get_interactive_response_templates()
     return templates.get(action_key) or templates.get("handoff") or "تدلل، خليني أتأكد من الموضوع وأرجعلك."
 
