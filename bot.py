@@ -3042,6 +3042,15 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
     # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
     normalized = " ".join(normalize_style_text(new_message))
+    # التحيات دقيقة وحساسة للأسلوب: لا نتركها للموديل. هلو/هلا ليست
+    # سلاماً شرعياً، وبالتالي ردها المعتمد "اهلا وسهلا" فقط.
+    greeting_categories = set(keyword_match_categories(new_message))
+    if "سلام" in greeting_categories:
+        return "static_faq"
+    if "ترحيب" in greeting_categories:
+        return "static_faq"
+    if "شكر" in greeting_categories:
+        return "closing"
     if workflow_state == "awaiting_plan_choice":
         selected = find_selected_chatgpt_plan(new_message)
         if selected:

@@ -13,7 +13,7 @@ grant select, insert, update, delete on table public.interactive_response_templa
 
 insert into public.interactive_response_templates (action_key, label, response_text)
 values
-  ('greeting', 'تحية', 'وعليكم السلام ورحمة الله وبركاته اهلا وسهلا'),
+  ('greeting', 'تحية عامة', 'اهلا وسهلا'),
   ('chatgpt_plans', 'باقات ChatGPT', ''),
   ('payment_methods', 'إرسال طرق الدفع', ''),
   ('request_plan_choice', 'طلب اختيار الباقة', 'تدلل، اختار الباقة اللي تناسبك حتى نكمل.'),
@@ -27,4 +27,7 @@ values
   ('closing', 'ختام وشكر', 'أهلين وسهلين، تدلل.'),
   ('clarify', 'سؤال توضيحي', 'تدلل، وضحلي شنو تريد بالضبط حتى أساعدك.'),
   ('handoff', 'حالة تحتاج متابعة', 'تدلل، خليني أتأكد من الموضوع وأرجعلك.')
-on conflict (action_key) do nothing;
+on conflict (action_key) do update set
+  label = excluded.label,
+  response_text = excluded.response_text,
+  updated_at = now();
