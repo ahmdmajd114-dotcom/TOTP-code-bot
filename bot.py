@@ -696,6 +696,7 @@ BTN_DEBT = "💳 تسجيل دين"
 BTN_TEACH = "📝 بدء تلقين جديد"
 BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
+BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -705,6 +706,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
+        [KeyboardButton(BTN_CHATGPT_VAULT)],
     ],
     resize_keyboard=True,
 )
@@ -1069,6 +1071,86 @@ def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
 
 async def show_payment_methods(message) -> None:
     await message.reply_text("💳 طرق الدفع\nاختَر طريقة لتعديلها، أو أضف طريقة جديدة.", reply_markup=payment_keyboard(get_payment_methods()))
+
+
+def get_chatgpt_shared_vault_summary() -> str:
+    """يعرض إحصاء الخزينة بدون كشف الإيميلات أو كلمات المرور."""
+    try:
+        accounts = supabase.table("chatgpt_shared_accounts").select("id, capacity, is_active").execute().data or []
+        active = [account for account in accounts if account.get("is_active")]
+        assignments = supabase.table("chatgpt_account_assignments").select("account_id").eq("status", "active").execute().data or []
+        used_by_account: dict[str, int] = {}
+        for assignment in assignments:
+            account_id = assignment["account_id"]
+            used_by_account[account_id] = used_by_account.get(account_id, 0) + 1
+        seats = sum(max(0, int(account["capacity"]) - used_by_account.get(account["id"], 0)) for account in active)
+        return f"🤖 خزينة ChatGPT المشتركة\nالحسابات المفعلة: {len(active)}\nالمقاعد المتاحة: {seats}"
+    except Exception:
+        logger.exception("Failed to load ChatGPT shared vault summary")
+        return "⚠️ ما كدرت أقرأ خزينة حسابات ChatGPT."
+
+
+async def show_chatgpt_shared_vault(message) -> None:
+    await message.reply_text(
+        get_chatgpt_shared_vault_summary(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")]]),
+    )
+
+
+async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    if query.data == "vault_add_shared":
+        context.user_data["pending_shared_account"] = {"step": "email"}
+        await query.edit_message_text("أرسل إيميل حساب ChatGPT المشترك:")
+
+
+async def handle_shared_account_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    state = context.user_data.get("pending_shared_account")
+    if not message or not message.text or not state:
+        return False
+    text = message.text.strip()
+    step = state.get("step")
+    if step == "email":
+        if "@" not in text:
+            await message.reply_text("اكتب إيميل صحيح.")
+            return True
+        state["email"] = text
+        state["step"] = "password"
+        await message.reply_text("تمام. أرسل كلمة المرور:")
+        return True
+    if step == "password":
+        if len(text) < 6:
+            await message.reply_text("كلمة المرور قصيرة جداً، أرسلها كاملة.")
+            return True
+        state["password"] = text
+        state["step"] = "totp_secret"
+        await message.reply_text("أرسل مفتاح TOTP الطويل للحساب (Base32، مو الكود ذي 6 أرقام):")
+        return True
+    if step == "totp_secret":
+        secret = re.sub(r"\s+", "", text).upper()
+        try:
+            pyotp.TOTP(secret).now()
+        except Exception:
+            await message.reply_text("المفتاح مو صحيح. أرسل مفتاح TOTP الطويل مرة ثانية.")
+            return True
+        try:
+            supabase.table("chatgpt_shared_accounts").insert({
+                "email": state["email"], "password": state["password"],
+                "totp_secret": secret, "capacity": 9,
+            }).execute()
+        except Exception:
+            logger.exception("Failed to add shared ChatGPT account")
+            await message.reply_text("⚠️ ما انحفظ الحساب. تأكد أن الإيميل مو مضاف سابقاً.")
+            return True
+        context.user_data.pop("pending_shared_account", None)
+        await message.reply_text("✅ تم حفظ الحساب المشترك. سعته 9 أشخاص.")
+        await show_chatgpt_shared_vault(message)
+        return True
+    return False
 
 
 async def handle_payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3143,6 +3225,24 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
         .execute()
     )
     if not link_res.data:
+        # حسابات ChatGPT المشتركة التي سُلّمت عبر خزينة الحسابات.
+        try:
+            assigned = (
+                supabase.table("chatgpt_account_assignments")
+                .select("account_id")
+                .eq("customer_chat_id", chat_id).eq("status", "active")
+                .order("assigned_at", desc=True).limit(1).execute().data or []
+            )
+            if assigned:
+                account = (
+                    supabase.table("chatgpt_shared_accounts")
+                    .select("totp_secret, email")
+                    .eq("id", assigned[0]["account_id"]).limit(1).execute().data or []
+                )
+                if account:
+                    return account[0]["totp_secret"], account[0]["email"]
+        except Exception:
+            logger.exception("Failed to get shared-account TOTP secret")
         return None
 
     account_id = link_res.data[0]["account_id"]
@@ -3156,6 +3256,54 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
         return None
 
     return acc_res.data[0]["secret"], acc_res.data[0].get("label") or ""
+
+
+CHATGPT_DELIVERY_TEMPLATE = """ChatGPT
+
+{email}
+
+{password}
+
+طريقة التسجيل
+https://t.me/+IcHCjNi8_ilkZjdi
+
+لو سمحت انضم للقناة
+https://t.me/+M8XsrznhCNJkNTA6
+
+شروط الاستخدام (وصول الرسالة يعني موافقتك على الشروط)
+https://t.me/policy_use/2
+
+هنيئاً 🎉"""
+
+
+def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
+    """يحجز حساباً مشتركاً فيه مقعد من أصل 9 لهذه الجلسة التجريبية."""
+    state = get_interactive_sale_state(customer_chat_id)
+    if not state.get("id"):
+        return None
+    try:
+        existing = (
+            supabase.table("chatgpt_account_assignments")
+            .select("account_id, chatgpt_shared_accounts(email, password)")
+            .eq("customer_chat_id", customer_chat_id)
+            .eq("conversation_session_id", state["id"]).eq("status", "active")
+            .limit(1).execute().data or []
+        )
+        if existing:
+            return existing[0].get("chatgpt_shared_accounts")
+        accounts = supabase.table("chatgpt_shared_accounts").select("id, email, password, capacity").eq("is_active", True).order("created_at").execute().data or []
+        for account in accounts:
+            used = supabase.table("chatgpt_account_assignments").select("id", count="exact").eq("account_id", account["id"]).eq("status", "active").execute()
+            if (used.count or 0) >= int(account["capacity"]):
+                continue
+            supabase.table("chatgpt_account_assignments").insert({
+                "account_id": account["id"], "customer_chat_id": customer_chat_id,
+                "conversation_session_id": state["id"],
+            }).execute()
+            return account
+    except Exception:
+        logger.exception("Failed to assign shared ChatGPT account")
+    return None
 
 
 def generate_totp_code(secret: str) -> str:
@@ -4524,7 +4672,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     # القديمة حتى ما تعترض المصروف أو التقرير أو أي وظيفة ثانية.
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
-        BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH,
+        BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -4535,6 +4683,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     if text == BTN_PAYMENT_METHODS:
         await show_payment_methods(message)
+        return True
+
+    if text == BTN_CHATGPT_VAULT:
+        await show_chatgpt_shared_vault(message)
         return True
 
     if text == BTN_EXPENSE:
@@ -4913,7 +5065,16 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if action_key is None:
         await message.reply_text("⚠️ صار خطأ أثناء اختيار الإجراء — تحقق من اتصال Groq.")
         return
-    reply = render_test_response(action_key, user_text)
+    if action_key == "payment_proof_approved":
+        account = assign_shared_chatgpt_account(customer_chat_id)
+        if account:
+            set_interactive_sale_state(customer_chat_id, "account_delivered")
+            reply = CHATGPT_DELIVERY_TEMPLATE.format(email=account["email"], password=account["password"])
+        else:
+            # لا يوجد مقعد متاح؛ لا نرسل أي بيانات حساب.
+            reply = "تم تأكيد التحويل مبدئياً، بس حالياً ماكو مقعد مشترك متاح. دا أرتبلك واحد وأرجعلك."
+    else:
+        reply = render_test_response(action_key, user_text)
 
     archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
 
@@ -4934,6 +5095,8 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
     if await handle_teaching_message(update, context):
         return
     if await handle_payment_method_input(update, context):
+        return
+    if await handle_shared_account_input(update, context):
         return
     if await handle_catalog_input(update, context):
         return
@@ -5078,6 +5241,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     if await handle_reply_keyboard_button(update, context):
         return
     if await handle_payment_method_input(update, context):
+        return
+    if await handle_shared_account_input(update, context):
         return
     if await handle_catalog_input(update, context):
         return
@@ -5451,6 +5616,9 @@ def main() -> None:
 
     # إدارة تفاصيل الدفع المعتمدة — للأونر فقط.
     app.add_handler(CallbackQueryHandler(handle_payment_method_callback, pattern=r"^pm_"))
+
+    # إدارة خزينة حسابات ChatGPT المشتركة — للأونر فقط.
+    app.add_handler(CallbackQueryHandler(handle_chatgpt_vault_callback, pattern=r"^vault_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
