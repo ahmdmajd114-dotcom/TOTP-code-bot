@@ -5076,6 +5076,11 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if action_key is None:
         await message.reply_text("⚠️ صار خطأ أثناء اختيار الإجراء — تحقق من اتصال Groq.")
         return
+    # التدقيق الطبيعي لا يحتاج رسالة وسيطة: الزبون يشوف فقط النتيجة
+    # النهائية (تسليم الحساب أو طلب وصل أوضح)، بينما إشعار المراجعة
+    # يبقى للأونر داخل فرع الإشعارات.
+    if action_key == "payment_under_review":
+        return
     if action_key == "payment_proof_approved":
         account = assign_shared_chatgpt_account(customer_chat_id)
         if account:
