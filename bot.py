@@ -2746,6 +2746,77 @@ def is_plan_question(text: str) -> bool:
     return any(term in normalized for term in {"باقه", "باقات", "سعر", "اسعار", "شكد", "خاص", "مشترك", "شهر"})
 
 
+def get_chatgpt_catalog_product() -> dict | None:
+    return next(
+        (row for row in get_catalog_products()
+         if row.get("is_active") and row.get("name", "").strip().lower() == "chatgpt"),
+        None,
+    )
+
+
+def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
+    """يحوّل اختيار الزبون باللهجة إلى باقة فعلية من الكاتالوج."""
+    product = get_chatgpt_catalog_product()
+    if not product:
+        return None
+    words = normalize_style_text(text)
+    if not words:
+        return None
+    plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
+    ranked: list[tuple[int, dict]] = []
+    for plan in plans:
+        plan_words = normalize_style_text(f"{plan.get('name') or ''} {plan.get('duration') or ''}")
+        score = len(words & plan_words)
+        # "شهر" وحدها يقصد بها غالباً الباقة ذات الشهر الواحد، وليس شهرين.
+        if "شهر" in words and "شهرين" not in words and "شهرين" not in plan_words and "شهر" in plan_words:
+            score += 3
+        if "شهرين" in words and "شهرين" in plan_words:
+            score += 3
+        if "خاص" in words and "خاص" in plan_words:
+            score += 3
+        if "مشترك" in words and "مشترك" in plan_words:
+            score += 3
+        ranked.append((score, plan))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if ranked and ranked[0][0] >= 2:
+        return product, ranked[0][1]
+    return None
+
+
+def get_interactive_sale_state(customer_chat_id: int) -> dict:
+    """حالة البيع للجلسة الحالية، حتى نفهم سؤال الخطوة التالية كتكملة."""
+    try:
+        rows = (
+            supabase.table("conversation_sessions")
+            .select("id, workflow_state, selected_product_id, selected_plan_id")
+            .eq("customer_chat_id", customer_chat_id)
+            .eq("status", "open")
+            .order("last_activity_at", desc=True)
+            .limit(1)
+            .execute().data or []
+        )
+        return rows[0] if rows else {}
+    except Exception:
+        logger.exception("Failed to get interactive sale state")
+        return {}
+
+
+def set_interactive_sale_state(customer_chat_id: int, workflow_state: str, product_id: str | None = None, plan_id: str | None = None) -> None:
+    """يحفظ انتقال الحالة في فرع التفاعل فقط."""
+    state = get_interactive_sale_state(customer_chat_id)
+    if not state.get("id"):
+        return
+    payload: dict[str, str | None] = {"workflow_state": workflow_state}
+    if product_id is not None:
+        payload["selected_product_id"] = product_id
+    if plan_id is not None:
+        payload["selected_plan_id"] = plan_id
+    try:
+        supabase.table("conversation_sessions").update(payload).eq("id", state["id"]).execute()
+    except Exception:
+        logger.exception("Failed to save interactive sale state")
+
+
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
@@ -2759,12 +2830,25 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             speaker = "الزبون" if item.get("sender_type") == "customer" else "المتجر"
             context_lines.append(f"{speaker}: {redact_context_text(text)}")
     context_text = "\n".join(context_lines) or "لا يوجد سياق سابق."
+    sale_state = get_interactive_sale_state(customer_chat_id)
+    workflow_state = sale_state.get("workflow_state", "observing")
 
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
     # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
     normalized = " ".join(normalize_style_text(new_message))
+    if workflow_state == "awaiting_plan_choice":
+        selected = find_selected_chatgpt_plan(new_message)
+        if selected:
+            product, plan = selected
+            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
+            return "payment_methods"
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
+        set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
+    if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and any(
+        term in normalized for term in {"هسه", "اسوي", "شنو", "شلون", "اوكي", "تمام"}
+    ):
+        return "payment_methods"
     if any(term in normalized for term in {"ادفع", "الدفع", "ماستر", "زين", "رصيد"}):
         return "payment_methods"
     if any(term in normalized for term in {"شكرا", "شكراً", "تعبتكم", "عاشت"}):
@@ -2772,6 +2856,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     if is_chatgpt_catalog_context(new_message) or (
         is_plan_question(new_message) and is_chatgpt_catalog_context(context_text)
     ):
+        set_interactive_sale_state(customer_chat_id, "awaiting_plan_choice", None, None)
         return "chatgpt_plans"
 
     messages = [{"role": "system", "content": TEST_ACTION_SELECTOR_PROMPT}]
@@ -2830,8 +2915,7 @@ def render_test_response(action_key: str, customer_text: str) -> str:
             if plans:
                 lines = ["بلي موجود هاي الباقات المتوفرة ChatGPT:", ""]
                 for plan in plans:
-                    duration = f" {plan['duration']}" if plan.get("duration") else ""
-                    lines.append(f"- {plan['name']}{duration} {plan['price']}")
+                    lines.append(f"- {plan['name']} {plan['price']}")
                 return "\n".join(lines)
         return get_reply_for_category("chatgpt") or "تدلل، خليني أتأكد من باقات الشات وأرجعلك."
     templates = get_interactive_response_templates()
@@ -4635,7 +4719,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     يستدعي دمج جديد) كذاكرة سياق بدل الاحتفاظ بكل التاريخ الخام.
     """
     message = update.message
-    if not message or (not message.text and not message.voice):
+    if not message or (not message.text and not message.voice and not message.photo):
         return
     if message.text and message.text.startswith("/"):
         return  # الأوامر (زي /getcode) تُعالج بـ handlers منفصلة
@@ -4644,7 +4728,18 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if message.message_thread_id != TOPIC_INTERACTIVE:
         return
 
-    if message.voice:
+    image_description = None
+    if message.photo:
+        try:
+            file = await context.bot.get_file(message.photo[-1].file_id)
+            image_description = await describe_image(bytes(await file.download_as_bytearray()))
+        except Exception:
+            logger.exception("Failed to describe image in interactive topic")
+        if not image_description:
+            await message.reply_text("⚠️ ما كدرت أقرأ الصورة، جرّب دزها مرة ثانية.")
+            return
+        user_text = message.caption or "[صورة مرفقة]"
+    elif message.voice:
         try:
             file = await context.bot.get_file(message.voice.file_id)
             file_bytes = bytes(await file.download_as_bytearray())
@@ -4663,10 +4758,18 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     customer_chat_id = context.user_data.get("interactive_test_chat_id", OWNER_USER_ID)
 
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
-    archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=user_text)
+    archive_message(
+        customer_chat_id, "تجربة", None, sender_type="customer",
+        message_text=user_text, image_description=image_description,
+    )
 
     # الذكاء الاصطناعي يختار الإجراء فقط؛ الرد النهائي دائماً ثابت ومخزن.
-    action_key = await choose_test_response_action(customer_chat_id, user_text)
+    if image_description:
+        # الصورة لا تعني قبول الدفع تلقائياً؛ تدخل فقط مرحلة مراجعة.
+        set_interactive_sale_state(customer_chat_id, "payment_review")
+        action_key = "payment_under_review"
+    else:
+        action_key = await choose_test_response_action(customer_chat_id, user_text)
     if action_key is None:
         await message.reply_text("⚠️ صار خطأ أثناء اختيار الإجراء — تحقق من اتصال Groq.")
         return

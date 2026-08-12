@@ -19,6 +19,14 @@ create table if not exists public.conversation_sessions (
 create index if not exists conversation_sessions_customer_activity_idx
   on public.conversation_sessions (customer_chat_id, last_activity_at desc);
 
+alter table public.conversation_sessions
+  add column if not exists workflow_state text not null default 'observing',
+  add column if not exists selected_product_id uuid references public.catalog_products(id) on delete set null,
+  add column if not exists selected_plan_id uuid references public.catalog_plans(id) on delete set null;
+
+create index if not exists conversation_sessions_workflow_state_idx
+  on public.conversation_sessions (workflow_state, last_activity_at desc);
+
 create table if not exists public.conversation_context_events (
   id bigint generated always as identity primary key,
   conversation_session_id text not null references public.conversation_sessions(id) on delete cascade,
