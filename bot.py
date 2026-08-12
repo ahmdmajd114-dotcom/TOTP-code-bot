@@ -5010,13 +5010,15 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         try:
             file = await context.bot.get_file(message.photo[-1].file_id)
             image_bytes = bytes(await file.download_as_bytearray())
-            image_description = await describe_image(image_bytes)
+            # فحص وصل الدفع يغني عن طلب وصف ثانٍ لنفس الصورة. سابقاً كان
+            # يستدعي قارئ الصورة مرتين متتاليتين (قد يصل التأخير لـ45 ثانية).
             payment_analysis = await analyze_payment_proof(image_bytes, context.user_data.get("interactive_test_chat_id", OWNER_USER_ID))
         except Exception:
-            logger.exception("Failed to describe image in interactive topic")
-        if not image_description:
-            await message.reply_text("⚠️ ما كدرت أقرأ الصورة، جرّب دزها مرة ثانية.")
+            logger.exception("Failed to analyze image in interactive topic")
+        if payment_analysis is None:
+            await message.reply_text("⚠️ ما كدرت أدقق الصورة هسه. جرّب دزها مرة ثانية بعد دقيقة.")
             return
+        image_description = payment_analysis.get("reason") or "صورة تم إرسالها للفحص"
         user_text = message.caption or "[صورة مرفقة]"
     elif message.voice:
         try:
