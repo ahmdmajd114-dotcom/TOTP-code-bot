@@ -5670,10 +5670,10 @@ def main() -> None:
         )
     )
 
-    # رسائل نصية أو صوتية بفرع "تفاعل" بالقروب — تجربة شات حر مع الذكاء الاصطناعي
+    # رسائل نصية أو صوتية أو صور بفرع "تفاعل" بالقروب — تجربة شات حر.
     app.add_handler(
         MessageHandler(
-            filters.ChatType.SUPERGROUP & (filters.TEXT | filters.VOICE) & filters.User(OWNER_USER_ID),
+            filters.ChatType.SUPERGROUP & (filters.TEXT | filters.VOICE | filters.PHOTO) & filters.User(OWNER_USER_ID),
             on_interactive_topic_message,
         )
     )
