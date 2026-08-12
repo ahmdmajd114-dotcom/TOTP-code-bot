@@ -2604,15 +2604,17 @@ async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> st
     return None
 
 
-TEST_CHAT_SYSTEM_PROMPT = (
-    "انت مساعد تجريبي لصاحب متجر عراقي يبيع اشتراكات رقمية (ChatGPT، "
-    "Anki، Canva، إلخ) عبر تيليجرام. اكتب الرد باللهجة العراقية الطبيعية "
-    "وبنفس روح وأسلوب الأمثلة التي يلقنك إياها صاحب المتجر. كن مباشرًا "
-    "ولا تكن رسميًا زيادة أو طويلًا بلا داعي. الأمثلة تعلّمك الأسلوب وطريقة "
-    "التعامل، وليست مصدرًا لحقائق عامة: لا تخترع سعرًا أو توفرًا أو طريقة دفع "
-    "أو وعدًا للزبون. إذا كانت المعلومة المطلوبة غير موجودة في سياق المحادثة "
-    "أو في الأمثلة المناسبة، قل إنك تتحقق منها أو اطلب توضيحًا قصيرًا. "
-    "هذا وضع اختبار: أخرج الرد الذي يصلح إرساله للزبون فقط، بلا شرح لتحليلك."
+TEST_ACTION_SELECTOR_PROMPT = (
+    "انت مصنف سياق فقط لمتجر عراقي يبيع اشتراكات رقمية. لا تكتب ردًا للزبون "
+    "ولا تذكر معلومة أو سعر أو رقم. مهمتك اختيار action_key واحد فقط من القائمة "
+    "المسموح بها. اعتمد على تسلسل المحادثة والأمثلة المؤرشفة لفهم المعنى. رد "
+    "بـ action_key فقط بلا شرح. اختَر static_faq للسؤال المباشر الذي يغطيه رد "
+    "ثابت. اختَر payment_methods عندما يطلب الدفع أو طرق الدفع. اختَر "
+    "request_plan_choice إذا يريد الشراء ولم يحدد باقة. اختَر "
+    "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
+    "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
+    "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
+    "الكلام غير واضح."
 )
 
 
@@ -2637,6 +2639,8 @@ def get_relevant_style_examples(query_text: str, limit: int = 8) -> list[dict]:
         res = (
             supabase.table("style_examples")
             .select("customer_message, owner_reply, source, created_at")
+            .eq("approval_status", "approved")
+            .eq("is_active", True)
             .order("created_at", desc=True)
             .limit(STYLE_EXAMPLE_CANDIDATE_LIMIT)
             .execute()
@@ -2673,67 +2677,122 @@ def format_style_examples(examples: list[dict]) -> str:
             source = example.get("source") or ""
             responder = "رد البوت" if source.endswith(":bot") else "رد صاحب المتجر"
             formatted.append(
-                f"مثال {index}:\nسياق المحادثة:\n{customer_message}\n{responder}: {owner_reply}"
+                f"مثال {index}:\nسياق المحادثة:\n{redact_context_text(customer_message)}\n"
+                f"{responder}: {redact_context_text(owner_reply)}"
             )
     return "\n\n".join(formatted)
 
 
-async def generate_test_chat_reply(customer_chat_id: int, new_message: str) -> str | None:
-    """
-    يرد على رسالة تجريبية بفرع 'تفاعل' — يستخدم الملخص التراكمي
-    الحالي (لو موجود) + الرسائل الأخيرة غير الملخصة كسياق، عن طريق
-    gpt-oss-120b. يرجع الرد النصي، أو None لو فشل.
-    """
-    summary_row = get_conversation_summary(customer_chat_id)
-    summary_text = summary_row["summary_text"] if summary_row and summary_row.get("summary_text") else None
-    style_examples = get_relevant_style_examples(new_message)
-    style_examples_text = format_style_examples(style_examples)
+def redact_context_text(text: str) -> str:
+    """يمنع إرسال بيانات دخول أو أرقام حساسة إلى موديل اختيار الإجراء."""
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[بيانات مخفية]", text)
+    return re.sub(r"\b\d{7,}\b", "[رقم مخفي]", text)
 
-    # نجيب الرسائل الأخيرة غير الملخصة بعد (منذ آخر تحديث ملخص) كسياق حي
+
+def get_interactive_response_templates() -> dict[str, str]:
+    """الردود الثابتة المفعلة لفرع التفاعل فقط."""
     try:
-        query = (
+        rows = (
+            supabase.table("interactive_response_templates")
+            .select("action_key, response_text")
+            .eq("is_active", True)
+            .execute().data or []
+        )
+        return {row["action_key"]: row["response_text"] for row in rows}
+    except Exception:
+        logger.exception("Failed to fetch interactive response templates")
+        return {}
+
+
+def get_recent_interactive_context(customer_chat_id: int, limit: int = 16) -> tuple[list[dict], str | None]:
+    """يجلب الرسائل التابعة لجلسة الاختبار الحالية فقط."""
+    try:
+        latest = (
+            supabase.table("conversation_archive")
+            .select("conversation_session_id")
+            .eq("customer_chat_id", customer_chat_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute().data or []
+        )
+        if not latest:
+            return [], None
+        session_id = latest[0]["conversation_session_id"]
+        rows = (
             supabase.table("conversation_archive")
             .select("sender_type, message_text")
-            .eq("customer_chat_id", customer_chat_id)
-            .order("created_at")
+            .eq("conversation_session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute().data or []
         )
-        if summary_row and summary_row.get("last_message_at"):
-            query = query.gt("created_at", summary_row["last_message_at"])
-        res = query.execute()
-        recent_messages = res.data or []
+        return list(reversed(rows)), session_id
     except Exception:
-        logger.exception("Failed to fetch recent messages for test chat context")
-        recent_messages = []
+        logger.exception("Failed to fetch current interactive context")
+        return [], None
 
-    messages = [{"role": "system", "content": TEST_CHAT_SYSTEM_PROMPT}]
+
+async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
+    """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
+    templates = get_interactive_response_templates()
+    allowed_actions = ["static_faq", *templates.keys()]
+    recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
+    style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
+    context_lines = []
+    for item in recent_messages:
+        text = (item.get("message_text") or "").strip()
+        if text:
+            speaker = "الزبون" if item.get("sender_type") == "customer" else "المتجر"
+            context_lines.append(f"{speaker}: {redact_context_text(text)}")
+    context_text = "\n".join(context_lines) or "لا يوجد سياق سابق."
+
+    messages = [{"role": "system", "content": TEST_ACTION_SELECTOR_PROMPT}]
     if style_examples_text:
-        messages.append({
-            "role": "system",
-            "content": f"هذه أمثلة مرتبة من محادثات المتجر، تشمل ردود صاحب المتجر وردود البوت. قلد الأسلوب المناسب، وليس بالضرورة تفاصيل كل حالة:\n\n{style_examples_text}",
-        })
-    if summary_text:
-        messages.append({"role": "system", "content": f"ملخص المحادثة السابقة:\n{summary_text}"})
-    for m in recent_messages:
-        if not m.get("message_text"):
-            continue
-        role = "user" if m["sender_type"] == "customer" else "assistant"
-        messages.append({"role": role, "content": m["message_text"]})
-    messages.append({"role": "user", "content": new_message})
-
+        messages.append({"role": "system", "content": f"أمثلة مؤرشفة ومعتمدة لفهم المسار فقط:\n\n{style_examples_text}"})
+    messages.append({
+        "role": "user",
+        "content": (
+            f"سياق الجلسة الحالية:\n{context_text}\n\n"
+            f"الإجراءات المسموح بها فقط: {', '.join(allowed_actions)}\n"
+            "اختر action_key واحدًا فقط."
+        ),
+    })
     try:
         data = await call_groq_api({
             "model": CHATGPT_CONTEXT_MODEL,
-            "temperature": 0.7,
-            "max_completion_tokens": 500,
+            "temperature": 0,
+            "max_completion_tokens": 200,
             "reasoning_effort": "low",
             "messages": messages,
         }, timeout=20.0)
         if data is None:
             return None
-        return data["choices"][0]["message"]["content"].strip()
+        raw_action = data["choices"][0]["message"]["content"].strip().lower()
+        for action_key in allowed_actions:
+            if raw_action == action_key or action_key in raw_action:
+                logger.info("Interactive selector chose %s for session %s", action_key, session_id)
+                return action_key
+        logger.warning("Interactive selector returned unsupported value: %r", raw_action)
+        return "handoff"
     except Exception:
-        logger.exception("Failed to generate test chat reply")
+        logger.exception("Failed to choose interactive response action")
         return None
+
+
+def render_test_response(action_key: str, customer_text: str) -> str:
+    """يحوّل الإجراء إلى رد ثابت، بدون صياغة من الذكاء الاصطناعي."""
+    if action_key == "static_faq":
+        return get_exact_test_faq_reply(customer_text) or "تدلل، وضحلي شنو تريد بالضبط حتى أساعدك."
+    if action_key == "payment_methods":
+        methods = [method for method in get_payment_methods() if method.get("is_active")]
+        if methods:
+            details = "\n\n".join(
+                f"{method['name']}\n{method['instructions']}" for method in methods
+            )
+            return f"طرق الدفع\n\n{details}"
+        return "تدلل، خليني أتأكد من طرق الدفع وأرجعلك."
+    templates = get_interactive_response_templates()
+    return templates.get(action_key) or templates.get("handoff") or "تدلل، خليني أتأكد من الموضوع وأرجعلك."
 
 
 def keyword_match_categories(text: str) -> list[str]:
@@ -4563,16 +4622,12 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
     archive_message(customer_chat_id, "تجربة", None, sender_type="customer", message_text=user_text)
 
-    # ردود التحية والشكر المعتمدة تبقى حرفية، بدون إضافة تسويق من الـAI.
-    reply = get_exact_test_faq_reply(user_text)
-    if reply is None:
-        # نفحص/نحدث الملخص التراكمي لو مرت 30 دقيقة صمت
-        await maybe_update_conversation_summary(customer_chat_id)
-
-        reply = await generate_test_chat_reply(customer_chat_id, user_text)
-        if reply is None:
-            await message.reply_text("⚠️ صار خطأ أثناء توليد الرد — تحقق من الاتصال بـ Groq.")
-            return
+    # الذكاء الاصطناعي يختار الإجراء فقط؛ الرد النهائي دائماً ثابت ومخزن.
+    action_key = await choose_test_response_action(customer_chat_id, user_text)
+    if action_key is None:
+        await message.reply_text("⚠️ صار خطأ أثناء اختيار الإجراء — تحقق من اتصال Groq.")
+        return
+    reply = render_test_response(action_key, user_text)
 
     archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
 
