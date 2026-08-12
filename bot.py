@@ -22,6 +22,7 @@ import uuid
 import base64
 import asyncio
 import logging
+import json
 import pyotp
 import httpx
 import gspread
@@ -2531,6 +2532,17 @@ IMAGE_DESCRIPTION_PROMPT = (
     "ومباشر، بدون مقدمات."
 )
 
+PAYMENT_PROOF_ANALYSIS_PROMPT = (
+    "أنت تدقق صورة إثبات دفع لمتجر عراقي. حلل ما يظهر فعلياً فقط، ولا تفترض "
+    "معلومات غير موجودة. أخرج JSON فقط بهذه الحقول: "
+    "is_payment_receipt (true/false), amount (رقم أو null), payment_method (نص أو null), "
+    "recipient_match (true/false/null), recency (recent/old/not_visible), confidence (0-100), "
+    "reason (نص عربي قصير).\n"
+    "تعتبر الصورة وصل دفع فقط إذا ظهر تطبيق/خدمة دفع مع مبلغ وعملية تحويل أو نجاح. "
+    "صورة التسجيل، الموقع، المحادثة، أو أي شاشة غير دفع = false. لا تعتبر الوقت "
+    "حديثاً إلا إذا ظهر تاريخ/وقت يتوافق مع اليوم أو آخر ساعتين بحسب وقت بغداد المعطى."
+)
+
 
 async def describe_image(file_bytes: bytes) -> str | None:
     """
@@ -2570,6 +2582,118 @@ async def describe_image(file_bytes: bytes) -> str | None:
     except Exception:
         logger.exception("Groq image description failed")
         return None
+
+
+def get_expected_payment_for_interactive_session(customer_chat_id: int) -> tuple[int | None, str]:
+    """يجلب المبلغ المتوقع من الباقة التي اختارها الزبون في جلسة الاختبار."""
+    state = get_interactive_sale_state(customer_chat_id)
+    plan_id = state.get("selected_plan_id")
+    if not plan_id:
+        return None, ""
+    try:
+        rows = supabase.table("catalog_plans").select("name, price").eq("id", plan_id).limit(1).execute().data or []
+        if rows:
+            return int(rows[0]["price"]), rows[0]["name"]
+    except Exception:
+        logger.exception("Failed to get expected payment amount")
+    return None, ""
+
+
+async def analyze_payment_proof(file_bytes: bytes, customer_chat_id: int) -> dict | None:
+    """يفحص وصل الدفع بالصورة مقابل الباقة وطرق الدفع المعتمدة."""
+    expected_amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
+    active_methods = [method for method in get_payment_methods() if method.get("is_active")]
+    destinations = "\n".join(f"- {method['name']}: {method['instructions']}" for method in active_methods)
+    prompt = (
+        f"{PAYMENT_PROOF_ANALYSIS_PROMPT}\n\n"
+        f"وقت بغداد الحالي: {datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M')}\n"
+        f"الباقة المختارة: {plan_name or 'غير معروفة'}\n"
+        f"المبلغ المطلوب: {expected_amount if expected_amount is not None else 'غير معروف'}\n"
+        f"وجهات الدفع المعتمدة (طابق الاسم/الرقم الظاهر فقط):\n{destinations or 'لا توجد وجهات مضبوطة'}"
+    )
+    try:
+        base64_image = base64.b64encode(file_bytes).decode("utf-8")
+        data = await call_groq_api({
+            "model": IMAGE_VISION_MODEL,
+            "temperature": 0,
+            "max_completion_tokens": 350,
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+            ]}],
+        }, timeout=25.0)
+        if data is None:
+            return None
+        raw = data["choices"][0]["message"]["content"].strip()
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        result = json.loads(match.group(0))
+        amount = result.get("amount")
+        try:
+            amount = int(str(amount).replace(",", "")) if amount is not None else None
+        except (TypeError, ValueError):
+            amount = None
+        result["amount"] = amount
+        result["expected_amount"] = expected_amount
+        result["plan_name"] = plan_name
+        approved = (
+            result.get("is_payment_receipt") is True
+            and expected_amount is not None
+            and amount == expected_amount
+            and result.get("recipient_match") is True
+            and result.get("recency") == "recent"
+            and int(result.get("confidence") or 0) >= 85
+        )
+        if approved:
+            result["decision"] = "approved"
+        elif result.get("is_payment_receipt") is False:
+            result["decision"] = "rejected"
+        else:
+            result["decision"] = "needs_review"
+        return result
+    except Exception:
+        logger.exception("Payment proof analysis failed")
+        return None
+
+
+def save_interactive_payment_proof(customer_chat_id: int, analysis: dict) -> None:
+    """يسجل نتيجة الفحص بدون الاحتفاظ بالصورة أو بيانات دخول."""
+    state = get_interactive_sale_state(customer_chat_id)
+    if not state.get("id"):
+        return
+    try:
+        supabase.table("payment_proof_reviews").insert({
+            "conversation_session_id": state["id"],
+            "customer_chat_id": customer_chat_id,
+            "selected_plan_id": state.get("selected_plan_id"),
+            "expected_amount": analysis.get("expected_amount"),
+            "detected_amount": analysis.get("amount"),
+            "decision": analysis.get("decision", "needs_review"),
+            "analysis": analysis,
+        }).execute()
+    except Exception:
+        logger.exception("Failed to save payment proof review")
+
+
+async def notify_interactive_payment_review(context: ContextTypes.DEFAULT_TYPE, analysis: dict) -> None:
+    """ينبه المالك بنتيجة التدقيق، حتى الحالات المقبولة تظل ظاهرة له."""
+    decision_label = {"approved": "✅ قبول مبدئي", "needs_review": "⚠️ مراجعة", "rejected": "❌ مرفوض"}.get(
+        analysis.get("decision"), "⚠️ مراجعة"
+    )
+    message = (
+        f"🧪 فحص وصل دفع — فرع التفاعل\n{decision_label}\n"
+        f"الباقة: {analysis.get('plan_name') or 'غير معروفة'}\n"
+        f"المطلوب: {analysis.get('expected_amount') or 'غير معروف'}\n"
+        f"المقروء: {analysis.get('amount') or 'غير واضح'}\n"
+        f"السبب: {analysis.get('reason') or 'لا يوجد'}"
+    )
+    try:
+        await context.bot.send_message(chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_NOTIFICATIONS, text=message)
+    except Exception:
+        logger.exception("Failed to notify owner about interactive payment proof")
 
 
 async def transcribe_audio(file_bytes: bytes, filename: str = "audio.ogg") -> str | None:
@@ -4729,10 +4853,13 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         return
 
     image_description = None
+    payment_analysis = None
     if message.photo:
         try:
             file = await context.bot.get_file(message.photo[-1].file_id)
-            image_description = await describe_image(bytes(await file.download_as_bytearray()))
+            image_bytes = bytes(await file.download_as_bytearray())
+            image_description = await describe_image(image_bytes)
+            payment_analysis = await analyze_payment_proof(image_bytes, context.user_data.get("interactive_test_chat_id", OWNER_USER_ID))
         except Exception:
             logger.exception("Failed to describe image in interactive topic")
         if not image_description:
@@ -4765,9 +4892,22 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
 
     # الذكاء الاصطناعي يختار الإجراء فقط؛ الرد النهائي دائماً ثابت ومخزن.
     if image_description:
-        # الصورة لا تعني قبول الدفع تلقائياً؛ تدخل فقط مرحلة مراجعة.
-        set_interactive_sale_state(customer_chat_id, "payment_review")
-        action_key = "payment_under_review"
+        if payment_analysis is None:
+            set_interactive_sale_state(customer_chat_id, "payment_review")
+            action_key = "payment_under_review"
+        else:
+            save_interactive_payment_proof(customer_chat_id, payment_analysis)
+            await notify_interactive_payment_review(context, payment_analysis)
+            decision = payment_analysis.get("decision")
+            if decision == "approved":
+                set_interactive_sale_state(customer_chat_id, "payment_verified")
+                action_key = "payment_proof_approved"
+            elif decision == "rejected":
+                set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
+                action_key = "payment_proof_rejected"
+            else:
+                set_interactive_sale_state(customer_chat_id, "payment_review")
+                action_key = "payment_under_review"
     else:
         action_key = await choose_test_response_action(customer_chat_id, user_text)
     if action_key is None:
