@@ -12,6 +12,7 @@ def normalized_words(text: str) -> set[str]:
     normalized = (text or "").lower()
     normalized = re.sub(r"[أإآٱ]", "ا", normalized)
     normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = normalized.replace("؟", " ").replace("،", " ").replace("؛", " ")
     normalized = re.sub(r"[^\w\u0600-\u06ff]+", " ", normalized)
     return {word for word in normalized.split() if len(word) >= 1}
 
@@ -101,9 +102,10 @@ def resolve_plan_choice(
     return PlanChoice(missing="request_plan_choice")
 
 
-def is_other_products_question(text: str) -> bool:
-    """يميز سؤال المنتجات الأخرى عن سؤال خطوة الدفع التالية."""
+def is_ambiguous_followup(text: str) -> bool:
+    """يكشف سؤالاً ناقصاً لا يجوز تفسيره أو تخمين المقصود منه."""
     words = normalized_words(text)
-    asks_about_store = bool(words & {"شنو", "عدكم", "منتجات", "اكو", "اكو"})
-    asks_for_alternatives = bool(words & {"غيره", "غير", "بقيه", "باقي"})
-    return asks_about_store and asks_for_alternatives
+    asks_question = bool(words & {"شنو", "عدكم", "اكو"})
+    refers_to_unspecified_alternative = bool(words & {"غيره", "غير", "بقيه", "باقي"})
+    names_scope = bool(words & {"منتجات", "المنتجات", "منتج", "شات", "الشات", "chatgpt", "جات", "كانفا", "canva"})
+    return asks_question and refers_to_unspecified_alternative and not names_scope

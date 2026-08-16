@@ -39,7 +39,7 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
-from chatgpt_sales_flow import is_other_products_question, resolve_plan_choice
+from chatgpt_sales_flow import is_ambiguous_followup, resolve_plan_choice
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -2840,8 +2840,7 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "selected_plan_price إذا سأل عن المبلغ بعد أن اختار باقة. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
-    "لمشكلة تحتاج صورة. اختَر catalog_products إذا سأل عن المنتجات الأخرى، "
-    "وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
+    "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
     "الكلام غير واضح."
 )
 
@@ -3043,7 +3042,7 @@ def set_interactive_sale_state(customer_chat_id: int, workflow_state: str, produ
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
-    allowed_actions = ["static_faq", "catalog_products", *templates.keys()]
+    allowed_actions = ["static_faq", *templates.keys()]
     recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
     style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
     context_lines = []
@@ -3116,10 +3115,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         expected_amount, _ = get_expected_payment_for_interactive_session(customer_chat_id)
         if expected_amount is not None:
             return "selected_plan_price"
-    # سؤال «شنو عدكم غيره؟» ليس طلباً لإعادة طرق الدفع؛ نبقي مرحلة البيع
-    # كما هي ونعرّف الزبون بالمنتجات الأخرى فقط.
-    if is_other_products_question(new_message):
-        return "catalog_products"
+    # «شنو عدكم غيره؟» لا تحدد هل يقصد باقات أو منتجات أو طريقة دفع أخرى؛
+    # نسأل بدلاً من تخمين المقصود وإرباكه.
+    if is_ambiguous_followup(new_message):
+        return "clarify"
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
         set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
@@ -3205,6 +3204,8 @@ def render_test_response(
             if amount is not None:
                 return f"سعره {amount} آلاف."
         return "تدلل، اختار الباقة اللي تناسبك حتى أگلك سعرها بالضبط."
+    if action_key == "clarify":
+        return "عفواً ما فهمت قصدك، تكدر توضحلي؟"
     if action_key == "chatgpt_plans":
         product = next(
             (row for row in get_catalog_products()
@@ -3219,15 +3220,6 @@ def render_test_response(
                     lines.append(f"- {plan['name']} {plan['price']}")
                 return "\n".join(lines)
         return get_reply_for_category("chatgpt") or "تدلل، خليني أتأكد من باقات الشات وأرجعلك."
-    if action_key == "catalog_products":
-        products = [
-            row.get("name", "").strip()
-            for row in get_catalog_products()
-            if row.get("is_active") and row.get("name", "").strip().lower() != "chatgpt"
-        ]
-        if products:
-            return "عدنا غير الشات:\n" + "\n".join(f"- {name}" for name in products)
-        return "حالياً الموجود عندنا الشات، وإذا تريد شي معين گلي عليه."
     templates = get_interactive_response_templates()
     return templates.get(action_key) or templates.get("handoff") or "تدلل، خليني أتأكد من الموضوع وأرجعلك."
 

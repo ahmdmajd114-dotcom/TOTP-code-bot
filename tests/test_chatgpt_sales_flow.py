@@ -1,6 +1,6 @@
 import unittest
 
-from chatgpt_sales_flow import is_other_products_question, resolve_plan_choice
+from chatgpt_sales_flow import is_ambiguous_followup, resolve_plan_choice
 
 
 PLANS = [
@@ -44,10 +44,10 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertIsNone(choice.plan)
         self.assertEqual(choice.missing, "request_plan_choice")
 
-    def test_other_products_question_is_not_a_payment_question(self):
-        self.assertTrue(is_other_products_question("شنو عدكم غيره"))
-        self.assertTrue(is_other_products_question("اكو منتجات غير الشات؟"))
-        self.assertFalse(is_other_products_question("شنو اسوي حتى ادفع"))
+    def test_ambiguous_followup_is_not_guessed(self):
+        self.assertTrue(is_ambiguous_followup("شنو عدكم غيره"))
+        self.assertFalse(is_ambiguous_followup("شنو عدكم غير الشات؟"))
+        self.assertFalse(is_ambiguous_followup("شنو اسوي حتى ادفع"))
 
 
 if __name__ == "__main__":
