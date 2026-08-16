@@ -123,3 +123,13 @@ def asks_payment_guidance(text: str) -> bool:
     has_question = bool(words & {"شنو", "شلون", "كيف"})
     has_next_step = bool(words & {"اسوي", "سوي", "ادفع", "الدفع", "تحويل"})
     return has_question and has_next_step
+
+
+def is_payment_claim(text: str) -> bool:
+    """يميز تصريح الدفع عن سؤال الأسعار أو الاستفسار العام."""
+    return bool(normalized_words(text) & {"حولت", "دفعت", "دافعل", "محول"})
+
+
+def is_private_chatgpt_plan(plan_name: str) -> bool:
+    """الباقات الخاصة لا يجوز أن تستلم حساباً مشتركاً تلقائياً."""
+    return "خاص" in normalized_words(plan_name)

@@ -4,6 +4,8 @@ from chatgpt_sales_flow import (
     asks_payment_guidance,
     is_acknowledgement,
     is_ambiguous_followup,
+    is_payment_claim,
+    is_private_chatgpt_plan,
     resolve_plan_choice,
 )
 
@@ -64,6 +66,15 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertTrue(asks_payment_guidance("شلون ادفع"))
         self.assertFalse(asks_payment_guidance("شنو"))
         self.assertFalse(asks_payment_guidance("تمام"))
+
+    def test_payment_claim_is_distinct_from_payment_question(self):
+        self.assertTrue(is_payment_claim("تمام حولت"))
+        self.assertTrue(is_payment_claim("دفعت"))
+        self.assertFalse(is_payment_claim("شلون ادفع"))
+
+    def test_private_plan_never_uses_shared_delivery(self):
+        self.assertTrue(is_private_chatgpt_plan("اشتراك شهر خاص"))
+        self.assertFalse(is_private_chatgpt_plan("اشتراك شهر مشترك"))
 
 
 if __name__ == "__main__":

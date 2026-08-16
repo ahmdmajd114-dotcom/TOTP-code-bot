@@ -43,6 +43,8 @@ from chatgpt_sales_flow import (
     asks_payment_guidance,
     is_acknowledgement,
     is_ambiguous_followup,
+    is_payment_claim,
+    is_private_chatgpt_plan,
     resolve_plan_choice,
 )
 
@@ -3131,9 +3133,11 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # نسأل بدلاً من تخمين المقصود وإرباكه.
     if is_ambiguous_followup(new_message):
         return "clarify"
-    if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
-        set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
-        return "request_payment_proof"
+    if is_payment_claim(new_message):
+        if workflow_state in {"awaiting_payment", "awaiting_payment_proof"}:
+            set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
+            return "request_payment_proof"
+        return "request_plan_choice"
     if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and asks_payment_guidance(new_message):
         return "payment_methods"
     if has_any_normalized_term(normalized, {"ادفع", "الدفع", "ماستر", "زين", "رصيد", "تحويل"}):
@@ -5118,22 +5122,32 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if message.message_thread_id != TOPIC_INTERACTIVE:
         return
 
+    # لكل /newtest رقم سياق اصطناعي مستقل، حتى ما تختلط سيناريوهات الاختبار.
+    # إذا ما بدأ الأونر جلسة يظل السلوك القديم متاحًا للتوافق.
+    customer_chat_id = context.user_data.get("interactive_test_chat_id", OWNER_USER_ID)
     image_description = None
     payment_analysis = None
+    photo_outside_payment_flow = False
     if message.photo:
-        try:
-            file = await context.bot.get_file(message.photo[-1].file_id)
-            image_bytes = bytes(await file.download_as_bytearray())
-            # فحص وصل الدفع يغني عن طلب وصف ثانٍ لنفس الصورة. سابقاً كان
-            # يستدعي قارئ الصورة مرتين متتاليتين (قد يصل التأخير لـ45 ثانية).
-            payment_analysis = await analyze_payment_proof(image_bytes, context.user_data.get("interactive_test_chat_id", OWNER_USER_ID))
-        except Exception:
-            logger.exception("Failed to analyze image in interactive topic")
-        if payment_analysis is None:
-            await message.reply_text("⚠️ ما كدرت أدقق الصورة هسه. جرّب دزها مرة ثانية بعد دقيقة.")
-            return
-        image_description = payment_analysis.get("reason") or "صورة تم إرسالها للفحص"
         user_text = message.caption or "[صورة مرفقة]"
+        state = get_interactive_sale_state(customer_chat_id)
+        if state.get("workflow_state") not in {"awaiting_payment", "awaiting_payment_proof"}:
+            # ما نصرف فحص رؤية على أي صورة خارج مسار الدفع، ولا نفسرها
+            # تلقائياً على أنها وصل تحويل.
+            photo_outside_payment_flow = True
+        else:
+            try:
+                file = await context.bot.get_file(message.photo[-1].file_id)
+                image_bytes = bytes(await file.download_as_bytearray())
+                # فحص وصل الدفع يغني عن طلب وصف ثانٍ لنفس الصورة. سابقاً كان
+                # يستدعي قارئ الصورة مرتين متتاليتين (قد يصل التأخير لـ45 ثانية).
+                payment_analysis = await analyze_payment_proof(image_bytes, customer_chat_id)
+            except Exception:
+                logger.exception("Failed to analyze image in interactive topic")
+            if payment_analysis is None:
+                await message.reply_text("⚠️ ما كدرت أدقق الصورة هسه. جرّب دزها مرة ثانية بعد دقيقة.")
+                return
+            image_description = payment_analysis.get("reason") or "صورة تم إرسالها للفحص"
     elif message.voice:
         try:
             file = await context.bot.get_file(message.voice.file_id)
@@ -5148,10 +5162,6 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     else:
         user_text = message.text
 
-    # لكل /newtest رقم سياق اصطناعي مستقل، حتى ما تختلط سيناريوهات الاختبار.
-    # إذا ما بدأ الأونر جلسة يظل السلوك القديم متاحًا للتوافق.
-    customer_chat_id = context.user_data.get("interactive_test_chat_id", OWNER_USER_ID)
-
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
     archive_message(
         customer_chat_id, "تجربة", None, sender_type="customer",
@@ -5159,7 +5169,9 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     )
 
     # الذكاء الاصطناعي يختار الإجراء فقط؛ الرد النهائي دائماً ثابت ومخزن.
-    if image_description:
+    if photo_outside_payment_flow:
+        action_key = "clarify"
+    elif image_description:
         if payment_analysis is None:
             set_interactive_sale_state(customer_chat_id, "payment_review")
             action_key = "payment_under_review"
@@ -5189,13 +5201,20 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if action_key == "no_reply":
         return
     if action_key == "payment_proof_approved":
-        account = assign_shared_chatgpt_account(customer_chat_id)
-        if account:
-            set_interactive_sale_state(customer_chat_id, "account_delivered")
-            reply = CHATGPT_DELIVERY_TEMPLATE.format(email=account["email"], password=account["password"])
+        _, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
+        if is_private_chatgpt_plan(plan_name):
+            # تفعيل الخاص يحتاج صاحب المتجر؛ لا نشارك بيانات حساب مشترك ولا
+            # نسمح بمسار الكود قبل أن يتم التفعيل فعلياً.
+            set_interactive_sale_state(customer_chat_id, "private_activation_pending")
+            reply = "تم تأكيد التحويل، راح أفعّله إلك وأرجعلك."
         else:
-            # لا يوجد مقعد متاح؛ لا نرسل أي بيانات حساب.
-            reply = "تم تأكيد التحويل مبدئياً، بس حالياً ماكو مقعد مشترك متاح. دا أرتبلك واحد وأرجعلك."
+            account = assign_shared_chatgpt_account(customer_chat_id)
+            if account:
+                set_interactive_sale_state(customer_chat_id, "account_delivered")
+                reply = CHATGPT_DELIVERY_TEMPLATE.format(email=account["email"], password=account["password"])
+            else:
+                # لا يوجد مقعد متاح؛ لا نرسل أي بيانات حساب.
+                reply = "تم تأكيد التحويل مبدئياً، بس حالياً ماكو مقعد مشترك متاح. دا أرتبلك واحد وأرجعلك."
     elif action_key == "code_request":
         # الكود لا ينرسل إلا للحساب الذي سُلّم داخل هذه الجلسة. العداد نفسه
         # المستخدم بالبوت الحقيقي يطبق قواعد إعادة المحاولة أيضاً.
