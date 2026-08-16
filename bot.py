@@ -3183,7 +3183,9 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         return None
 
 
-def render_test_response(action_key: str, customer_text: str) -> str:
+def render_test_response(
+    action_key: str, customer_text: str, customer_chat_id: int | None = None
+) -> str:
     """يحوّل الإجراء إلى رد ثابت، بدون صياغة من الذكاء الاصطناعي."""
     if action_key == "static_faq":
         return get_exact_test_faq_reply(customer_text) or "تدلل، وضحلي شنو تريد بالضبط حتى أساعدك."
@@ -3196,9 +3198,10 @@ def render_test_response(action_key: str, customer_text: str) -> str:
             return f"طرق الدفع\n\n{details}"
         return "تدلل، خليني أتأكد من طرق الدفع وأرجعلك."
     if action_key == "selected_plan_price":
-        amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
-        if amount is not None:
-            return f"الباقة اللي اخترتها ({plan_name}) سعرها {amount} ألف."
+        if customer_chat_id is not None:
+            amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
+            if amount is not None:
+                return f"الباقة اللي اخترتها ({plan_name}) سعرها {amount} ألف."
         return "تدلل، اختار الباقة اللي تناسبك حتى أگلك سعرها بالضبط."
     if action_key == "chatgpt_plans":
         product = next(
@@ -5177,11 +5180,11 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         if reply:
             set_interactive_sale_state(customer_chat_id, "code_sent")
         else:
-            reply = render_test_response("handoff", user_text)
+            reply = render_test_response("handoff", user_text, customer_chat_id)
             if stopped:
                 logger.warning("Interactive test code retries stopped for session %s", customer_chat_id)
     else:
-        reply = render_test_response(action_key, user_text)
+        reply = render_test_response(action_key, user_text, customer_chat_id)
 
     archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
 
