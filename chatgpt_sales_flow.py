@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Iterable, Mapping
 
 
@@ -159,6 +160,41 @@ def decide_code_retry(attempt_count: int, awaiting_restart: bool) -> CodeRetryDe
 def should_review_payment_photo(workflow_state: str) -> bool:
     """فحص الصورة مكلف وحساس؛ لا يتم إلا بعد اختيار الباقة/طلب الوصل."""
     return workflow_state in {"awaiting_payment", "awaiting_payment_proof"}
+
+
+def is_paid_amount_sufficient(expected_catalog_price: int | None, detected_amount: int | None) -> bool:
+    """أسعار الكاتالوج بالآلاف، والوصل بالدينار الكامل.
+
+    لا نرفض زيادة المبلغ: قد يكون الزبون اختار أن يدفع أكثر أو أضاف رسماً.
+    لكن لا يصح أبداً اعتبار مبلغ أقل من سعر الباقة مدفوعاً بالكامل.
+    """
+    if expected_catalog_price is None or detected_amount is None:
+        return False
+    required_iqd = expected_catalog_price * 1000 if expected_catalog_price < 1000 else expected_catalog_price
+    return detected_amount >= required_iqd
+
+
+def classify_receipt_recency(receipt_datetime: str | None, now: datetime) -> str | None:
+    """يعيد recent/old/future حين يكون تاريخ الوصل قابلاً للقراءة، وإلا None.
+
+    لا نعتمد فرقاً يصفه نموذج الرؤية بالكلام؛ الحساب هنا يتم من التاريخ نفسه.
+    """
+    if not receipt_datetime:
+        return None
+    value = str(receipt_datetime).strip()
+    parsed = None
+    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    # صورة التحويل التي تظهر بعد وقت بغداد الحالي بصورة ملموسة ليست وصلاً حديثاً صالحاً.
+    if parsed > now.replace(tzinfo=None) + timedelta(minutes=5):
+        return "future"
+    return "recent" if now.replace(tzinfo=None) - parsed <= timedelta(hours=2) else "old"
 
 
 def can_request_account_code(workflow_state: str) -> bool:

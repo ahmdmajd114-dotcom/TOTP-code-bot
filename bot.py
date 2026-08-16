@@ -49,6 +49,8 @@ from chatgpt_sales_flow import (
     is_private_chatgpt_plan,
     resolve_plan_choice,
     should_review_payment_photo,
+    is_paid_amount_sufficient,
+    classify_receipt_recency,
 )
 
 # ------------------------------------------------------------------
@@ -2630,11 +2632,13 @@ PAYMENT_PROOF_ANALYSIS_PROMPT = (
     "أنت تدقق صورة إثبات دفع لمتجر عراقي. حلل ما يظهر فعلياً فقط، ولا تفترض "
     "معلومات غير موجودة. أخرج JSON فقط بهذه الحقول: "
     "is_payment_receipt (true/false), amount (رقم أو null), payment_method (نص أو null), "
-    "recipient_match (true/false/null), recency (recent/old/not_visible), confidence (0-100), "
+    "recipient_match (true/false/null), receipt_datetime (صيغة YYYY-MM-DD HH:MM أو null), "
+    "recency (recent/old/not_visible), confidence (0-100), "
     "reason (نص عربي قصير).\n"
     "تعتبر الصورة وصل دفع فقط إذا ظهر تطبيق/خدمة دفع مع مبلغ وعملية تحويل أو نجاح. "
     "صورة التسجيل، الموقع، المحادثة، أو أي شاشة غير دفع = false. لا تعتبر الوقت "
-    "حديثاً إلا إذا ظهر تاريخ/وقت يتوافق مع اليوم أو آخر ساعتين بحسب وقت بغداد المعطى."
+    "حديثاً إلا إذا ظهر تاريخ/وقت يتوافق مع اليوم أو آخر ساعتين بحسب وقت بغداد المعطى. "
+    "انسخ التاريخ والوقت الظاهرين كما هما إلى receipt_datetime بعد تحويلهما للصيغة المطلوبة، ولا تكتب فرقاً زمنياً تقديرياً."
 )
 
 
@@ -2733,13 +2737,12 @@ async def analyze_payment_proof(file_bytes: bytes, customer_chat_id: int) -> dic
         result["amount"] = amount
         result["expected_amount"] = expected_amount
         result["plan_name"] = plan_name
-        # أسعار الكاتالوج مخزنة بآلاف الدنانير (15 تعني 15,000 د.ع)، بينما
-        # الوصل قد يظهر المبلغ الكامل ومعه رسم التحويل الصغير، مثل 15,015.
-        # لا نعتبره مطابقاً إذا كان أقل من سعر الباقة.
-        amount_matches = amount == expected_amount
-        if expected_amount is not None and amount is not None and expected_amount < 1000:
-            required_iqd = expected_amount * 1000
-            amount_matches = required_iqd <= amount <= required_iqd + max(1000, required_iqd // 10)
+        # يقبل المبلغ الذي يساوي سعر الباقة أو يزيد عليه، ويرفض الناقص فقط.
+        amount_matches = is_paid_amount_sufficient(expected_amount, amount)
+        baghdad_now = datetime.now(timezone(timedelta(hours=3)))
+        computed_recency = classify_receipt_recency(result.get("receipt_datetime"), baghdad_now)
+        if computed_recency is not None:
+            result["recency"] = computed_recency
 
         approved = (
             result.get("is_payment_receipt") is True
@@ -2753,7 +2756,7 @@ async def analyze_payment_proof(file_bytes: bytes, customer_chat_id: int) -> dic
             result["decision"] = "approved"
         elif (
             result.get("is_payment_receipt") is False
-            or result.get("recency") == "old"
+            or result.get("recency") in {"old", "future"}
             or (expected_amount is not None and amount is not None and not amount_matches)
             or result.get("recipient_match") is False
         ):

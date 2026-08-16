@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 
 from chatgpt_sales_flow import (
     asks_payment_guidance,
@@ -10,6 +11,8 @@ from chatgpt_sales_flow import (
     is_private_chatgpt_plan,
     resolve_plan_choice,
     should_review_payment_photo,
+    is_paid_amount_sufficient,
+    classify_receipt_recency,
 )
 
 
@@ -94,6 +97,17 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertFalse(should_review_payment_photo("awaiting_plan_choice"))
         self.assertTrue(should_review_payment_photo("awaiting_payment"))
         self.assertTrue(should_review_payment_photo("awaiting_payment_proof"))
+
+    def test_payment_amount_accepts_equal_or_higher_only(self):
+        self.assertFalse(is_paid_amount_sufficient(8, 7_999))
+        self.assertTrue(is_paid_amount_sufficient(8, 8_000))
+        self.assertTrue(is_paid_amount_sufficient(8, 15_000))
+
+    def test_receipt_recency_uses_the_receipt_date_not_a_model_estimate(self):
+        now = datetime(2026, 8, 16, 19, 3)
+        self.assertEqual(classify_receipt_recency("2026-08-16 18:49", now), "recent")
+        self.assertEqual(classify_receipt_recency("16/07/2026 15:06", now), "old")
+        self.assertEqual(classify_receipt_recency("2026-08-16 21:30", now), "future")
 
     def test_code_is_not_available_before_account_delivery(self):
         self.assertFalse(can_request_account_code("payment_verified"))
