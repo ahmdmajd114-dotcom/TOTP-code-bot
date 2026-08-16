@@ -3121,12 +3121,21 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         if has_any_normalized_term(normalized, {"كود", "الرمز", "رمز", "code", "otp"}):
             return "code_request"
     if workflow_state == "awaiting_plan_choice":
-        selected = find_selected_chatgpt_plan(new_message)
+        # اختيار الباقة قد يصل على رسالتين: «أريد جات شهر» ثم «خاص». نجمع
+        # رسائل الزبون ضمن الجلسة الحالية فقط حتى لا ننسى الجزء الأول ولا
+        # نخلط أي محادثة قديمة.
+        customer_choice_messages = [
+            (item.get("message_text") or "").strip()
+            for item in recent_messages
+            if item.get("sender_type") == "customer" and (item.get("message_text") or "").strip()
+        ]
+        plan_choice_text = " ".join(customer_choice_messages[-4:])
+        selected = find_selected_chatgpt_plan(plan_choice_text)
         if selected:
             product, plan = selected
             set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
             return "payment_methods"
-        missing_choice = get_chatgpt_plan_choice_gap(new_message)
+        missing_choice = get_chatgpt_plan_choice_gap(plan_choice_text)
         if missing_choice:
             return missing_choice
         return "request_plan_choice"
