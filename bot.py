@@ -3144,6 +3144,19 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         return "request_plan_choice"
     if any(term in normalized for term in {"شكرا", "شكراً", "تعبتكم", "عاشت"}):
         return "closing"
+    # الزبون قد يحدد المنتج والباقـة من أول رسالة مثل: «أريد جات مشترك
+    # شهر». لا نعيد له القائمة في هذه الحالة؛ نثبت اختياره وننتقل مباشرة
+    # لخطوة الدفع.
+    if is_chatgpt_catalog_context(new_message):
+        selected = find_selected_chatgpt_plan(new_message)
+        if selected:
+            product, plan = selected
+            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
+            return "payment_methods"
+        missing_choice = get_chatgpt_plan_choice_gap(new_message)
+        if missing_choice:
+            set_interactive_sale_state(customer_chat_id, "awaiting_plan_choice", None, None)
+            return missing_choice
     if is_chatgpt_catalog_context(new_message) or (
         is_plan_question(new_message) and is_chatgpt_catalog_context(context_text)
     ):
