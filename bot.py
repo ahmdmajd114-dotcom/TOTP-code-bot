@@ -41,12 +41,14 @@ from telegram.ext import (
 )
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    can_request_account_code,
     decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_payment_claim,
     is_private_chatgpt_plan,
     resolve_plan_choice,
+    should_review_payment_photo,
 )
 
 # ------------------------------------------------------------------
@@ -3086,7 +3088,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         return "closing"
     # هذه الحالات تأتي بعد تسليم الحساب فقط؛ ما نسمح لكلمة "كود" أن
     # تخرج من مسار البيع أو تعطي كوداً لشخص لم يستلم حساباً.
-    if workflow_state in {"account_delivered", "code_sent", "support_review"}:
+    if can_request_account_code(workflow_state):
         if has_any_normalized_term(normalized, {"workspace", "personal", "مساحه", "مساحة"}):
             return "workspace_guidance"
         if has_any_normalized_term(normalized, {"شلون", "اسجل", "سجل", "تسجيل", "وين"}):
@@ -5117,7 +5119,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if message.photo:
         user_text = message.caption or "[صورة مرفقة]"
         state = get_interactive_sale_state(customer_chat_id)
-        if state.get("workflow_state") not in {"awaiting_payment", "awaiting_payment_proof"}:
+        if not should_review_payment_photo(state.get("workflow_state", "observing")):
             # ما نصرف فحص رؤية على أي صورة خارج مسار الدفع، ولا نفسرها
             # تلقائياً على أنها وصل تحويل.
             photo_outside_payment_flow = True

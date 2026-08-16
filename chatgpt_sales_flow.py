@@ -154,3 +154,13 @@ def decide_code_retry(attempt_count: int, awaiting_restart: bool) -> CodeRetryDe
     if next_count == 5:
         return CodeRetryDecision("send_code", next_count, False)
     return CodeRetryDecision("stop", next_count, False)
+
+
+def should_review_payment_photo(workflow_state: str) -> bool:
+    """فحص الصورة مكلف وحساس؛ لا يتم إلا بعد اختيار الباقة/طلب الوصل."""
+    return workflow_state in {"awaiting_payment", "awaiting_payment_proof"}
+
+
+def can_request_account_code(workflow_state: str) -> bool:
+    """الكود لا يصدر إلا بعد تسليم حساب مشترك فعلياً."""
+    return workflow_state in {"account_delivered", "code_sent", "support_review"}

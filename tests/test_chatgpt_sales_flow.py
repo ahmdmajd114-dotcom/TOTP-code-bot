@@ -2,12 +2,14 @@ import unittest
 
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    can_request_account_code,
     decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_payment_claim,
     is_private_chatgpt_plan,
     resolve_plan_choice,
+    should_review_payment_photo,
 )
 
 
@@ -85,6 +87,18 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertEqual(decide_code_retry(3, True).attempt_count, 4)
         self.assertEqual(decide_code_retry(4, False).attempt_count, 5)
         self.assertEqual(decide_code_retry(5, False).action, "stop")
+
+    def test_payment_photo_is_only_reviewed_inside_payment_flow(self):
+        self.assertFalse(should_review_payment_photo("observing"))
+        self.assertFalse(should_review_payment_photo("awaiting_plan_choice"))
+        self.assertTrue(should_review_payment_photo("awaiting_payment"))
+        self.assertTrue(should_review_payment_photo("awaiting_payment_proof"))
+
+    def test_code_is_not_available_before_account_delivery(self):
+        self.assertFalse(can_request_account_code("payment_verified"))
+        self.assertFalse(can_request_account_code("private_activation_pending"))
+        self.assertTrue(can_request_account_code("account_delivered"))
+        self.assertTrue(can_request_account_code("code_sent"))
 
 
 if __name__ == "__main__":
