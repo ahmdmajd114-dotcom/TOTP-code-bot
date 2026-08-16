@@ -2831,8 +2831,11 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "بـ action_key فقط بلا شرح. اختَر static_faq للسؤال المباشر الذي يغطيه رد "
     "ثابت. اختَر chatgpt_plans عندما يطلب جات/ChatGPT أو يسأل عن باقاته، "
     "حتى لو سأل فقط \"شنو الباقات\" وكان الطلب السابق داخل السياق عن جات. "
-    "اختَر payment_methods عندما يطلب الدفع أو طرق الدفع. اختَر "
+    "اختَر payment_methods عندما يطلب الدفع أو طرق الدفع بعد اختيار باقة. اختَر "
     "request_plan_choice إذا يريد الشراء ولم يحدد باقة. اختَر "
+    "clarify_plan_type إذا حدد المدة فقط، وclarify_plan_duration إذا حدد "
+    "خاص أو مشترك فقط. اختَر code_request فقط بعد تسليم الحساب، واختَر "
+    "workspace_guidance لسؤال Personal أو Workspace. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
     "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
@@ -2985,7 +2988,9 @@ def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
     plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
     ranked: list[tuple[int, dict]] = []
     for plan in plans:
-        plan_words = normalize_style_text(f"{plan.get('name') or ''} {plan.get('duration') or ''}")
+        plan_words = normalize_style_text(
+            f"{plan.get('name') or ''} {plan.get('duration') or ''} {plan.get('price') or ''}"
+        )
         score = len(words & plan_words)
         # "شهر" وحدها يقصد بها غالباً الباقة ذات الشهر الواحد، وليس شهرين.
         if "شهر" in words and "شهرين" not in words and "شهرين" not in plan_words and "شهر" in plan_words:
@@ -2996,11 +3001,32 @@ def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
             score += 3
         if "مشترك" in words and "مشترك" in plan_words:
             score += 3
+        # الزبون كثيراً يختارها بالسعر المختصر: "أبو 8" أو "باقة 25".
+        if str(plan.get("price") or "") in words:
+            score += 3
         ranked.append((score, plan))
     ranked.sort(key=lambda item: item[0], reverse=True)
     if ranked and ranked[0][0] >= 2:
         return product, ranked[0][1]
     return None
+
+
+def get_chatgpt_plan_choice_gap(text: str) -> str | None:
+    """يحدد شنو الناقص من اختيار الباقة، بدون أن نخمن بداله."""
+    words = normalize_style_text(text)
+    has_private = "خاص" in words
+    has_shared = "مشترك" in words
+    has_month = "شهر" in words
+    has_two_months = "شهرين" in words
+    if (has_private or has_shared) and not (has_month or has_two_months):
+        return "clarify_plan_duration"
+    if (has_month or has_two_months) and not (has_private or has_shared):
+        return "clarify_plan_type"
+    return None
+
+
+def has_any_normalized_term(normalized: str, terms: set[str]) -> bool:
+    return any(term in normalized for term in terms)
 
 
 def get_interactive_sale_state(customer_chat_id: int) -> dict:
@@ -3048,6 +3074,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         text = (item.get("message_text") or "").strip()
         if text:
             speaker = "الزبون" if item.get("sender_type") == "customer" else "المتجر"
+            # بيانات الحساب لا تفيد المصنف بعد التسليم، ولا يجوز إرسالها إلى
+            # موديل خارجي ضمن سياق المحادثة.
+            if speaker == "المتجر" and re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text):
+                text = "[تم تسليم بيانات الحساب]"
             context_lines.append(f"{speaker}: {redact_context_text(text)}")
     context_text = "\n".join(context_lines) or "لا يوجد سياق سابق."
     sale_state = get_interactive_sale_state(customer_chat_id)
@@ -3070,12 +3100,30 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         return "static_faq"
     if "شكر" in greeting_categories:
         return "closing"
+    # هذه الحالات تأتي بعد تسليم الحساب فقط؛ ما نسمح لكلمة "كود" أن
+    # تخرج من مسار البيع أو تعطي كوداً لشخص لم يستلم حساباً.
+    if workflow_state in {"account_delivered", "code_sent", "support_review"}:
+        if has_any_normalized_term(normalized, {"workspace", "personal", "مساحه", "مساحة"}):
+            return "workspace_guidance"
+        if has_any_normalized_term(normalized, {"شلون", "اسجل", "سجل", "تسجيل", "وين"}):
+            return "registration_guidance"
+        if has_any_normalized_term(normalized, {"ماصار", "مايشتغل", "خطا", "خطأ", "مشكله", "مشكلة"}) or (
+            "ما" in normalized and has_any_normalized_term(normalized, {"صار", "يشتغل"})
+        ):
+            set_interactive_sale_state(customer_chat_id, "support_review")
+            return "request_support_screenshot"
+        if has_any_normalized_term(normalized, {"كود", "الرمز", "رمز", "code", "otp"}):
+            return "code_request"
     if workflow_state == "awaiting_plan_choice":
         selected = find_selected_chatgpt_plan(new_message)
         if selected:
             product, plan = selected
             set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
             return "payment_methods"
+        missing_choice = get_chatgpt_plan_choice_gap(new_message)
+        if missing_choice:
+            return missing_choice
+        return "request_plan_choice"
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
         set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
@@ -3083,8 +3131,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         term in normalized for term in {"هسه", "اسوي", "شنو", "شلون", "اوكي", "تمام"}
     ):
         return "payment_methods"
-    if any(term in normalized for term in {"ادفع", "الدفع", "ماستر", "زين", "رصيد"}):
-        return "payment_methods"
+    if has_any_normalized_term(normalized, {"ادفع", "الدفع", "ماستر", "زين", "رصيد", "تحويل"}):
+        if workflow_state in {"awaiting_payment", "awaiting_payment_proof"}:
+            return "payment_methods"
+        return "request_plan_choice"
     if any(term in normalized for term in {"شكرا", "شكراً", "تعبتكم", "عاشت"}):
         return "closing"
     if is_chatgpt_catalog_context(new_message) or (
@@ -5108,6 +5158,16 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         else:
             # لا يوجد مقعد متاح؛ لا نرسل أي بيانات حساب.
             reply = "تم تأكيد التحويل مبدئياً، بس حالياً ماكو مقعد مشترك متاح. دا أرتبلك واحد وأرجعلك."
+    elif action_key == "code_request":
+        # الكود لا ينرسل إلا للحساب الذي سُلّم داخل هذه الجلسة. العداد نفسه
+        # المستخدم بالبوت الحقيقي يطبق قواعد إعادة المحاولة أيضاً.
+        reply, stopped = process_code_request(customer_chat_id)
+        if reply:
+            set_interactive_sale_state(customer_chat_id, "code_sent")
+        else:
+            reply = render_test_response("handoff", user_text)
+            if stopped:
+                logger.warning("Interactive test code retries stopped for session %s", customer_chat_id)
     else:
         reply = render_test_response(action_key, user_text)
 
