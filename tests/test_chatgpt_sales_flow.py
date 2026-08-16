@@ -2,6 +2,7 @@ import unittest
 
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_payment_claim,
@@ -75,6 +76,15 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
     def test_private_plan_never_uses_shared_delivery(self):
         self.assertTrue(is_private_chatgpt_plan("اشتراك شهر خاص"))
         self.assertFalse(is_private_chatgpt_plan("اشتراك شهر مشترك"))
+
+    def test_code_retry_sequence(self):
+        self.assertEqual(decide_code_retry(0, False).action, "send_code")
+        self.assertEqual(decide_code_retry(1, False).attempt_count, 2)
+        restart = decide_code_retry(2, False)
+        self.assertEqual((restart.action, restart.attempt_count, restart.awaiting_restart), ("ask_restart", 3, True))
+        self.assertEqual(decide_code_retry(3, True).attempt_count, 4)
+        self.assertEqual(decide_code_retry(4, False).attempt_count, 5)
+        self.assertEqual(decide_code_retry(5, False).action, "stop")
 
 
 if __name__ == "__main__":

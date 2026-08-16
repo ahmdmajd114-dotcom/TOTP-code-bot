@@ -25,6 +25,13 @@ class PlanChoice:
     missing: str | None = None
 
 
+@dataclass(frozen=True)
+class CodeRetryDecision:
+    action: str
+    attempt_count: int
+    awaiting_restart: bool
+
+
 def _plan_words(plan: Mapping[str, object]) -> set[str]:
     return normalized_words(
         " ".join(
@@ -133,3 +140,17 @@ def is_payment_claim(text: str) -> bool:
 def is_private_chatgpt_plan(plan_name: str) -> bool:
     """الباقات الخاصة لا يجوز أن تستلم حساباً مشتركاً تلقائياً."""
     return "خاص" in normalized_words(plan_name)
+
+
+def decide_code_retry(attempt_count: int, awaiting_restart: bool) -> CodeRetryDecision:
+    """قرار الكود بعد كل محاولة، مستقل عن قاعدة البيانات وTOTP."""
+    if awaiting_restart:
+        return CodeRetryDecision("send_code", 4, False)
+    next_count = attempt_count + 1
+    if next_count <= 2:
+        return CodeRetryDecision("send_code", next_count, False)
+    if next_count == 3:
+        return CodeRetryDecision("ask_restart", next_count, True)
+    if next_count == 5:
+        return CodeRetryDecision("send_code", next_count, False)
+    return CodeRetryDecision("stop", next_count, False)

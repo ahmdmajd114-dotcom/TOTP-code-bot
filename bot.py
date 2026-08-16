@@ -41,6 +41,7 @@ from telegram.ext import (
 )
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_payment_claim,
@@ -3529,31 +3530,16 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
 
     secret, label = result
 
-    # لو كنا ننتظر تأكيد الريستارت، وهذي رسالة جديدة تطلب كود تعتبر
-    # تأكيد ضمني للريستارت → نبعث كود (محاولة 4) ونطفي علامة الانتظار
-    if awaiting_restart:
+    decision = decide_code_retry(attempt_count, awaiting_restart)
+    if decision.action == "send_code":
         code = generate_totp_code(secret)
-        _save_retry_state(chat_id, attempt_count=4, awaiting_restart=False)
+        _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
-
-    new_count = attempt_count + 1
-
-    if new_count <= 2:
-        code = generate_totp_code(secret)
-        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
-        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
-
-    if new_count == 3:
-        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=True)
+    if decision.action == "ask_restart":
+        _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         return RESTART_MESSAGE, False
-
-    if new_count == 5:
-        code = generate_totp_code(secret)
-        _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
-        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
-
-    # new_count >= 6 (أو أي حالة بعد المحاولة الخامسة) — نوقف ونبلغ الأونر
-    _save_retry_state(chat_id, attempt_count=new_count, awaiting_restart=False)
+    # المحاولة السادسة وما بعدها: نوقف ونبلغ الأونر.
+    _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
     return None, True
 
 
