@@ -1,0 +1,109 @@
+"""منطق نقي وقابل للاختبار لاختيار باقات ChatGPT باللهجة العراقية."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Iterable, Mapping
+
+
+def normalized_words(text: str) -> set[str]:
+    """تطبيع بسيط يكفي لفهم كلمات الاختيار، من دون تخمين المعنى."""
+    normalized = (text or "").lower()
+    normalized = re.sub(r"[أإآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"[^\w\u0600-\u06ff]+", " ", normalized)
+    return {word for word in normalized.split() if len(word) >= 1}
+
+
+@dataclass(frozen=True)
+class PlanChoice:
+    """نتيجة فهم الاختيار؛ لا تحتوي أي رد جاهز للزبون."""
+
+    plan: Mapping[str, object] | None = None
+    missing: str | None = None
+
+
+def _plan_words(plan: Mapping[str, object]) -> set[str]:
+    return normalized_words(
+        " ".join(
+            str(plan.get(key) or "")
+            for key in ("name", "duration", "description", "price")
+        )
+    )
+
+
+def _duration_from_words(words: set[str]) -> str | None:
+    if "شهرين" in words:
+        return "two_months"
+    if "شهر" in words:
+        return "one_month"
+    return None
+
+
+def _type_from_words(words: set[str]) -> str | None:
+    if "خاص" in words:
+        return "private"
+    if "مشترك" in words:
+        return "shared"
+    return None
+
+
+def _plan_matches_type(plan_words: set[str], selected_type: str) -> bool:
+    return (selected_type == "private" and "خاص" in plan_words) or (
+        selected_type == "shared" and "مشترك" in plan_words
+    )
+
+
+def _plan_matches_duration(plan_words: set[str], selected_duration: str) -> bool:
+    if selected_duration == "two_months":
+        return "شهرين" in plan_words
+    return "شهر" in plan_words and "شهرين" not in plan_words
+
+
+def resolve_plan_choice(
+    message_parts: Iterable[str], plans: Iterable[Mapping[str, object]]
+) -> PlanChoice:
+    """
+    يدمج رسائل الزبون داخل الجلسة ويعيد باقة مؤكدة أو نوع السؤال الناقص.
+
+    لا توجد هنا قاعدة اختيار افتراضي: لا تُرجَع الباقة إلا إذا عرفنا نوعها
+    ومدتها معاً، أو اختار الزبون سعراً فريداً وصريحاً.
+    """
+    text = " ".join(part for part in message_parts if part)
+    words = normalized_words(text)
+    active_plans = [plan for plan in plans if plan.get("is_active", True)]
+
+    explicit_price_matches = [
+        plan for plan in active_plans
+        if str(plan.get("price") or "") in words
+    ]
+    if len(explicit_price_matches) == 1:
+        return PlanChoice(plan=explicit_price_matches[0])
+
+    selected_type = _type_from_words(words)
+    selected_duration = _duration_from_words(words)
+    if selected_type and selected_duration:
+        matches = [
+            plan for plan in active_plans
+            if _plan_matches_type(_plan_words(plan), selected_type)
+            and _plan_matches_duration(_plan_words(plan), selected_duration)
+        ]
+        if len(matches) == 1:
+            return PlanChoice(plan=matches[0])
+        # إذا الكاتالوج نفسه ملتبس، ما نختار نيابة عن الزبون.
+        return PlanChoice(missing="request_plan_choice")
+
+    if selected_type:
+        return PlanChoice(missing="clarify_plan_duration")
+    if selected_duration:
+        return PlanChoice(missing="clarify_plan_type")
+    return PlanChoice(missing="request_plan_choice")
+
+
+def is_other_products_question(text: str) -> bool:
+    """يميز سؤال المنتجات الأخرى عن سؤال خطوة الدفع التالية."""
+    words = normalized_words(text)
+    asks_about_store = bool(words & {"شنو", "عدكم", "منتجات", "اكو", "اكو"})
+    asks_for_alternatives = bool(words & {"غيره", "غير", "بقيه", "باقي"})
+    return asks_about_store and asks_for_alternatives

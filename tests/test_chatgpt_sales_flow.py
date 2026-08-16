@@ -1,0 +1,54 @@
+import unittest
+
+from chatgpt_sales_flow import is_other_products_question, resolve_plan_choice
+
+
+PLANS = [
+    {"id": "shared-1", "name": "اشتراك شهر مشترك", "price": 8, "is_active": True},
+    {"id": "shared-2", "name": "اشتراك شهرين مشترك", "price": 15, "is_active": True},
+    {"id": "private-1", "name": "اشتراك شهر خاص", "price": 25, "is_active": True},
+    {"id": "private-2", "name": "اشتراك شهرين خاص", "price": 35, "is_active": True},
+]
+
+
+class ChatGPTPlanChoiceTests(unittest.TestCase):
+    def assert_plan(self, messages, expected_id):
+        choice = resolve_plan_choice(messages, PLANS)
+        self.assertIsNotNone(choice.plan)
+        self.assertEqual(choice.plan["id"], expected_id)
+
+    def test_month_without_type_never_guesses_shared(self):
+        choice = resolve_plan_choice(["اريد جات شهر"], PLANS)
+        self.assertIsNone(choice.plan)
+        self.assertEqual(choice.missing, "clarify_plan_type")
+
+    def test_type_without_duration_never_guesses_month(self):
+        choice = resolve_plan_choice(["اريد جات خاص"], PLANS)
+        self.assertIsNone(choice.plan)
+        self.assertEqual(choice.missing, "clarify_plan_duration")
+
+    def test_choice_is_merged_across_messages(self):
+        self.assert_plan(["اريد جات شهر", "خاص"], "private-1")
+
+    def test_shared_two_months_is_resolved(self):
+        self.assert_plan(["اريد جات", "مشترك", "شهرين"], "shared-2")
+
+    def test_direct_complete_choice_is_resolved(self):
+        self.assert_plan(["اريد جات مشترك شهر"], "shared-1")
+
+    def test_unique_price_is_a_valid_choice(self):
+        self.assert_plan(["اريد باقة 25"], "private-1")
+
+    def test_ambiguous_or_empty_choice_requests_clarification(self):
+        choice = resolve_plan_choice(["اختارته"], PLANS)
+        self.assertIsNone(choice.plan)
+        self.assertEqual(choice.missing, "request_plan_choice")
+
+    def test_other_products_question_is_not_a_payment_question(self):
+        self.assertTrue(is_other_products_question("شنو عدكم غيره"))
+        self.assertTrue(is_other_products_question("اكو منتجات غير الشات؟"))
+        self.assertFalse(is_other_products_question("شنو اسوي حتى ادفع"))
+
+
+if __name__ == "__main__":
+    unittest.main()

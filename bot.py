@@ -39,6 +39,7 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
+from chatgpt_sales_flow import is_other_products_question, resolve_plan_choice
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -2839,7 +2840,8 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "selected_plan_price إذا سأل عن المبلغ بعد أن اختار باقة. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
-    "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
+    "لمشكلة تحتاج صورة. اختَر catalog_products إذا سأل عن المنتجات الأخرى، "
+    "وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
     "الكلام غير واضح."
 )
 
@@ -2983,52 +2985,21 @@ def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
     product = get_chatgpt_catalog_product()
     if not product:
         return None
-    words = normalize_style_text(text)
-    if not words:
-        return None
-    # «شهر» وحدها لا تكفي: عندنا شهر خاص وشهر مشترك. لا نخمن النوع
-    # بدلاً عن الزبون، إلا إذا اختار النوع والمدة معاً أو ذكر السعر بوضوح.
-    has_type = bool(words & {"خاص", "مشترك"})
-    has_duration = bool(words & {"شهر", "شهرين"})
     plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
-    ranked: list[tuple[int, dict]] = []
-    for plan in plans:
-        plan_words = normalize_style_text(
-            f"{plan.get('name') or ''} {plan.get('duration') or ''} {plan.get('price') or ''}"
-        )
-        score = len(words & plan_words)
-        # "شهر" وحدها يقصد بها غالباً الباقة ذات الشهر الواحد، وليس شهرين.
-        if "شهر" in words and "شهرين" not in words and "شهرين" not in plan_words and "شهر" in plan_words:
-            score += 3
-        if "شهرين" in words and "شهرين" in plan_words:
-            score += 3
-        if "خاص" in words and "خاص" in plan_words:
-            score += 3
-        if "مشترك" in words and "مشترك" in plan_words:
-            score += 3
-        # الزبون كثيراً يختارها بالسعر المختصر: "أبو 8" أو "باقة 25".
-        if str(plan.get("price") or "") in words:
-            score += 3
-        ranked.append((score, plan))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    explicit_price = any(str(plan.get("price") or "") in words for plan in plans)
-    if ranked and ranked[0][0] >= 2 and (has_type and has_duration or explicit_price):
-        return product, ranked[0][1]
+    choice = resolve_plan_choice([text], plans)
+    if choice.plan:
+        return product, dict(choice.plan)
     return None
 
 
 def get_chatgpt_plan_choice_gap(text: str) -> str | None:
     """يحدد شنو الناقص من اختيار الباقة، بدون أن نخمن بداله."""
-    words = normalize_style_text(text)
-    has_private = "خاص" in words
-    has_shared = "مشترك" in words
-    has_month = "شهر" in words
-    has_two_months = "شهرين" in words
-    if (has_private or has_shared) and not (has_month or has_two_months):
-        return "clarify_plan_duration"
-    if (has_month or has_two_months) and not (has_private or has_shared):
-        return "clarify_plan_type"
-    return None
+    product = get_chatgpt_catalog_product()
+    if not product:
+        return None
+    plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
+    choice = resolve_plan_choice([text], plans)
+    return choice.missing if choice.missing in {"clarify_plan_type", "clarify_plan_duration"} else None
 
 
 def has_any_normalized_term(normalized: str, terms: set[str]) -> bool:
@@ -3072,7 +3043,7 @@ def set_interactive_sale_state(customer_chat_id: int, workflow_state: str, produ
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
-    allowed_actions = ["static_faq", *templates.keys()]
+    allowed_actions = ["static_faq", "catalog_products", *templates.keys()]
     recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
     style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
     context_lines = []
@@ -3145,6 +3116,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         expected_amount, _ = get_expected_payment_for_interactive_session(customer_chat_id)
         if expected_amount is not None:
             return "selected_plan_price"
+    # سؤال «شنو عدكم غيره؟» ليس طلباً لإعادة طرق الدفع؛ نبقي مرحلة البيع
+    # كما هي ونعرّف الزبون بالمنتجات الأخرى فقط.
+    if is_other_products_question(new_message):
+        return "catalog_products"
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
         set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
@@ -3244,6 +3219,15 @@ def render_test_response(
                     lines.append(f"- {plan['name']} {plan['price']}")
                 return "\n".join(lines)
         return get_reply_for_category("chatgpt") or "تدلل، خليني أتأكد من باقات الشات وأرجعلك."
+    if action_key == "catalog_products":
+        products = [
+            row.get("name", "").strip()
+            for row in get_catalog_products()
+            if row.get("is_active") and row.get("name", "").strip().lower() != "chatgpt"
+        ]
+        if products:
+            return "عدنا غير الشات:\n" + "\n".join(f"- {name}" for name in products)
+        return "حالياً الموجود عندنا الشات، وإذا تريد شي معين گلي عليه."
     templates = get_interactive_response_templates()
     return templates.get(action_key) or templates.get("handoff") or "تدلل، خليني أتأكد من الموضوع وأرجعلك."
 
