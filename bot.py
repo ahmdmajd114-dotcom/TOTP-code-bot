@@ -2842,7 +2842,8 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "بـ action_key فقط بلا شرح. اختَر static_faq للسؤال المباشر الذي يغطيه رد "
     "ثابت. اختَر chatgpt_plans عندما يطلب جات/ChatGPT أو يسأل عن باقاته، "
     "حتى لو سأل فقط \"شنو الباقات\" وكان الطلب السابق داخل السياق عن جات. "
-    "اختَر payment_methods عندما يطلب الدفع أو طرق الدفع بعد اختيار باقة. اختَر "
+    "اختَر payment_methods عندما يطلب طرق الدفع بعد اختيار باقة، وpayment_next_step "
+    "عندما يسأل شنو يسوي بعدها أو هل يدفع أولاً. اختَر "
     "request_plan_choice إذا يريد الشراء ولم يحدد باقة. اختَر "
     "clarify_plan_type إذا حدد المدة فقط، وclarify_plan_duration إذا حدد "
     "خاص أو مشترك فقط. اختَر code_request فقط بعد تسليم الحساب، واختَر "
@@ -3052,7 +3053,7 @@ def set_interactive_sale_state(customer_chat_id: int, workflow_state: str, produ
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
-    allowed_actions = ["static_faq", *templates.keys()]
+    allowed_actions = ["static_faq", "payment_next_step", *templates.keys()]
     recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
     style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
     context_lines = []
@@ -3142,7 +3143,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             return "request_payment_proof"
         return "request_plan_choice"
     if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and asks_payment_guidance(new_message):
-        return "payment_methods"
+        return "payment_next_step"
     if has_any_normalized_term(normalized, {"ادفع", "الدفع", "ماستر", "زين", "رصيد", "تحويل"}):
         if workflow_state in {"awaiting_payment", "awaiting_payment_proof"}:
             return "payment_methods"
@@ -3229,6 +3230,14 @@ def render_test_response(
             if amount is not None:
                 return f"سعره {amount} آلاف."
         return "تدلل، اختار الباقة اللي تناسبك حتى أگلك سعرها بالضبط."
+    if action_key == "payment_next_step":
+        amount, plan_name = (None, "")
+        if customer_chat_id is not None:
+            amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
+        amount_text = f" {amount} آلاف" if amount is not None else ""
+        if is_private_chatgpt_plan(plan_name):
+            return f"إي تدفع أول{amount_text} على وحدة من الطرق، وبعدها دزلي صورة التحويل حتى أتأكد وأفعّل اشتراكك."
+        return f"إي تدفع أول{amount_text} على وحدة من الطرق، وبعدها دزلي صورة التحويل حتى أتأكد وأدزلك الحساب."
     if action_key == "clarify":
         return "عفواً ما فهمت قصدك، تكدر توضحلي؟"
     if action_key == "chatgpt_plans":

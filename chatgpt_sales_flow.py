@@ -127,8 +127,8 @@ def is_acknowledgement(text: str) -> bool:
 def asks_payment_guidance(text: str) -> bool:
     """يفرق سؤال الخطوة القادمة عن كلمة عامة مثل «شنو» أو «تمام»."""
     words = normalized_words(text)
-    has_question = bool(words & {"شنو", "شلون", "كيف"})
-    has_next_step = bool(words & {"اسوي", "سوي", "ادفع", "الدفع", "تحويل"})
+    has_question = bool(words & {"شنو", "شلون", "كيف", "لو"})
+    has_next_step = bool(words & {"اسوي", "سوي", "ادفع", "الدفع", "تحويل", "حساب", "الحساب"})
     return has_question and has_next_step
 
 

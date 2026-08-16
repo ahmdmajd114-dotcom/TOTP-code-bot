@@ -67,6 +67,7 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
     def test_payment_guidance_needs_a_real_question(self):
         self.assertTrue(asks_payment_guidance("شنو اسوي حتى ادفع"))
         self.assertTrue(asks_payment_guidance("شلون ادفع"))
+        self.assertTrue(asks_payment_guidance("ادفع اول لو تدزلي الحساب"))
         self.assertFalse(asks_payment_guidance("شنو"))
         self.assertFalse(asks_payment_guidance("تمام"))
 
