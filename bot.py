@@ -2986,6 +2986,10 @@ def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
     words = normalize_style_text(text)
     if not words:
         return None
+    # «شهر» وحدها لا تكفي: عندنا شهر خاص وشهر مشترك. لا نخمن النوع
+    # بدلاً عن الزبون، إلا إذا اختار النوع والمدة معاً أو ذكر السعر بوضوح.
+    has_type = bool(words & {"خاص", "مشترك"})
+    has_duration = bool(words & {"شهر", "شهرين"})
     plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
     ranked: list[tuple[int, dict]] = []
     for plan in plans:
@@ -3007,7 +3011,8 @@ def find_selected_chatgpt_plan(text: str) -> tuple[dict, dict] | None:
             score += 3
         ranked.append((score, plan))
     ranked.sort(key=lambda item: item[0], reverse=True)
-    if ranked and ranked[0][0] >= 2:
+    explicit_price = any(str(plan.get("price") or "") in words for plan in plans)
+    if ranked and ranked[0][0] >= 2 and (has_type and has_duration or explicit_price):
         return product, ranked[0][1]
     return None
 
@@ -3214,7 +3219,7 @@ def render_test_response(
         if customer_chat_id is not None:
             amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
             if amount is not None:
-                return f"الباقة اللي اخترتها ({plan_name}) سعرها {amount} ألف."
+                return f"سعره {amount} آلاف."
         return "تدلل، اختار الباقة اللي تناسبك حتى أگلك سعرها بالضبط."
     if action_key == "chatgpt_plans":
         product = next(
