@@ -16,6 +16,7 @@ values
   ('greeting', 'تحية عامة', 'اهلا وسهلا'),
   ('chatgpt_plans', 'باقات ChatGPT', ''),
   ('payment_methods', 'إرسال طرق الدفع', ''),
+  ('selected_plan_price', 'سعر الباقة المختارة', ''),
   ('request_plan_choice', 'طلب اختيار الباقة', 'تدلل، اختار الباقة اللي تناسبك حتى نكمل.'),
   ('clarify_plan_type', 'طلب نوع الباقة', 'تدلل، تريده خاص لو مشترك؟'),
   ('clarify_plan_duration', 'طلب مدة الباقة', 'تدلل، شهر لو شهرين؟'),

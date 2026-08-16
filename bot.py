@@ -2836,6 +2836,7 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "clarify_plan_type إذا حدد المدة فقط، وclarify_plan_duration إذا حدد "
     "خاص أو مشترك فقط. اختَر code_request فقط بعد تسليم الحساب، واختَر "
     "workspace_guidance لسؤال Personal أو Workspace. اختَر "
+    "selected_plan_price إذا سأل عن المبلغ بعد أن اختار باقة. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
     "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
@@ -3124,6 +3125,12 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         if missing_choice:
             return missing_choice
         return "request_plan_choice"
+    # «شكد لازم أدفع؟» بعد اختيار الباقة سؤال عن مبلغ الباقة نفسها، مو
+    # طلب لإعادة أرقام الدفع. نعتمد السعر المخزّن للباقة المختارة.
+    if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and is_plan_question(new_message):
+        expected_amount, _ = get_expected_payment_for_interactive_session(customer_chat_id)
+        if expected_amount is not None:
+            return "selected_plan_price"
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
         set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
@@ -3188,6 +3195,11 @@ def render_test_response(action_key: str, customer_text: str) -> str:
             )
             return f"طرق الدفع\n\n{details}"
         return "تدلل، خليني أتأكد من طرق الدفع وأرجعلك."
+    if action_key == "selected_plan_price":
+        amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
+        if amount is not None:
+            return f"الباقة اللي اخترتها ({plan_name}) سعرها {amount} ألف."
+        return "تدلل، اختار الباقة اللي تناسبك حتى أگلك سعرها بالضبط."
     if action_key == "chatgpt_plans":
         product = next(
             (row for row in get_catalog_products()
