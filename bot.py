@@ -39,7 +39,12 @@ from telegram.ext import (
     CommandHandler,
     filters,
 )
-from chatgpt_sales_flow import is_ambiguous_followup, resolve_plan_choice
+from chatgpt_sales_flow import (
+    asks_payment_guidance,
+    is_acknowledgement,
+    is_ambiguous_followup,
+    resolve_plan_choice,
+)
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -3090,6 +3095,13 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             return "request_support_screenshot"
         if has_any_normalized_term(normalized, {"كود", "الرمز", "رمز", "code", "otp"}):
             return "code_request"
+    # «تمام» أو «أوكي» تأكيد مفهوم، لكنه لا يطلب خطوة من المتجر. هذا ينطبق
+    # على جميع مراحل البيع المفتوحة، لا على الدفع فقط.
+    if workflow_state in {
+        "awaiting_plan_choice", "awaiting_payment", "awaiting_payment_proof",
+        "account_delivered", "code_sent", "support_review",
+    } and is_acknowledgement(new_message):
+        return "no_reply"
     if workflow_state == "awaiting_plan_choice":
         # اختيار الباقة قد يصل على رسالتين: «أريد جات شهر» ثم «خاص». نجمع
         # رسائل الزبون ضمن الجلسة الحالية فقط حتى لا ننسى الجزء الأول ولا
@@ -3122,9 +3134,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     if any(term in normalized for term in {"حولت", "حولت", "دفعت"}):
         set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
         return "request_payment_proof"
-    if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and any(
-        term in normalized for term in {"هسه", "اسوي", "شنو", "شلون", "اوكي", "تمام"}
-    ):
+    if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and asks_payment_guidance(new_message):
         return "payment_methods"
     if has_any_normalized_term(normalized, {"ادفع", "الدفع", "ماستر", "زين", "رصيد", "تحويل"}):
         if workflow_state in {"awaiting_payment", "awaiting_payment_proof"}:
@@ -3150,6 +3160,14 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     ):
         set_interactive_sale_state(customer_chat_id, "awaiting_plan_choice", None, None)
         return "chatgpt_plans"
+
+    # داخل عملية بيع قائمة، أي كلام ما فهمناه لا يرجع لآخر رد ولا يخرج عن
+    # السياق. نسأل الزبون يوضح قصده.
+    if workflow_state in {
+        "awaiting_plan_choice", "awaiting_payment", "awaiting_payment_proof",
+        "account_delivered", "code_sent", "support_review",
+    }:
+        return "clarify"
 
     messages = [{"role": "system", "content": TEST_ACTION_SELECTOR_PROMPT}]
     if style_examples_text:
@@ -5167,6 +5185,8 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     # النهائية (تسليم الحساب أو طلب وصل أوضح)، بينما إشعار المراجعة
     # يبقى للأونر داخل فرع الإشعارات.
     if action_key == "payment_under_review":
+        return
+    if action_key == "no_reply":
         return
     if action_key == "payment_proof_approved":
         account = assign_shared_chatgpt_account(customer_chat_id)

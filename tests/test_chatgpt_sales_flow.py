@@ -1,6 +1,11 @@
 import unittest
 
-from chatgpt_sales_flow import is_ambiguous_followup, resolve_plan_choice
+from chatgpt_sales_flow import (
+    asks_payment_guidance,
+    is_acknowledgement,
+    is_ambiguous_followup,
+    resolve_plan_choice,
+)
 
 
 PLANS = [
@@ -48,6 +53,17 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertTrue(is_ambiguous_followup("شنو عدكم غيره"))
         self.assertFalse(is_ambiguous_followup("شنو عدكم غير الشات؟"))
         self.assertFalse(is_ambiguous_followup("شنو اسوي حتى ادفع"))
+
+    def test_acknowledgement_needs_no_reply(self):
+        self.assertTrue(is_acknowledgement("تمام"))
+        self.assertTrue(is_acknowledgement("اوكي"))
+        self.assertFalse(is_acknowledgement("زين شكد ادفع"))
+
+    def test_payment_guidance_needs_a_real_question(self):
+        self.assertTrue(asks_payment_guidance("شنو اسوي حتى ادفع"))
+        self.assertTrue(asks_payment_guidance("شلون ادفع"))
+        self.assertFalse(asks_payment_guidance("شنو"))
+        self.assertFalse(asks_payment_guidance("تمام"))
 
 
 if __name__ == "__main__":

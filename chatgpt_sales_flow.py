@@ -109,3 +109,17 @@ def is_ambiguous_followup(text: str) -> bool:
     refers_to_unspecified_alternative = bool(words & {"غيره", "غير", "بقيه", "باقي"})
     names_scope = bool(words & {"منتجات", "المنتجات", "منتج", "شات", "الشات", "chatgpt", "جات", "كانفا", "canva"})
     return asks_question and refers_to_unspecified_alternative and not names_scope
+
+
+def is_acknowledgement(text: str) -> bool:
+    """رسالة تأكيد لا تحتاج جواباً من المتجر."""
+    words = normalized_words(text)
+    return bool(words) and words <= {"تمام", "اوكي", "اوكيه", "ok", "اوك"}
+
+
+def asks_payment_guidance(text: str) -> bool:
+    """يفرق سؤال الخطوة القادمة عن كلمة عامة مثل «شنو» أو «تمام»."""
+    words = normalized_words(text)
+    has_question = bool(words & {"شنو", "شلون", "كيف"})
+    has_next_step = bool(words & {"اسوي", "سوي", "ادفع", "الدفع", "تحويل"})
+    return has_question and has_next_step
