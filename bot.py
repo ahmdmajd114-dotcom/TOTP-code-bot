@@ -52,6 +52,7 @@ from chatgpt_sales_flow import (
     is_paid_amount_sufficient,
     classify_receipt_recency,
 )
+from modesty_guard import is_flirtatious_text
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -85,6 +86,9 @@ TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر م
 TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط زبون بحساب
 TOPIC_DEBTS = int(os.environ.get("TOPIC_DEBTS", "0"))  # تسجيل دين جديد + تسديد دين — لازم تحدد رقمه الحقيقي
 SHARED_CHATGPT_ACCOUNT_CAPACITY = 3  # الحد الثابت لكل حساب ChatGPT مشترك
+# معرف المحادثة المسموح للفلتر أن يعمل عليها. يبقى في Render فقط، ولا يوضع
+# في الكود أو Git. الصفر يعني أن الفلتر متوقف بالكامل.
+MODESTY_GUARD_CHAT_ID = int(os.environ.get("MODESTY_GUARD_CHAT_ID", "0"))
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
@@ -5654,6 +5658,27 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     sender_id = bm.from_user.id if bm.from_user else None
     is_from_owner = sender_id == OWNER_USER_ID
+    chat_id = bm.chat.id
+
+    # حماية محادثة متفق عليها: لا تمرر النص للذكاء الاصطناعي ولا تحفظه في
+    # الأرشيف. نحذف فقط من المحادثة المحددة في Render، سواء كانت الرسالة
+    # مرسلة من الأونر أو من الطرف الآخر.
+    guard_text = bm.text or bm.caption
+    if (
+        MODESTY_GUARD_CHAT_ID
+        and chat_id == MODESTY_GUARD_CHAT_ID
+        and guard_text
+        and is_flirtatious_text(guard_text)
+    ):
+        try:
+            await context.bot.delete_business_messages(
+                business_connection_id=bm.business_connection_id,
+                message_ids=[bm.message_id],
+            )
+            logger.info("Modesty guard deleted a matched message")
+        except Exception:
+            logger.exception("Modesty guard could not delete a matched message")
+        return
 
     # صورة دفع جاية من الزبون (مو منك) — نحولها لمحادثتك الخاصة مع
     # البوت مع أزرار تأكيد/إلغاء عشان تبدأ تسجيل عملية الدفع
@@ -5688,8 +5713,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not text:
         return
-
-    chat_id = bm.chat.id
 
     # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
