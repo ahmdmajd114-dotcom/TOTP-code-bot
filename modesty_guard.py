@@ -20,6 +20,8 @@ def normalized_words(text: str | None) -> set[str]:
     value = re.sub(r"[أإآٱ]", "ا", value)
     value = value.replace("ى", "ي").replace("ة", "ه")
     value = re.sub(r"[^\w\u0600-\u06ff]+", " ", value)
+    # «حبيبتييي» و«فدووووه» تبقى نفس الكلمة للفلتر.
+    value = re.sub(r"(.)\1{2,}", r"\1", value)
     return {word for word in value.split() if word}
 
 

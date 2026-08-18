@@ -5651,8 +5651,8 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعالج كل الرسائل الجاية عن طريق Telegram Business (محادثتك الشخصية)."""
-    bm = update.business_message
+    """يعالج رسائل Telegram Business الجديدة والمعدلة (محادثتك الشخصية)."""
+    bm = update.business_message or update.edited_business_message
     if not bm:
         return
 
@@ -5674,6 +5674,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.info("Modesty guard deleted a matched message")
             except Exception:
                 logger.exception("Modesty guard could not delete a matched message")
+                try:
+                    await context.bot.send_message(
+                        chat_id=OWNER_USER_ID,
+                        text="⚠️ فلتر الحماية ما كدر يحذف رسالة. تأكد من صلاحية حذف كل الرسائل واتصال البوت.",
+                    )
+                except Exception:
+                    logger.exception("Could not notify owner about modesty guard deletion failure")
         # هذه المحادثة مخصصة للحماية فقط: لا FAQ ولا رد تلقائي ولا أرشفة
         # ولا فحص صور أو تحويلات أو إرسال إشعارات المتجر.
         return
@@ -5846,6 +5853,9 @@ def main() -> None:
     # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
     # Telegram Business، وهي أساس عمل البوت
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
+    # تعديل الرسالة قد يضيف كلاماً مخالفاً بعد إرسال رسالة عادية؛ نعيد تمريرها
+    # لنفس الحارس قبل أن تصل إلى أي من وظائف المتجر.
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, on_business_message))
 
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
