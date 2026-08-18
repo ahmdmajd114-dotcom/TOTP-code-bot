@@ -2984,6 +2984,45 @@ def is_chatgpt_catalog_context(text: str) -> bool:
     return any(term in normalized for term in direct_terms)
 
 
+def find_catalog_product_context(text: str) -> dict | None:
+    """يلتقط المنتج من اسمه أو الكلمات التي أضافها الأونر في الكاتالوج."""
+    words = normalize_style_text(text)
+    for product in get_catalog_products():
+        if not product.get("is_active"):
+            continue
+        product_terms = normalize_style_text(product.get("name") or "")
+        for alias in product.get("aliases") or []:
+            product_terms.update(normalize_style_text(str(alias)))
+        if words & product_terms:
+            return product
+    return None
+
+
+def find_selected_catalog_plan(product: dict, text: str) -> dict | None:
+    """يقبل اختيار باقة غير ChatGPT فقط عندما يذكر اسمها أو سعرها بوضوح."""
+    words = normalize_style_text(text)
+    plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
+    matches: list[dict] = []
+    for plan in plans:
+        plan_words = normalize_style_text(plan.get("name") or "")
+        # كلمات مثل «اشتراك» و«باقة» لا تكفي لاختيار منتج بالنيابة عن الزبون.
+        meaningful_words = plan_words - {"اشتراك", "باقة", "الباقه", "الاشتراك"}
+        explicit_price = str(plan.get("price") or "") in words
+        if explicit_price or (meaningful_words and meaningful_words <= words):
+            matches.append(plan)
+    return matches[0] if len(matches) == 1 else None
+
+
+def get_selected_catalog_product(customer_chat_id: int) -> dict | None:
+    state = get_interactive_sale_state(customer_chat_id)
+    product_id = state.get("selected_product_id")
+    return get_catalog_product(product_id) if product_id else None
+
+
+def is_chatgpt_product(product: dict | None) -> bool:
+    return bool(product and product.get("name", "").strip().lower() == "chatgpt")
+
+
 def is_plan_question(text: str) -> bool:
     normalized = " ".join(normalize_style_text(text))
     return any(term in normalized for term in {"باقه", "باقات", "سعر", "اسعار", "شكد", "خاص", "مشترك", "شهر"})
@@ -3111,7 +3150,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # «تمام» أو «أوكي» تأكيد مفهوم، لكنه لا يطلب خطوة من المتجر. هذا ينطبق
     # على جميع مراحل البيع المفتوحة، لا على الدفع فقط.
     if workflow_state in {
-        "awaiting_plan_choice", "awaiting_payment", "awaiting_payment_proof",
+        "awaiting_plan_choice", "awaiting_catalog_plan_choice", "awaiting_payment", "awaiting_payment_proof",
         "account_delivered", "code_sent", "support_review",
     } and is_acknowledgement(new_message):
         return "no_reply"
@@ -3134,6 +3173,17 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         if missing_choice:
             return missing_choice
         return "request_plan_choice"
+    if workflow_state == "awaiting_catalog_plan_choice":
+        product = get_selected_catalog_product(customer_chat_id)
+        if not product:
+            return "clarify"
+        selected_plan = find_selected_catalog_plan(product, new_message)
+        if selected_plan:
+            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], selected_plan["id"])
+            return "payment_methods"
+        # إعادة سؤال «شنو متوفر؟» أو اسم المنتج تعرض نفس باقاته، ولا ترجع
+        # إلى فلو ChatGPT ولا تطلب اختياراً أعمى.
+        return "catalog_product_plans"
     # «شكد لازم أدفع؟» بعد اختيار الباقة سؤال عن مبلغ الباقة نفسها، مو
     # طلب لإعادة أرقام الدفع. نعتمد السعر المخزّن للباقة المختارة.
     if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and is_plan_question(new_message):
@@ -3175,6 +3225,13 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     ):
         set_interactive_sale_state(customer_chat_id, "awaiting_plan_choice", None, None)
         return "chatgpt_plans"
+
+    # منتجات الكاتالوج الأخرى لها نفس منطق العرض والاختيار، لكن لا تدخل
+    # أبداً في تسليم حسابات ChatGPT.
+    catalog_product = find_catalog_product_context(new_message)
+    if catalog_product and not is_chatgpt_product(catalog_product):
+        set_interactive_sale_state(customer_chat_id, "awaiting_catalog_plan_choice", catalog_product["id"], None)
+        return "catalog_product_plans"
 
     # داخل عملية بيع قائمة، أي كلام ما فهمناه لا يرجع لآخر رد ولا يخرج عن
     # السياق. نسأل الزبون يوضح قصده.
@@ -3242,6 +3299,9 @@ def render_test_response(
         if customer_chat_id is not None:
             amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
         amount_text = f" {amount} آلاف" if amount is not None else ""
+        product = get_selected_catalog_product(customer_chat_id) if customer_chat_id is not None else None
+        if product and not is_chatgpt_product(product):
+            return f"إي تدفع أول{amount_text} على وحدة من الطرق، وبعدها دزلي صورة التحويل حتى أتأكد وأجهز طلبك."
         if is_private_chatgpt_plan(plan_name):
             return f"إي تدفع أول{amount_text} على وحدة من الطرق، وبعدها دزلي صورة التحويل حتى أتأكد وأفعّل اشتراكك."
         return f"إي تدفع أول{amount_text} على وحدة من الطرق، وبعدها دزلي صورة التحويل حتى أتأكد وأدزلك الحساب."
@@ -3261,6 +3321,16 @@ def render_test_response(
                     lines.append(f"- {plan['name']} {plan['price']}")
                 return "\n".join(lines)
         return get_reply_for_category("chatgpt") or "تدلل، خليني أتأكد من باقات الشات وأرجعلك."
+    if action_key == "catalog_product_plans":
+        product = get_selected_catalog_product(customer_chat_id) if customer_chat_id is not None else None
+        if product:
+            plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active")]
+            if plans:
+                lines = [f"بلي موجود هاي الباقات المتوفرة {product['name']}:", ""]
+                lines.extend(f"- {plan['name']} {plan['price']}" for plan in plans)
+                return "\n".join(lines)
+            return f"تدلل، {product['name']} حالياً ما بي باقات مضافة."
+        return "عفواً ما فهمت قصدك، تكدر توضحلي؟"
     templates = get_interactive_response_templates()
     return templates.get(action_key) or templates.get("handoff") or "تدلل، خليني أتأكد من الموضوع وأرجعلك."
 
@@ -5207,7 +5277,13 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         return
     if action_key == "payment_proof_approved":
         _, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
-        if is_private_chatgpt_plan(plan_name):
+        selected_product = get_selected_catalog_product(customer_chat_id)
+        if selected_product and not is_chatgpt_product(selected_product):
+            # بقية المنتجات تستخدم نفس التحقق والدفع، لكن لا يجوز أن تقع
+            # في مسار تسليم حساب ChatGPT. تجهيزها له فلو خاص لاحقاً.
+            set_interactive_sale_state(customer_chat_id, "fulfillment_pending")
+            reply = "تم تأكيد التحويل، راح أجهز طلبك وأرجعلك."
+        elif is_private_chatgpt_plan(plan_name):
             # تفعيل الخاص يحتاج صاحب المتجر؛ لا نشارك بيانات حساب مشترك ولا
             # نسمح بمسار الكود قبل أن يتم التفعيل فعلياً.
             set_interactive_sale_state(customer_chat_id, "private_activation_pending")
