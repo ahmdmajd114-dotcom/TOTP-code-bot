@@ -8,6 +8,8 @@ class ModestyGuardTests(unittest.TestCase):
         self.assertTrue(is_flirtatious_text("هلا حبيبتي شلونج"))
         self.assertTrue(is_flirtatious_text("اشتاقلك"))
         self.assertTrue(is_flirtatious_text("أحبج"))
+        self.assertTrue(is_flirtatious_text("فدوة إلك"))
+        self.assertTrue(is_flirtatious_text("فديتج"))
 
     def test_keeps_formal_messages(self):
         self.assertFalse(is_flirtatious_text("السلام عليكم، شلون الأهل؟"))
