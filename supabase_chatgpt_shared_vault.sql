@@ -4,7 +4,7 @@ create table if not exists public.chatgpt_shared_accounts (
   email text not null unique,
   password text not null,
   totp_secret text not null,
-  capacity smallint not null default 9 check (capacity between 1 and 20),
+  capacity smallint not null default 3 check (capacity between 1 and 20),
   is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
@@ -27,3 +27,7 @@ alter table public.chatgpt_account_assignments enable row level security;
 revoke all on table public.chatgpt_shared_accounts, public.chatgpt_account_assignments from anon, authenticated;
 grant select, insert, update, delete on table public.chatgpt_shared_accounts, public.chatgpt_account_assignments to service_role;
 grant usage, select on sequence public.chatgpt_account_assignments_id_seq to service_role;
+
+-- الحسابات الموجودة أيضاً تتبع الحد الجديد عند تنفيذ هذا الملف في Supabase.
+alter table public.chatgpt_shared_accounts alter column capacity set default 3;
+update public.chatgpt_shared_accounts set capacity = 3 where capacity > 3;

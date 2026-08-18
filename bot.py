@@ -84,6 +84,7 @@ TOPIC_EXPENSES = 10       # إشعار كل عملية مصروف
 TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر مع البوت
 TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط زبون بحساب
 TOPIC_DEBTS = int(os.environ.get("TOPIC_DEBTS", "0"))  # تسجيل دين جديد + تسديد دين — لازم تحدد رقمه الحقيقي
+SHARED_CHATGPT_ACCOUNT_CAPACITY = 3  # الحد الثابت لكل حساب ChatGPT مشترك
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
@@ -1097,7 +1098,10 @@ def get_chatgpt_shared_vault_summary() -> str:
         for assignment in assignments:
             account_id = assignment["account_id"]
             used_by_account[account_id] = used_by_account.get(account_id, 0) + 1
-        seats = sum(max(0, int(account["capacity"]) - used_by_account.get(account["id"], 0)) for account in active)
+        seats = sum(
+            max(0, min(int(account["capacity"]), SHARED_CHATGPT_ACCOUNT_CAPACITY) - used_by_account.get(account["id"], 0))
+            for account in active
+        )
         return f"🤖 خزينة ChatGPT المشتركة\nالحسابات المفعلة: {len(active)}\nالمقاعد المتاحة: {seats}"
     except Exception:
         logger.exception("Failed to load ChatGPT shared vault summary")
@@ -1154,14 +1158,14 @@ async def handle_shared_account_input(update: Update, context: ContextTypes.DEFA
         try:
             supabase.table("chatgpt_shared_accounts").insert({
                 "email": state["email"], "password": state["password"],
-                "totp_secret": secret, "capacity": 9,
+                "totp_secret": secret, "capacity": SHARED_CHATGPT_ACCOUNT_CAPACITY,
             }).execute()
         except Exception:
             logger.exception("Failed to add shared ChatGPT account")
             await message.reply_text("⚠️ ما انحفظ الحساب. تأكد أن الإيميل مو مضاف سابقاً.")
             return True
         context.user_data.pop("pending_shared_account", None)
-        await message.reply_text("✅ تم حفظ الحساب المشترك. سعته 9 أشخاص.")
+        await message.reply_text("✅ تم حفظ الحساب المشترك. سعته 3 أشخاص.")
         await show_chatgpt_shared_vault(message)
         return True
     return False
@@ -3410,7 +3414,7 @@ https://t.me/policy_use/2
 
 
 def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
-    """يحجز حساباً مشتركاً فيه مقعد من أصل 9 لهذه الجلسة التجريبية."""
+    """يحجز حساباً مشتركاً فيه مقعد من أصل 3 لهذه الجلسة التجريبية."""
     state = get_interactive_sale_state(customer_chat_id)
     if not state.get("id"):
         return None
@@ -3427,7 +3431,8 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
         accounts = supabase.table("chatgpt_shared_accounts").select("id, email, password, capacity").eq("is_active", True).order("created_at").execute().data or []
         for account in accounts:
             used = supabase.table("chatgpt_account_assignments").select("id", count="exact").eq("account_id", account["id"]).eq("status", "active").execute()
-            if (used.count or 0) >= int(account["capacity"]):
+            effective_capacity = min(int(account["capacity"]), SHARED_CHATGPT_ACCOUNT_CAPACITY)
+            if (used.count or 0) >= effective_capacity:
                 continue
             supabase.table("chatgpt_account_assignments").insert({
                 "account_id": account["id"], "customer_chat_id": customer_chat_id,
