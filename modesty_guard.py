@@ -25,3 +25,8 @@ def normalized_words(text: str | None) -> set[str]:
 def is_flirtatious_text(text: str | None) -> bool:
     """يعيد True فقط لعبارات غزل صريحة متفق عليها."""
     return bool(normalized_words(text) & FLIRTING_TERMS)
+
+
+def is_guarded_chat(chat_id: int, configured_chat_id: int) -> bool:
+    """لا يعمل الفلتر من دون معرف محادثة صريح."""
+    return bool(configured_chat_id and chat_id == configured_chat_id)

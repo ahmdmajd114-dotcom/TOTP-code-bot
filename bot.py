@@ -52,7 +52,7 @@ from chatgpt_sales_flow import (
     is_paid_amount_sufficient,
     classify_receipt_recency,
 )
-from modesty_guard import is_flirtatious_text
+from modesty_guard import is_flirtatious_text, is_guarded_chat
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -5664,20 +5664,18 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # الأرشيف. نحذف فقط من المحادثة المحددة في Render، سواء كانت الرسالة
     # مرسلة من الأونر أو من الطرف الآخر.
     guard_text = bm.text or bm.caption
-    if (
-        MODESTY_GUARD_CHAT_ID
-        and chat_id == MODESTY_GUARD_CHAT_ID
-        and guard_text
-        and is_flirtatious_text(guard_text)
-    ):
-        try:
-            await context.bot.delete_business_messages(
-                business_connection_id=bm.business_connection_id,
-                message_ids=[bm.message_id],
-            )
-            logger.info("Modesty guard deleted a matched message")
-        except Exception:
-            logger.exception("Modesty guard could not delete a matched message")
+    if is_guarded_chat(chat_id, MODESTY_GUARD_CHAT_ID):
+        if guard_text and is_flirtatious_text(guard_text):
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+                logger.info("Modesty guard deleted a matched message")
+            except Exception:
+                logger.exception("Modesty guard could not delete a matched message")
+        # هذه المحادثة مخصصة للحماية فقط: لا FAQ ولا رد تلقائي ولا أرشفة
+        # ولا فحص صور أو تحويلات أو إرسال إشعارات المتجر.
         return
 
     # صورة دفع جاية من الزبون (مو منك) — نحولها لمحادثتك الخاصة مع

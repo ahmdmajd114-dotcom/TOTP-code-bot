@@ -1,6 +1,6 @@
 import unittest
 
-from modesty_guard import is_flirtatious_text
+from modesty_guard import is_flirtatious_text, is_guarded_chat
 
 
 class ModestyGuardTests(unittest.TestCase):
@@ -12,3 +12,8 @@ class ModestyGuardTests(unittest.TestCase):
     def test_keeps_formal_messages(self):
         self.assertFalse(is_flirtatious_text("السلام عليكم، شلون الأهل؟"))
         self.assertFalse(is_flirtatious_text("إن شاء الله أتواصل ويا الأهل بخصوص الموضوع."))
+
+    def test_guard_never_matches_without_a_configured_chat(self):
+        self.assertFalse(is_guarded_chat(123, 0))
+        self.assertTrue(is_guarded_chat(123, 123))
+        self.assertFalse(is_guarded_chat(123, 456))
