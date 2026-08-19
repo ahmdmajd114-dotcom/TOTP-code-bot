@@ -7,6 +7,7 @@ from chatgpt_sales_flow import (
     decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
+    is_chatgpt_support_issue,
     is_payment_claim,
     is_private_chatgpt_plan,
     resolve_plan_choice,
@@ -78,6 +79,13 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertTrue(is_payment_claim("تمام حولت"))
         self.assertTrue(is_payment_claim("دفعت"))
         self.assertFalse(is_payment_claim("شلون ادفع"))
+
+    def test_chatgpt_support_is_never_treated_as_catalog_interest(self):
+        self.assertTrue(is_chatgpt_support_issue("عندي مشكلة تشات"))
+        self.assertTrue(is_chatgpt_support_issue("جات ما يفتح"))
+        self.assertTrue(is_chatgpt_support_issue("حساب ChatGPT ما يشتغل"))
+        self.assertFalse(is_chatgpt_support_issue("اريد اشتراك تشات"))
+        self.assertFalse(is_chatgpt_support_issue("كم سعر ChatGPT"))
 
     def test_private_plan_never_uses_shared_delivery(self):
         self.assertTrue(is_private_chatgpt_plan("اشتراك شهر خاص"))

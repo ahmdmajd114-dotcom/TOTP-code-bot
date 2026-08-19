@@ -138,6 +138,22 @@ def is_payment_claim(text: str) -> bool:
     return bool(normalized_words(text) & {"حولت", "دفعت", "دافعل", "محول"})
 
 
+def is_chatgpt_support_issue(text: str) -> bool:
+    """يكشف شكوى اشتراك ChatGPT، ولا يخلطها بطلب شراء أو أسعار.
+
+    الدالة نقية حتى تكون قاعدة الحماية نفسها قابلة للاختبار قبل أن تدخل
+    في وكيل المحادثة أو أي واجهة أخرى.
+    """
+    words = normalized_words(text)
+    chatgpt_terms = {"chatgpt", "chat", "gpt", "جات", "تشات", "شات", "جيبيتي"}
+    issue_terms = {
+        "مشكله", "مشكلتي", "خربان", "خرب", "متوقف", "وقف", "واقف",
+        "يرفض", "رفض", "مايشتغل", "مايفتح", "مايدخل",
+    }
+    split_failure = "ما" in words and bool(words & {"يشتغل", "يفتح", "يدخل", "صار"})
+    return bool(words & chatgpt_terms) and (bool(words & issue_terms) or split_failure)
+
+
 def is_private_chatgpt_plan(plan_name: str) -> bool:
     """الباقات الخاصة لا يجوز أن تستلم حساباً مشتركاً تلقائياً."""
     return "خاص" in normalized_words(plan_name)

@@ -45,6 +45,7 @@ from chatgpt_sales_flow import (
     decide_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
+    is_chatgpt_support_issue,
     is_payment_claim,
     is_private_chatgpt_plan,
     resolve_plan_choice,
@@ -716,6 +717,7 @@ BTN_TEACH = "📝 بدء تلقين جديد"
 BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
+BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -725,7 +727,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
-        [KeyboardButton(BTN_CHATGPT_VAULT)],
+        [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
     ],
     resize_keyboard=True,
 )
@@ -1349,6 +1351,33 @@ def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repay
     return InlineKeyboardMarkup(rows)
 
 
+def build_subscription_type_keyboard() -> InlineKeyboardMarkup:
+    """اختيار مؤكد من الأونر بعد دفع جات؛ لا نعتمد على تخمين نص الزبون."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("خاص شهر", callback_data="pay_subscription_private_1"),
+            InlineKeyboardButton("مشترك شهر", callback_data="pay_subscription_shared_1"),
+        ],
+        [
+            InlineKeyboardButton("خاص شهرين", callback_data="pay_subscription_private_2"),
+            InlineKeyboardButton("مشترك شهرين", callback_data="pay_subscription_shared_2"),
+        ],
+    ])
+
+
+def build_manual_subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("خاص شهر", callback_data="subrem_private_1"),
+            InlineKeyboardButton("مشترك شهر", callback_data="subrem_shared_1"),
+        ],
+        [
+            InlineKeyboardButton("خاص شهرين", callback_data="subrem_private_2"),
+            InlineKeyboardButton("مشترك شهرين", callback_data="subrem_shared_2"),
+        ],
+    ])
+
+
 def format_payment_summary(state: dict) -> str:
     """يبني نص الملخص المعروض فوق الأزرار أثناء تسجيل الدفع."""
     lines = ["تسجيل عملية دفع"]
@@ -1359,6 +1388,16 @@ def format_payment_summary(state: dict) -> str:
 
     product = state.get("product")
     lines.append(f"المنتج: {product if product else '— لم يُختر بعد —'}")
+
+    if product == CHATGPT_PRODUCT_NAME:
+        subscription_type = state.get("subscription_type")
+        duration_months = state.get("duration_months")
+        if subscription_type and duration_months:
+            type_text = "خاص" if subscription_type == "private" else "مشترك"
+            duration_text = "شهر" if duration_months == 1 else "شهرين"
+            lines.append(f"الاشتراك: {type_text} {duration_text}")
+        else:
+            lines.append("الاشتراك: — اختره عند تثبيت العملية —")
 
     payments = state.get("payments", [])
     if payments:
@@ -1523,6 +1562,30 @@ def upsert_chatgpt_account(
         return True
     except Exception:
         logger.exception("Failed to upsert ChatGPT account info in Google Sheet")
+        return False
+
+
+def save_subscription_reminder(state: dict) -> bool:
+    """يحفظ تنبيه الاشتراك من الاختيار اليدوي المؤكد داخل فلو الدفع الرسمي."""
+    subscription_type = state.get("subscription_type")
+    duration_months = state.get("duration_months")
+    chat_id = state.get("customer_chat_id")
+    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+        return False
+    now = datetime.now(timezone.utc)
+    try:
+        supabase.table("subscription_reminders").insert({
+            "customer_chat_id": chat_id,
+            "customer_name": state["customer_name"],
+            "customer_username": state.get("customer_username"),
+            "subscription_type": subscription_type,
+            "duration_months": duration_months,
+            "started_at": now.isoformat(),
+            "expires_at": (now + timedelta(days=30 * duration_months)).isoformat(),
+        }).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to save subscription reminder")
         return False
 
 
@@ -2862,8 +2925,12 @@ TEST_ACTION_SELECTOR_PROMPT = (
     "selected_plan_price إذا سأل عن المبلغ بعد أن اختار باقة. اختَر "
     "request_payment_proof فقط إذا قال حوّلت/دفعت ولم يرسل صورة. اختَر "
     "payment_under_review عند إرسال صورة تحويل. اختَر request_support_screenshot "
-    "لمشكلة تحتاج صورة، وhandoff للحالة الحساسة أو غير المؤكدة، وclarify إذا "
-    "الكلام غير واضح."
+    "لمشكلة تحتاج صورة. اختَر support_pending عندما يظهر من السياق أن عنده "
+    "مشكلة تقنية أو اشتراك قائم—even إذا رسالته الحالية فقط مثل: «تگدر "
+    "تساعدني؟» أو «هلو» أو تفصيل قصير للمشكلة. support_pending يعني لا "
+    "نرسل أي رد حالياً ونحافظ على سياق الدعم. اختَر no_reply للكلام الذي "
+    "لا يحتاج جواب ولا يغيّر الحالة. اختَر handoff للحالة الحساسة أو غير "
+    "المؤكدة، وclarify إذا الكلام غير واضح."
 )
 
 
@@ -2988,22 +3055,6 @@ def is_chatgpt_catalog_context(text: str) -> bool:
     return any(term in normalized for term in direct_terms)
 
 
-def is_chatgpt_support_issue(text: str) -> bool:
-    """يميز شكوى اشتراك ChatGPT كي لا تتحول بالخطأ إلى طلب باقات.
-
-    في فرع التفاعل الحالي الشكوى لا تملك مسار دعم تلقائي بعد؛ لذلك نلتزم
-    بالصمت إلى أن يضيف صاحب المتجر التفاصيل أو يطوّر مسار الدعم.
-    """
-    words = normalize_style_text(text)
-    chatgpt_terms = {"chatgpt", "chat", "gpt", "جات", "تشات", "شات", "جيبيتي"}
-    issue_terms = {
-        "مشكله", "مشكلتي", "خربان", "خرب", "متوقف", "وقف", "واقف",
-        "يرفض", "رفض", "مايشتغل", "مايفتح", "مايدخل",
-    }
-    has_split_failure = "ما" in words and bool(words & {"يشتغل", "يفتح", "يدخل", "صار"})
-    return bool(words & chatgpt_terms) and (bool(words & issue_terms) or has_split_failure)
-
-
 def find_catalog_product_context(text: str) -> dict | None:
     """يلتقط المنتج من اسمه أو الكلمات التي أضافها الأونر في الكاتالوج."""
     words = normalize_style_text(text)
@@ -3119,7 +3170,9 @@ def set_interactive_sale_state(customer_chat_id: int, workflow_state: str, produ
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """الـAI يختار إجراءً فقط؛ النص النهائي لا يولّده الذكاء الاصطناعي."""
     templates = get_interactive_response_templates()
-    allowed_actions = ["static_faq", "payment_next_step", *templates.keys()]
+    allowed_actions = [
+        "static_faq", "payment_next_step", "support_pending", "no_reply", *templates.keys(),
+    ]
     recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
     style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
     context_lines = []
@@ -3139,10 +3192,16 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
     # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
     normalized = " ".join(normalize_style_text(new_message))
+    # تبدأ الشكوى حالة سياقية، لا مجرد تجاهل لرسالة واحدة. لذلك الرسائل
+    # التالية مثل «تگدر تساعدني؟» أو «هلو» تبقى ضمن نفس الشكوى ولا تعود
+    # إلى المصنف العام أو لمسار عرض الباقات.
+    if workflow_state == "support_pending":
+        return "no_reply"
     # «عندي مشكلة تشات» ليست طلب شراء. لا نسمح بمرورها لمسار الكاتالوج
     # الذي يعرض الأسعار بمجرد رؤية كلمة «تشات». الدعم الذكي لم يفعّل بعد
-    # في فرع التفاعل، لذلك السلوك المقصود حالياً هو عدم الرد إطلاقاً.
+    # في فرع التفاعل، لذلك نثبت حالة دعم صامتة إلى أن تبدأ جلسة جديدة.
     if is_chatgpt_support_issue(new_message):
+        set_interactive_sale_state(customer_chat_id, "support_pending")
         return "no_reply"
     # بعد إرسال الوصل لا نسمح لأي كلمة لاحقة (مثل "هسة" أو "جات") أن ترجع
     # المحادثة للباقات أو للردود العامة. النتيجة الوحيدة تكون فحص الصورة ثم
@@ -3272,6 +3331,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     messages.append({
         "role": "user",
         "content": (
+            f"حالة الجلسة الحالية: {workflow_state}\n\n"
             f"سياق الجلسة الحالية:\n{context_text}\n\n"
             f"الإجراءات المسموح بها فقط: {', '.join(allowed_actions)}\n"
             "اختر action_key واحدًا فقط."
@@ -3288,6 +3348,9 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         if data is None:
             return None
         raw_action = data["choices"][0]["message"]["content"].strip().lower()
+        if raw_action == "support_pending":
+            set_interactive_sale_state(customer_chat_id, "support_pending")
+            return "no_reply"
         for action_key in allowed_actions:
             if raw_action == action_key or action_key in raw_action:
                 logger.info("Interactive selector chose %s for session %s", action_key, session_id)
@@ -3537,6 +3600,40 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
     except Exception:
         logger.exception("Failed to assign shared ChatGPT account")
     return None
+
+
+async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يرسل تنبيه انتهاء واحداً للاشتراكات المثبتة ضمن فلو الدفع الرسمي."""
+    now = datetime.now(timezone.utc)
+    try:
+        reminders = (
+            supabase.table("subscription_reminders")
+            .select("id, customer_name, customer_username, subscription_type, duration_months")
+            .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to check subscription reminders")
+        return
+
+    for reminder in reminders:
+        type_text = "خاص" if reminder["subscription_type"] == "private" else "مشترك"
+        duration_text = "شهر" if reminder["duration_months"] == 1 else "شهرين"
+        customer = reminder["customer_name"]
+        if reminder.get("customer_username"):
+            customer += f" (@{reminder['customer_username']})"
+        try:
+            # نحدّث بعد نجاح الإرسال حتى يعاد الفحص إذا تعذر إرسال التنبيه.
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(f"🔔 انتهى اشتراك {type_text} {duration_text}\n"
+                      f"الزبون: {customer}\n"
+                      "صار وقت تجديده أو ترتيب الحساب لزبون جديد."),
+            )
+            supabase.table("subscription_reminders").update({
+                "status": "expired", "expiry_notified_at": now.isoformat(),
+            }).eq("id", reminder["id"]).eq("status", "active").execute()
+        except Exception:
+            logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
 
 
 def generate_totp_code(secret: str) -> str:
@@ -3952,6 +4049,8 @@ async def handle_incoming_payment_photo(
         "pending_amount": 0,
         "awaiting_manual_amount": False,
         "awaiting_manual_product": False,
+        "subscription_type": None,
+        "duration_months": None,
     }
 
 
@@ -4002,6 +4101,22 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     data = query.data
     await query.answer()
+
+    # بعد دفع منتج «جات» الأونر هو من يثبت النوع والمدة، لذلك لا يخلط
+    # البوت بين خاص/مشترك أو شهر/شهرين من كلام الزبون وحده.
+    if data.startswith("pay_subscription_"):
+        try:
+            _, _, subscription_type, duration_text = data.split("_", 3)
+            duration_months = int(duration_text)
+        except (ValueError, TypeError):
+            await query.answer("اختيار الاشتراك غير صحيح.", show_alert=True)
+            return
+        if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+            await query.answer("اختيار الاشتراك غير صحيح.", show_alert=True)
+            return
+        state["subscription_type"] = subscription_type
+        state["duration_months"] = duration_months
+        data = "pay_finalize"
 
     # -------------------- إلغاء --------------------
     if data == "pay_cancel":
@@ -4151,7 +4266,17 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("لازم تختار منتج وطريقة دفع وحدة على الأقل قبل التثبيت.", show_alert=True)
             return
 
+        if state["product"] == CHATGPT_PRODUCT_NAME and not state.get("subscription_type"):
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر نوع ومدة الاشتراك حتى ينحفظ تنبيه نهايته:",
+                reply_markup=build_subscription_type_keyboard(),
+            )
+            return
+
         saved = append_payment_row(state)
+        subscription_saved = False
+        if saved and state["product"] == CHATGPT_PRODUCT_NAME:
+            subscription_saved = save_subscription_reminder(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
         if saved:
@@ -4186,7 +4311,8 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         del _pending_payments[message_id]
 
         if saved:
-            final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح."
+            reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
+            final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح." + reminder_note
         else:
             final_text = format_payment_summary(state) + "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
 
@@ -4247,6 +4373,60 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception("Failed to update final debt-repayment confirmation message")
         return
+
+
+async def handle_manual_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يبدأ إضافة تنبيه يدوي مستقل، حتى لو لم يمرّ عبر صورة دفع."""
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    try:
+        _, subscription_type, duration_text = query.data.split("_", 2)
+        duration_months = int(duration_text)
+    except (AttributeError, ValueError, TypeError):
+        await query.answer("اختيار غير صحيح.", show_alert=True)
+        return
+    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+        await query.answer("اختيار غير صحيح.", show_alert=True)
+        return
+    context.user_data["pending_manual_subscription"] = {
+        "subscription_type": subscription_type,
+        "duration_months": duration_months,
+    }
+    await query.answer()
+    type_text = "خاص" if subscription_type == "private" else "مشترك"
+    duration_text = "شهر" if duration_months == 1 else "شهرين"
+    await query.edit_message_text(
+        f"اختيارك: {type_text} {duration_text}\n\nاكتب اسم الزبون. وإذا عنده يوزر اكتب هكذا:\nالاسم | @username"
+    )
+
+
+async def handle_manual_subscription_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يكمل التسجيل اليدوي باسم الزبون بعد أن يختار الأونر الباقة."""
+    state = context.user_data.get("pending_manual_subscription")
+    message = update.message
+    if state is None or message is None or not message.text:
+        return False
+    name, separator, username = message.text.strip().partition("|")
+    name = name.strip()
+    if not name:
+        await message.reply_text("اكتب اسم الزبون أولاً.")
+        return True
+    username = username.strip() if separator else ""
+    saved = save_subscription_reminder({
+        "customer_chat_id": None,
+        "customer_name": name,
+        "customer_username": username or None,
+        "subscription_type": state["subscription_type"],
+        "duration_months": state["duration_months"],
+    })
+    if saved:
+        end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=30 * state["duration_months"])
+        await message.reply_text(f"✅ تم تسجيل التنبيه. ينتهي: {end.strftime('%Y-%m-%d %H:%M')}")
+        context.user_data.pop("pending_manual_subscription", None)
+    else:
+        await message.reply_text("⚠️ فشل الحفظ. تأكد من تشغيل ملف Supabase الجديد.")
+    return True
 
 
 async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -4891,6 +5071,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
+        BTN_SUBSCRIPTION_REMINDER,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -4905,6 +5086,14 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     if text == BTN_CHATGPT_VAULT:
         await show_chatgpt_shared_vault(message)
+        return True
+
+    if text == BTN_SUBSCRIPTION_REMINDER:
+        context.user_data.pop("pending_manual_subscription", None)
+        await message.reply_text(
+            "اختَر نوع ومدة الاشتراك اللي تريد تضيفه يدوياً:",
+            reply_markup=build_manual_subscription_keyboard(),
+        )
         return True
 
     if text == BTN_EXPENSE:
@@ -5504,6 +5693,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
         return
     if await handle_catalog_input(update, context):
         return
+    if await handle_manual_subscription_input(update, context):
+        return
     if await handle_manual_product_entry(update, context):
         return
     if await handle_manual_amount_entry(update, context):
@@ -5871,6 +6062,12 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # يفحص كل 15 دقيقة؛ لذلك التنبيه يصل خلال ربع ساعة كحد أقصى من النهاية.
+    if app.job_queue is None:
+        logger.error("JobQueue غير متوفر: ثبّت python-telegram-bot[job-queue] لتفعيل تنبيهات الاشتراكات.")
+    else:
+        app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
+
     # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
     # Telegram Business، وهي أساس عمل البوت
     app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, on_business_message))
@@ -5880,6 +6077,9 @@ def main() -> None:
 
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
+
+    # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
+    app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
 
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
