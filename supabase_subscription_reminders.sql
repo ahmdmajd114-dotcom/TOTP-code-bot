@@ -25,3 +25,27 @@ alter table public.subscription_reminders enable row level security;
 revoke all on table public.subscription_reminders from anon, authenticated;
 grant select, insert, update, delete on table public.subscription_reminders to service_role;
 grant usage, select on sequence public.subscription_reminders_id_seq to service_role;
+
+-- ترحيل مرة واحدة للزبائن القدامى المرتبطين حالياً بـ /link:
+-- نعطي كل واحد اشتراكاً مشتركاً لمدة شهرين من وقت تشغيل هذا الملف، حتى
+-- يبقى حق طلب الكود متاحاً ولا تحتاج تضيفهم يدوياً واحداً واحداً.
+insert into public.subscription_reminders (
+  customer_chat_id, customer_name, subscription_type, duration_months,
+  started_at, expires_at, status
+)
+select
+  link.chat_id,
+  'زبون قديم',
+  'shared',
+  2,
+  now(),
+  now() + interval '60 days',
+  'active'
+from public.totp_links as link
+where not exists (
+  select 1
+  from public.subscription_reminders as reminder
+  where reminder.customer_chat_id = link.chat_id
+    and reminder.status = 'active'
+    and reminder.expires_at > now()
+);
