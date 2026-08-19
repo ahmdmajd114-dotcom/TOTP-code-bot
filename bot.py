@@ -3711,6 +3711,22 @@ def reset_retry_state(chat_id: int) -> None:
     ).execute()
 
 
+def has_active_subscription(chat_id: int) -> bool:
+    """الكود لا يصدر إلا بوجود اشتراك مثبت ولم يصل تاريخ انتهائه بعد."""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id").eq("customer_chat_id", chat_id).eq("status", "active")
+            .gt("expires_at", datetime.now(timezone.utc).isoformat()).limit(1).execute().data or []
+        )
+        return bool(rows)
+    except Exception:
+        # عند تعذر قراءة حالة الاشتراك نختار عدم إرسال الكود؛ هذا يمنع
+        # استمرار الوصول بالخطأ بعد الانتهاء.
+        logger.exception("Failed to check active subscription for chat %s", chat_id)
+        return False
+
+
 RESTART_MESSAGE = (
     "يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
     "جرب تسوي التالي: احذف الحساب من تطبيق المصادقة (Authenticator) "
@@ -3733,6 +3749,10 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     state = _get_retry_state(chat_id)
     attempt_count = state["attempt_count"]
     awaiting_restart = state["awaiting_restart_confirmation"]
+
+    # حتى لو بقي /link موجوداً، انتهاء الاشتراك يلغي حق طلب كود جديد فوراً.
+    if not has_active_subscription(chat_id):
+        return None, False
 
     result = get_secret_for_chat(chat_id)
     if result is None:
@@ -3894,7 +3914,8 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
-            text=f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}",
+            text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                  f"chat_id للتنبيه اليدوي: {chat_id}"),
         )
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
@@ -4397,7 +4418,9 @@ async def handle_manual_subscription_callback(update: Update, context: ContextTy
     type_text = "خاص" if subscription_type == "private" else "مشترك"
     duration_text = "شهر" if duration_months == 1 else "شهرين"
     await query.edit_message_text(
-        f"اختيارك: {type_text} {duration_text}\n\nاكتب اسم الزبون. وإذا عنده يوزر اكتب هكذا:\nالاسم | @username"
+        f"اختيارك: {type_text} {duration_text}\n\n"
+        "اكتب هكذا حتى ينقطع الكود عند الانتهاء:\n"
+        "chat_id | اسم الزبون | @username (اختياري)"
     )
 
 
@@ -4407,14 +4430,15 @@ async def handle_manual_subscription_input(update: Update, context: ContextTypes
     message = update.message
     if state is None or message is None or not message.text:
         return False
-    name, separator, username = message.text.strip().partition("|")
-    name = name.strip()
-    if not name:
-        await message.reply_text("اكتب اسم الزبون أولاً.")
+    parts = [part.strip() for part in message.text.split("|", 2)]
+    if len(parts) < 2 or not parts[0].lstrip("-").isdigit() or not parts[1]:
+        await message.reply_text("الصيغة الصحيحة: chat_id | اسم الزبون | @username (اختياري)")
         return True
-    username = username.strip() if separator else ""
+    chat_id = int(parts[0])
+    name = parts[1]
+    username = parts[2] if len(parts) == 3 else ""
     saved = save_subscription_reminder({
-        "customer_chat_id": None,
+        "customer_chat_id": chat_id,
         "customer_name": name,
         "customer_username": username or None,
         "subscription_type": state["subscription_type"],
