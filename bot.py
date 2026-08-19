@@ -3961,9 +3961,9 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
                   f"chat_id للتنبيه اليدوي: {chat_id}"),
         )
-        # الدين يبدأ من لحظة الربط: نحتاج منك اختيار الباقة حتى نعطيه حق
-        # الكود فوراً ونحسب موعد الانتهاء والتنبيه بشكل صحيح.
-        if bm is not None:
+        # إذا كان دافع مسبقاً وباقته مسجلة، الربط يكفي ولا نسألك عن الدين.
+        # سؤال الدين مخصص فقط للزبون الذي لا يملك اشتراكاً فعّالاً مسجلاً.
+        if bm is not None and not has_active_subscription(chat_id):
             context.user_data["pending_link_debt"] = {
                 "customer_chat_id": chat_id,
                 "customer_name": bm.chat.full_name or bm.chat.first_name or "غير معروف",
