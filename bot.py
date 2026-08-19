@@ -54,6 +54,7 @@ from chatgpt_sales_flow import (
     classify_receipt_recency,
 )
 from modesty_guard import is_flirtatious_text, is_guarded_chat
+from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -77,6 +78,8 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])  # الـ Telegram User ID تبعك انت (owner)
+INSTAGRAM_MANAGER_USER_ID = int(os.environ.get("INSTAGRAM_MANAGER_USER_ID", "0"))
+INSTAGRAM_COMMISSION_PERCENT = int(os.environ.get("INSTAGRAM_COMMISSION_PERCENT", "25"))
 NOTIFICATIONS_GROUP_ID = int(os.environ.get("NOTIFICATIONS_GROUP_ID", "-1003771659131"))  # قروب سجل الردود
 
 # أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
@@ -108,6 +111,7 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
 )
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]  # الـ ID تبع الشيت (من رابطه)
 GOOGLE_SHEET_WORKSHEET_NAME = os.environ.get("GOOGLE_SHEET_WORKSHEET_NAME", "Sheet1")
+INSTAGRAM_SALES_WORKSHEET_NAME = os.environ.get("INSTAGRAM_SALES_WORKSHEET_NAME", "مبيعات الإنستغرام")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -183,6 +187,66 @@ def get_google_sheet():
     except Exception:
         logger.exception("Failed to connect to Google Sheets")
         return None
+
+
+_instagram_sales_sheet = None
+
+
+def get_instagram_sales_worksheet():
+    """Return/create the protected Instagram sales tab with a stable schema."""
+    global _instagram_sales_sheet
+    if _instagram_sales_sheet is not None:
+        return _instagram_sales_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _instagram_sales_sheet = spreadsheet.worksheet(INSTAGRAM_SALES_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            _instagram_sales_sheet = spreadsheet.add_worksheet(
+                title=INSTAGRAM_SALES_WORKSHEET_NAME, rows=2000, cols=14
+            )
+            _instagram_sales_sheet.append_row(
+                [
+                    "رقم العملية", "التاريخ والوقت", "يوزر الإنستغرام", "المنتج",
+                    "نوع الجات", "نوع المحفظة", "المبلغ", "النسبة %",
+                    "العمولة", "الحالة", "تم دفع العمولة؟", "المسجل",
+                    "Telegram User ID", "ملاحظات",
+                ],
+                value_input_option="USER_ENTERED",
+            )
+        return _instagram_sales_sheet
+    except Exception:
+        logger.exception("Failed to connect to Instagram sales worksheet")
+        return None
+
+
+def append_instagram_sale(sale: dict) -> bool:
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        return False
+    try:
+        sheet.append_row(
+            [
+                sale["sale_id"], sale["created_at"], sale["instagram_account"],
+                sale["product"], sale.get("chat_type") or "—", sale["wallet"],
+                sale["amount"], sale["commission_percent"], sale["commission"],
+                "مؤكدة", "لا", sale["recorded_by"], sale["recorded_by_id"],
+                sale.get("notes") or "",
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to append Instagram sale")
+        return False
 
 
 _expenses_sheet = None
@@ -718,6 +782,7 @@ BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
+BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -731,6 +796,45 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+INSTAGRAM_MANAGER_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(BTN_INSTAGRAM_SALE)]], resize_keyboard=True
+)
+
+
+def is_instagram_manager(user_id: int | None) -> bool:
+    return bool(INSTAGRAM_MANAGER_USER_ID and user_id == INSTAGRAM_MANAGER_USER_ID)
+
+
+def instagram_product_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("جات", callback_data="ig_product_جات")],
+        [InlineKeyboardButton("انكي", callback_data="ig_product_انكي"), InlineKeyboardButton("كانفا", callback_data="ig_product_كانفا")],
+        [InlineKeyboardButton("تليجرام مميز", callback_data="ig_product_تليجرام")],
+        [InlineKeyboardButton("✏️ منتج آخر", callback_data="ig_product_manual")],
+    ])
+
+
+def instagram_chat_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("خاص", callback_data="ig_type_خاص"), InlineKeyboardButton("مشترك", callback_data="ig_type_مشترك")],
+    ])
+
+
+def instagram_wallet_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(method, callback_data=f"ig_wallet_{method}")] for method in PAYMENT_METHODS]
+    return InlineKeyboardMarkup(rows)
+
+
+def instagram_sale_prompt(state: dict) -> str:
+    return (
+        "📲 تسجيل بيع إنستغرام\n\n"
+        f"المنتج: {state.get('product') or '—'}\n"
+        f"نوع الجات: {state.get('chat_type') or '—'}\n"
+        f"الحساب: {state.get('instagram_account') or '—'}\n"
+        f"المحفظة: {state.get('wallet') or '—'}\n"
+        f"المبلغ: {format_iqd(state['amount']) if state.get('amount') else '—'}"
+    )
 
 
 def get_catalog_products() -> list[dict]:
@@ -5848,11 +5952,178 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     await handle_add_account_flow(update, context)
 
 
+async def handle_instagram_manager_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Limited data-entry flow for the Instagram sales operator."""
+    message = update.message
+    if not message or not is_instagram_manager(update.effective_user.id if update.effective_user else None):
+        return False
+    state = context.user_data.get("instagram_sale")
+    if not state or not message.text:
+        return False
+    text = message.text.strip()
+
+    if state["step"] == "product":
+        state["product"] = text
+        state["step"] = "account"
+        await message.reply_text("اكتب اسم أو يوزر حساب الإنستغرام:")
+        return True
+    if state["step"] == "account":
+        if len(text) < 2:
+            await message.reply_text("اكتب اسم أو يوزر صحيح للحساب:")
+            return True
+        state["instagram_account"] = text.lstrip("@")
+        state["step"] = "wallet"
+        await message.reply_text("اختَر نوع المحفظة:", reply_markup=instagram_wallet_keyboard())
+        return True
+    if state["step"] == "amount":
+        amount = parse_amount(text)
+        if amount is None:
+            await message.reply_text("أرسل المبلغ كرقم، مثال: 25000")
+            return True
+        state["amount"] = amount
+        commission = commission_for(amount, percent=INSTAGRAM_COMMISSION_PERCENT)
+        state["step"] = "confirm"
+        await message.reply_text(
+            instagram_sale_prompt(state) +
+            f"\n\nعمولته ({INSTAGRAM_COMMISSION_PERCENT}%): {format_iqd(commission)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ حفظ العملية", callback_data="ig_confirm")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="ig_cancel")],
+            ]),
+        )
+        return True
+    return False
+
+
+async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not is_instagram_manager(query.from_user.id):
+        return
+    await query.answer()
+    data = query.data or ""
+    state = context.user_data.get("instagram_sale")
+
+    if data == "ig_cancel":
+        context.user_data.pop("instagram_sale", None)
+        await query.edit_message_text("تم إلغاء تسجيل العملية.")
+        return
+    if data == "ig_confirm":
+        if not state or state.get("step") != "confirm":
+            await query.edit_message_text("انتهت جلسة التسجيل. ابدأ عملية جديدة.")
+            return
+        sale = {
+            "sale_id": "IG-" + uuid.uuid4().hex[:10].upper(),
+            "created_at": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "instagram_account": state["instagram_account"],
+            "product": state["product"],
+            "chat_type": state.get("chat_type"),
+            "wallet": state["wallet"],
+            "amount": state["amount"],
+            "commission_percent": INSTAGRAM_COMMISSION_PERCENT,
+            "commission": commission_for(state["amount"], percent=INSTAGRAM_COMMISSION_PERCENT),
+            "recorded_by": query.from_user.full_name,
+            "recorded_by_id": query.from_user.id,
+        }
+        saved = append_instagram_sale(sale)
+        context.user_data.pop("instagram_sale", None)
+        if saved:
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=(
+                        "📲 تسجيل بيع جديد من الإنستغرام\n"
+                        f"رقم العملية: {sale['sale_id']}\n"
+                        f"الحساب: @{sale['instagram_account']}\n"
+                        f"المنتج: {sale['product']}"
+                        + (f" ({sale['chat_type']})" if sale.get("chat_type") else "")
+                        + f"\nالمبلغ: {format_iqd(sale['amount'])}"
+                        + f"\nالعمولة: {format_iqd(sale['commission'])}"
+                    ),
+                )
+            except Exception:
+                logger.exception("Failed to notify owner about Instagram sale")
+            await query.edit_message_text(
+                "✅ تم حفظ عملية بيع الإنستغرام\n"
+                f"رقم العملية: {sale['sale_id']}\n"
+                f"العمولة: {format_iqd(sale['commission'])}"
+            )
+        else:
+            await query.edit_message_text("⚠️ تعذر الحفظ في Google Sheets. أعد المحاولة أو بلغ المالك.")
+        return
+    if not state:
+        return
+    if data == "ig_product_manual":
+        state["step"] = "product"
+        await query.edit_message_text("اكتب اسم المنتج:")
+        return
+    if data.startswith("ig_product_"):
+        product = data[len("ig_product_"):]
+        state["product"] = product
+        if product == "جات":
+            state["step"] = "chat_type"
+            await query.edit_message_text("اختَر نوع الجات:", reply_markup=instagram_chat_type_keyboard())
+        else:
+            state["step"] = "account"
+            await query.edit_message_text("اكتب اسم أو يوزر حساب الإنستغرام:")
+        return
+    if data.startswith("ig_type_"):
+        state["chat_type"] = normalize_chat_type(data[len("ig_type_"):])
+        state["step"] = "account"
+        await query.edit_message_text("اكتب اسم أو يوزر حساب الإنستغرام:")
+        return
+    if data.startswith("ig_wallet_"):
+        state["wallet"] = data[len("ig_wallet_"):]
+        state["step"] = "amount"
+        await query.edit_message_text("اكتب مبلغ الدفع بالأرقام، مثال: 25000")
+
+
+async def on_instagram_manager_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_instagram_manager(update.effective_user.id if update.effective_user else None):
+        return
+    if update.message and update.message.text == BTN_INSTAGRAM_SALE:
+        context.user_data["instagram_sale"] = {
+            "step": "product", "product": None, "chat_type": None,
+            "instagram_account": None, "wallet": None, "amount": None,
+        }
+        await update.message.reply_text("اختَر المنتج:", reply_markup=instagram_product_keyboard())
+        return
+    await handle_instagram_manager_message(update, context)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب) بمحادثتك مع البوت."""
-    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+    if update.effective_user is None:
+        return
+    if is_instagram_manager(update.effective_user.id):
+        await update.message.reply_text("جاهز. من هنا تسجل مبيعات الإنستغرام فقط:", reply_markup=INSTAGRAM_MANAGER_KEYBOARD)
+        return
+    if update.effective_user.id != OWNER_USER_ID:
         return
     await update.message.reply_text("جاهز. استخدم الأزرار بالأسفل:", reply_markup=MAIN_REPLY_KEYBOARD)
+
+
+async def cmd_instagram_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only quick totals for confirmed Instagram sales."""
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        await update.message.reply_text("⚠️ تعذر الاتصال بشيت مبيعات الإنستغرام.")
+        return
+    try:
+        rows = sheet.get_all_values()[1:]
+        total = sum(int(re.sub(r"[^0-9]", "", row[6])) for row in rows if len(row) > 8 and row[6])
+        commission = sum(int(re.sub(r"[^0-9]", "", row[8])) for row in rows if len(row) > 8 and row[8])
+        await update.message.reply_text(
+            "📊 تقرير مبيعات الإنستغرام\n\n"
+            f"عدد العمليات: {len(rows)}\n"
+            f"إجمالي المبيعات: {format_iqd(total)}\n"
+            f"إجمالي العمولة ({INSTAGRAM_COMMISSION_PERCENT}%): {format_iqd(commission)}\n"
+            f"الصافي لك: {format_iqd(total - commission)}"
+        )
+    except Exception:
+        logger.exception("Failed to build Instagram report")
+        await update.message.reply_text("⚠️ تعذر قراءة تقرير مبيعات الإنستغرام.")
 
 
 async def cmd_import_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6212,6 +6483,9 @@ def main() -> None:
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
 
+    # تسجيل مبيعات الإنستغرام — متاح فقط لمعرف المدير المحدد بالبيئة.
+    app.add_handler(CallbackQueryHandler(handle_instagram_callback, pattern=r"^ig_"))
+
     # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
     app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
 
@@ -6252,6 +6526,9 @@ def main() -> None:
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
 
+    # تقرير مبيعات الإنستغرام — للأونر فقط.
+    app.add_handler(CommandHandler("instagram_report", cmd_instagram_report))
+
     # أمر /importarchive — يحوّل محادثات الأرشيف القديمة إلى أمثلة أسلوب
     # نظيفة، ويُستخدم من الأونر داخل محادثته الخاصة مع البوت فقط.
     app.add_handler(CommandHandler("importarchive", cmd_import_archive))
@@ -6265,6 +6542,13 @@ def main() -> None:
 
     # رسائل نصية عادية منك بمحادثتك الخاصة مع البوت — تستخدم حالياً
     # بس لالتقاط إدخال مبلغ يدوي أثناء تسجيل دفع (رد على رسالة الصورة)
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & filters.User(INSTAGRAM_MANAGER_USER_ID),
+            on_instagram_manager_private_message,
+        )
+    )
+
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & filters.User(OWNER_USER_ID),
