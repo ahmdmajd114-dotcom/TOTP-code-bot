@@ -2988,6 +2988,22 @@ def is_chatgpt_catalog_context(text: str) -> bool:
     return any(term in normalized for term in direct_terms)
 
 
+def is_chatgpt_support_issue(text: str) -> bool:
+    """يميز شكوى اشتراك ChatGPT كي لا تتحول بالخطأ إلى طلب باقات.
+
+    في فرع التفاعل الحالي الشكوى لا تملك مسار دعم تلقائي بعد؛ لذلك نلتزم
+    بالصمت إلى أن يضيف صاحب المتجر التفاصيل أو يطوّر مسار الدعم.
+    """
+    words = normalize_style_text(text)
+    chatgpt_terms = {"chatgpt", "chat", "gpt", "جات", "تشات", "شات", "جيبيتي"}
+    issue_terms = {
+        "مشكله", "مشكلتي", "خربان", "خرب", "متوقف", "وقف", "واقف",
+        "يرفض", "رفض", "مايشتغل", "مايفتح", "مايدخل",
+    }
+    has_split_failure = "ما" in words and bool(words & {"يشتغل", "يفتح", "يدخل", "صار"})
+    return bool(words & chatgpt_terms) and (bool(words & issue_terms) or has_split_failure)
+
+
 def find_catalog_product_context(text: str) -> dict | None:
     """يلتقط المنتج من اسمه أو الكلمات التي أضافها الأونر في الكاتالوج."""
     words = normalize_style_text(text)
@@ -3123,6 +3139,11 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
     # بالتجربة: "رايد جات" يجب أن يعرض الباقات، لا أن يطلب اختيارها.
     normalized = " ".join(normalize_style_text(new_message))
+    # «عندي مشكلة تشات» ليست طلب شراء. لا نسمح بمرورها لمسار الكاتالوج
+    # الذي يعرض الأسعار بمجرد رؤية كلمة «تشات». الدعم الذكي لم يفعّل بعد
+    # في فرع التفاعل، لذلك السلوك المقصود حالياً هو عدم الرد إطلاقاً.
+    if is_chatgpt_support_issue(new_message):
+        return "no_reply"
     # بعد إرسال الوصل لا نسمح لأي كلمة لاحقة (مثل "هسة" أو "جات") أن ترجع
     # المحادثة للباقات أو للردود العامة. النتيجة الوحيدة تكون فحص الصورة ثم
     # التسليم تلقائياً عند القبول، أو طلب وصل صحيح عند الرفض.
