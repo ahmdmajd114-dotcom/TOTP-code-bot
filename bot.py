@@ -1365,6 +1365,26 @@ def build_subscription_type_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_link_debt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ نعم، دين", callback_data="linkdebt_yes"),
+        InlineKeyboardButton("❌ لا، مو دين", callback_data="linkdebt_no"),
+    ]])
+
+
+def build_link_debt_plan_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("خاص شهر", callback_data="linkplan_private_1"),
+            InlineKeyboardButton("مشترك شهر", callback_data="linkplan_shared_1"),
+        ],
+        [
+            InlineKeyboardButton("خاص شهرين", callback_data="linkplan_private_2"),
+            InlineKeyboardButton("مشترك شهرين", callback_data="linkplan_shared_2"),
+        ],
+    ])
+
+
 def build_manual_subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -1580,6 +1600,7 @@ def save_subscription_reminder(state: dict) -> bool:
             "customer_username": state.get("customer_username"),
             "subscription_type": subscription_type,
             "duration_months": duration_months,
+            "is_debt": bool(state.get("is_debt", False)),
             "started_at": now.isoformat(),
             "expires_at": (now + timedelta(days=30 * duration_months)).isoformat(),
         }).execute()
@@ -3940,6 +3961,20 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
                   f"chat_id للتنبيه اليدوي: {chat_id}"),
         )
+        # الدين يبدأ من لحظة الربط: نحتاج منك اختيار الباقة حتى نعطيه حق
+        # الكود فوراً ونحسب موعد الانتهاء والتنبيه بشكل صحيح.
+        if bm is not None:
+            context.user_data["pending_link_debt"] = {
+                "customer_chat_id": chat_id,
+                "customer_name": bm.chat.full_name or bm.chat.first_name or "غير معروف",
+                "customer_username": bm.chat.username,
+                "account_label": label or link_code,
+            }
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text="هل هذا الزبون دين؟",
+                reply_markup=build_link_debt_keyboard(),
+            )
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
             customer_username_for_topic = bm.chat.username if bm is not None else None
@@ -4417,6 +4452,58 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception("Failed to update final debt-repayment confirmation message")
         return
+
+
+async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يكمل سؤال الدين الذي يظهر مباشرة بعد /link."""
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    state = context.user_data.get("pending_link_debt")
+    if state is None:
+        await query.answer("انتهت صلاحية هذا السؤال.", show_alert=True)
+        return
+    await query.answer()
+    if query.data == "linkdebt_no":
+        context.user_data.pop("pending_link_debt", None)
+        await query.edit_message_text("تمام، تم الربط بدون تسجيل دين.")
+        return
+    if query.data == "linkdebt_yes":
+        await query.edit_message_text(
+            "تمام، هذا دين. اختَر نوع ومدة الاشتراك؛ من الآن يبدأ الحساب ويسمح له بطلب الكود.",
+            reply_markup=build_link_debt_plan_keyboard(),
+        )
+        return
+    if not query.data.startswith("linkplan_"):
+        return
+    try:
+        _, subscription_type, duration_text = query.data.split("_", 2)
+        duration_months = int(duration_text)
+    except (ValueError, TypeError):
+        await query.edit_message_text("⚠️ اختيار الباقة غير صحيح.")
+        return
+    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+        await query.edit_message_text("⚠️ اختيار الباقة غير صحيح.")
+        return
+
+    saved = save_subscription_reminder({
+        **state,
+        "subscription_type": subscription_type,
+        "duration_months": duration_months,
+        "is_debt": True,
+    })
+    if not saved:
+        await query.edit_message_text("⚠️ تم الربط، بس فشل تسجيل اشتراك الدين. تأكد من تشغيل SQL الجديد.")
+        return
+    context.user_data.pop("pending_link_debt", None)
+    type_text = "خاص" if subscription_type == "private" else "مشترك"
+    duration_text = "شهر" if duration_months == 1 else "شهرين"
+    end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=30 * duration_months)
+    await query.edit_message_text(
+        f"✅ تم تسجيل دين: {type_text} {duration_text}\n"
+        f"الكود متاح للزبون من هسه.\n"
+        f"ينتهي الاشتراك: {end.strftime('%Y-%m-%d %H:%M')}"
+    )
 
 
 async def handle_manual_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6127,6 +6214,9 @@ def main() -> None:
 
     # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
     app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
+
+    # سؤال الدين والباقته بعد ربط زبون بحساب /link.
+    app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan)_"))
 
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))

@@ -7,6 +7,7 @@ create table if not exists public.subscription_reminders (
   customer_username text,
   subscription_type text not null check (subscription_type in ('private', 'shared')),
   duration_months smallint not null check (duration_months in (1, 2)),
+  is_debt boolean not null default false,
   started_at timestamptz not null default now(),
   expires_at timestamptz not null,
   status text not null default 'active' check (status in ('active', 'expired', 'cancelled')),
@@ -20,6 +21,9 @@ create index if not exists subscription_reminders_due_idx
 -- توافق إذا كان الجدول قد شُغّل قبل إضافة التسجيل اليدوي.
 alter table public.subscription_reminders
   alter column customer_chat_id drop not null;
+
+alter table public.subscription_reminders
+  add column if not exists is_debt boolean not null default false;
 
 alter table public.subscription_reminders enable row level security;
 revoke all on table public.subscription_reminders from anon, authenticated;
