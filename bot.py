@@ -3608,7 +3608,7 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
     try:
         reminders = (
             supabase.table("subscription_reminders")
-            .select("id, customer_name, customer_username, subscription_type, duration_months")
+            .select("id, customer_chat_id, customer_name, customer_username, subscription_type, duration_months")
             .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
         )
     except Exception:
@@ -3622,16 +3622,25 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
         if reminder.get("customer_username"):
             customer += f" (@{reminder['customer_username']})"
         try:
-            # نحدّث بعد نجاح الإرسال حتى يعاد الفحص إذا تعذر إرسال التنبيه.
+            supabase.table("subscription_reminders").update({
+                "status": "expired", "expiry_notified_at": now.isoformat(),
+            }).eq("id", reminder["id"]).eq("status", "active").execute()
+
+            # إذا لم يبقَ للزبون اشتراك فعّال آخر (مثلاً جدد مقدماً)، نفك
+            # /link أيضاً. لذلك عداد زبائن الحساب بالإحصائيات ينقص فوراً.
+            unlinked = False
+            chat_id = reminder.get("customer_chat_id")
+            if chat_id is not None and can_unlink_expired_customer(chat_id):
+                supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
+                unlinked = True
+
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=(f"🔔 انتهى اشتراك {type_text} {duration_text}\n"
                       f"الزبون: {customer}\n"
-                      "صار وقت تجديده أو ترتيب الحساب لزبون جديد."),
+                      + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
+                      + "صار وقت تجديده أو ترتيب الحساب لزبون جديد."),
             )
-            supabase.table("subscription_reminders").update({
-                "status": "expired", "expiry_notified_at": now.isoformat(),
-            }).eq("id", reminder["id"]).eq("status", "active").execute()
         except Exception:
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
 
@@ -3724,6 +3733,20 @@ def has_active_subscription(chat_id: int) -> bool:
         # عند تعذر قراءة حالة الاشتراك نختار عدم إرسال الكود؛ هذا يمنع
         # استمرار الوصول بالخطأ بعد الانتهاء.
         logger.exception("Failed to check active subscription for chat %s", chat_id)
+        return False
+
+
+def can_unlink_expired_customer(chat_id: int) -> bool:
+    """لا نفك الربط إذا كان للزبون تجديد فعّال آخر؛ عند خطأ قاعدة البيانات نبقيه."""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id").eq("customer_chat_id", chat_id).eq("status", "active")
+            .gt("expires_at", datetime.now(timezone.utc).isoformat()).limit(1).execute().data or []
+        )
+        return not rows
+    except Exception:
+        logger.exception("Failed to determine whether expired customer can be unlinked: %s", chat_id)
         return False
 
 
