@@ -1244,8 +1244,9 @@ async def show_payment_methods(message) -> None:
 def get_chatgpt_shared_vault_summary() -> str:
     """يعرض إحصاء الخزينة بدون كشف الإيميلات أو كلمات المرور."""
     try:
-        accounts = supabase.table("chatgpt_shared_accounts").select("id, capacity, is_active").execute().data or []
-        active = [account for account in accounts if account.get("is_active")]
+        native_accounts = supabase.table("chatgpt_shared_accounts").select("id, capacity, is_active").execute().data or []
+        active = [account for account in native_accounts if account.get("is_active")]
+        legacy_accounts = supabase.table("totp_accounts").select("id, label, link_code").execute().data or []
         assignments = supabase.table("chatgpt_account_assignments").select("account_id").eq("status", "active").execute().data or []
         used_by_account: dict[str, int] = {}
         for assignment in assignments:
@@ -1255,15 +1256,21 @@ def get_chatgpt_shared_vault_summary() -> str:
             max(0, min(int(account["capacity"]), SHARED_CHATGPT_ACCOUNT_CAPACITY) - used_by_account.get(account["id"], 0))
             for account in active
         )
-        return f"🤖 خزينة ChatGPT المشتركة\nالحسابات المفعلة: {len(active)}\nالمقاعد المتاحة: {seats}"
+        native_names = set()
+        native_rows = supabase.table("chatgpt_shared_accounts").select("email").execute().data or []
+        native_names = {(account.get("email") or "").strip().lower() for account in native_rows}
+        legacy_only_count = sum(1 for account in legacy_accounts if (account.get("label") or account.get("link_code") or "").strip().lower() not in native_names)
+        return f"🤖 خزينة ChatGPT المشتركة\nالحسابات المفعلة: {len(active) + legacy_only_count}\nالمقاعد المتاحة: {seats}"
     except Exception:
         logger.exception("Failed to load ChatGPT shared vault summary")
         return "⚠️ ما كدرت أقرأ خزينة حسابات ChatGPT."
 
 
 def get_chatgpt_shared_accounts() -> list[dict]:
+    """يرجع الحسابات الجديدة والقديمة بقائمة خزينة موحدة."""
+    accounts: list[dict] = []
     try:
-        return (
+        accounts.extend(
             supabase.table("chatgpt_shared_accounts")
             .select("id, email, is_active, capacity")
             .eq("is_active", True)
@@ -1272,21 +1279,48 @@ def get_chatgpt_shared_accounts() -> list[dict]:
         )
     except Exception:
         logger.exception("Failed to fetch shared ChatGPT accounts")
-        return []
+    try:
+        legacy_accounts = (
+            supabase.table("totp_accounts")
+            .select("id, link_code, label")
+            .order("created_at")
+            .execute().data or []
+        )
+        existing_names = {str(account.get("email") or "").strip().lower() for account in accounts}
+        for account in legacy_accounts:
+            name = (account.get("label") or account.get("link_code") or "").strip()
+            if name.lower() in existing_names:
+                continue
+            accounts.append({
+                "id": f"legacy:{account['id']}",
+                "legacy_id": account["id"],
+                "email": name,
+                "is_active": True,
+                "capacity": SHARED_CHATGPT_ACCOUNT_CAPACITY,
+                "source": "legacy",
+            })
+    except Exception:
+        logger.exception("Failed to fetch legacy shared ChatGPT accounts")
+    return accounts
 
 
 def build_shared_vault_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         f"{account.get('email') or 'حساب بدون اسم'}",
-        callback_data=f"vault_account_{account['id']}",
+        callback_data=(
+            f"vault_legacy_account_{account['legacy_id']}"
+            if account.get("source") == "legacy"
+            else f"vault_account_{account['id']}"
+        ),
     )] for account in accounts]
     rows.append([InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_shared_account_actions_keyboard(account_id: str) -> InlineKeyboardMarkup:
+def build_shared_account_actions_keyboard(account_id: str, legacy: bool = False) -> InlineKeyboardMarkup:
+    prefix = "vault_legacy_relogin_" if legacy else "vault_relogin_"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📣 إرسال طلب إعادة تسجيل الدخول", callback_data=f"vault_relogin_{account_id}")],
+        [InlineKeyboardButton("📣 إرسال طلب إعادة تسجيل الدخول", callback_data=f"{prefix}{account_id}")],
         [InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")],
     ])
 
@@ -1405,6 +1439,18 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
             reply_markup=build_shared_account_actions_keyboard(account_id),
         )
         return
+    if query.data.startswith("vault_legacy_account_"):
+        account_id = query.data[len("vault_legacy_account_"):]
+        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]
+        if not accounts:
+            await query.edit_message_text("الحساب غير موجود.")
+            return
+        await query.edit_message_text(
+            f"الحساب المشترك:\n{accounts[0].get('email') or '—'}\n\n"
+            "هذا حساب مضاف بالطريقة القديمة /addaccount، لكنه صار ضمن نفس خزينة الحسابات.",
+            reply_markup=build_shared_account_actions_keyboard(account_id, legacy=True),
+        )
+        return
     if query.data.startswith("vault_relogin_"):
         account_id = query.data[len("vault_relogin_"):]
         sent, failed = await send_shared_account_relogin_notifications(context, account_id)
@@ -1412,6 +1458,17 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
             f"✅ تم إرسال الرسالة إلى {sent} مشترك فعّال."
             + (f"\n⚠️ فشل الإرسال إلى {failed}." if failed else "")
             + "\n\nإذا تريد ترسلها مرة ثانية، افتح الحساب واضغط الزر من جديد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")]]),
+        )
+        return
+    if query.data.startswith("vault_legacy_relogin_"):
+        account_id = query.data[len("vault_legacy_relogin_"):]
+        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]
+        account_name = accounts[0].get("email") if accounts else "الحساب المشترك"
+        sent, failed = await send_legacy_shared_account_relogin_notifications(context, account_id, account_name)
+        await query.edit_message_text(
+            f"✅ تم إرسال الرسالة إلى {sent} مشترك فعّال."
+            + (f"\n⚠️ فشل الإرسال إلى {failed}." if failed else ""),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")]]),
         )
         return
@@ -1459,6 +1516,17 @@ async def handle_shared_account_input(update: Update, context: ContextTypes.DEFA
             logger.exception("Failed to add shared ChatGPT account")
             await message.reply_text("⚠️ ما انحفظ الحساب. تأكد أن الإيميل مو مضاف سابقاً.")
             return True
+        try:
+            # نخلي الحساب الجديد معروفاً أيضاً لمسار /link القديم.
+            legacy_exists = supabase.table("totp_accounts").select("id").eq("label", state["email"]).limit(1).execute().data or []
+            if not legacy_exists:
+                supabase.table("totp_accounts").insert({
+                    "link_code": "vault_" + uuid.uuid4().hex[:12],
+                    "secret": secret,
+                    "label": state["email"],
+                }).execute()
+        except Exception:
+            logger.exception("Failed to mirror new shared account into legacy accounts")
         context.user_data.pop("pending_shared_account", None)
         await message.reply_text("✅ تم حفظ الحساب المشترك. سعته 3 أشخاص.")
         await show_chatgpt_shared_vault(message)
