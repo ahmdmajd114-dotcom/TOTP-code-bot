@@ -1199,6 +1199,38 @@ def get_payment_methods() -> list[dict]:
         return []
 
 
+def upsert_customer_contact(
+    platform: str,
+    external_id: str,
+    display_name: str | None = None,
+    username: str | None = None,
+    chat_id: int | None = None,
+    business_connection_id: str | None = None,
+) -> bool:
+    """يحفظ جهة اتصال بشكل دائم حتى لا يعتمد سجل العملاء على ذاكرة البوت."""
+    if not platform or not external_id:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "platform": platform,
+        "external_id": str(external_id),
+        "display_name": display_name,
+        "username": username,
+        "chat_id": chat_id,
+        "business_connection_id": business_connection_id,
+        "last_seen_at": now,
+    }
+    try:
+        supabase.table("customer_contacts").upsert(
+            payload,
+            on_conflict="platform,external_id",
+        ).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to upsert customer contact %s:%s", platform, external_id)
+        return False
+
+
 def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"{'✅' if row['is_active'] else '⏸️'} {row['name']}", callback_data=f"pm_{row['id']}")] for row in methods]
     rows.append([InlineKeyboardButton("➕ إضافة طريقة دفع", callback_data="pm_add")])
@@ -6384,6 +6416,15 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             "recorded_by_id": query.from_user.id,
         }
         saved = append_instagram_sale(sale)
+        if saved and sale.get("instagram_account"):
+            # هذا الحقل هو المعرف الذي يدخله مدير مبيعات الإنستغرام.
+            # إذا كان يوزر الزبون، يبقى محفوظاً ضمن سجل العملاء للرسائل المستقبلية.
+            upsert_customer_contact(
+                platform="instagram",
+                external_id=sale["instagram_account"].lstrip("@"),
+                display_name=sale["instagram_account"],
+                username=sale["instagram_account"].lstrip("@"),
+            )
         context.user_data.pop("instagram_sale", None)
         if saved:
             try:
@@ -6636,6 +6677,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     sender_id = bm.from_user.id if bm.from_user else None
     is_from_owner = sender_id == OWNER_USER_ID
     chat_id = bm.chat.id
+
+    # سجل دائم للمستخدم من أول تعامل، مستقل عن أرشيف الرسائل.
+    if not is_from_owner:
+        upsert_customer_contact(
+            platform="telegram",
+            external_id=str(chat_id),
+            display_name=bm.chat.full_name or bm.chat.first_name or "غير معروف",
+            username=bm.chat.username,
+            chat_id=chat_id,
+            business_connection_id=bm.business_connection_id,
+        )
 
     # حماية محادثة متفق عليها: لا تمرر النص للذكاء الاصطناعي ولا تحفظه في
     # الأرشيف. نحذف فقط من المحادثة المحددة في Render، سواء كانت الرسالة
