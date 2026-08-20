@@ -587,7 +587,7 @@ _pending_debt: dict | None = None
 _teaching_session: dict | None = None
 
 # ------------------------------------------------------------------
-# حد أقصى 3 صور دفع لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
+# حد أقصى صورة دفع وحدة لكل زبون خلال آخر 6 ساعات — الهدف منع إزعاج
 # متكرر من زبون يرسل سكرين شوت كثير لنفس عملية الدفع. المفتاح هو
 # customer_chat_id، والقيمة قائمة بأوقات وصول الصور المقبولة (تلقائياً
 # فقط، مو صور accept اليدوي) خلال النافذة الحالية.
@@ -595,16 +595,50 @@ _teaching_session: dict | None = None
 PHOTO_RATE_LIMIT_MAX = 1
 PHOTO_RATE_LIMIT_WINDOW_HOURS = 6
 _photo_timestamps: dict[int, list[datetime]] = {}
+_processed_business_photo_keys: set[tuple[int, int, bool]] = set()
+
+
+def has_recent_photo_marker(chat_id: int, sender_type: str) -> bool:
+    """يفحص علامة الصورة الدائمة حتى لا يتصفر الحد بعد restart/deploy."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=PHOTO_RATE_LIMIT_WINDOW_HOURS)
+    try:
+        rows = (
+            supabase.table("conversation_archive")
+            .select("id")
+            .eq("customer_chat_id", chat_id)
+            .eq("sender_type", sender_type)
+            .eq("image_description", "[photo_rate_limit_marker]")
+            .gte("created_at", cutoff.isoformat())
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        return bool(rows)
+    except Exception:
+        logger.exception("Failed to check persistent photo rate limit")
+        return False
+
+
+def archive_photo_rate_limit_marker(chat_id: int, sender_type: str) -> None:
+    """يسجل أن الصورة دخلت الفلو حتى يبقى حد الست ساعات محفوظاً."""
+    archive_message(
+        chat_id, None, None, sender_type=sender_type,
+        image_description="[photo_rate_limit_marker]",
+    )
 
 
 def is_photo_within_rate_limit(customer_chat_id: int) -> bool:
     """
-    يتحقق هل هذي الصورة ضمن حد 3 صور/6 ساعات لهذا الزبون. لو نعم،
+    يتحقق هل هذي الصورة ضمن حد صورة وحدة/6 ساعات لهذا الزبون. لو نعم،
     يسجل وقت وصولها ويرجع True (نحول الصورة عادي). لو تجاوز الحد،
     يرجع False بدون ما يسجل شي (الصورة تتجاهل بالكامل).
     """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=PHOTO_RATE_LIMIT_WINDOW_HOURS)
+
+    if has_recent_photo_marker(customer_chat_id, "customer"):
+        return False
 
     timestamps = _photo_timestamps.get(customer_chat_id, [])
     # نشيل أي وقت أقدم من النافذة الحالية (منتهي الصلاحية)
@@ -632,6 +666,9 @@ def is_owner_photo_within_rate_limit() -> bool:
     global _owner_photo_timestamps
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=PHOTO_RATE_LIMIT_WINDOW_HOURS)
+
+    if has_recent_photo_marker(OWNER_USER_ID, "owner"):
+        return False
 
     timestamps = [t for t in _owner_photo_timestamps if t > cutoff]
 
@@ -4755,7 +4792,7 @@ async def handle_incoming_payment_photo(
     مع البوت (مو Business) مع زرين: تأكيد/إلغاء، ونحفظ بيانات الزبون
     بحالة مؤقتة عشان نربطها لاحقاً بعملية التسجيل.
 
-    محدودة بـ 3 صور/6 ساعات لكل زبون — أي صورة تتجاوز الحد تُتجاهل
+    محدودة بصورة وحدة/6 ساعات لكل زبون — أي صورة تتجاوز الحد تُتجاهل
     بالكامل (بدون تحويل وبدون حفظ)، وتقدر تحول أي وحدة منهن يدوياً
     بالرد عليها بكلمة accept بمحادثتك مع الزبون (Business) —
     bypass_rate_limit=True تُستخدم بالضبط بهذي الحالة لتخطي الحد.
@@ -4798,6 +4835,7 @@ async def handle_incoming_payment_photo(
         "plan_duration": None,
         "duration_days": None,
     }
+    archive_photo_rate_limit_marker(customer_chat_id, "customer")
 
 
 async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, photo) -> None:
@@ -4825,6 +4863,7 @@ async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAU
         return
 
     _pending_expense_photo_confirm[sent.message_id] = {"file_id": file_id}
+    archive_photo_rate_limit_marker(OWNER_USER_ID, "owner")
 
 
 async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7006,6 +7045,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # صورة دفع جاية من الزبون (مو منك) — نحولها لمحادثتك الخاصة مع
     # البوت مع أزرار تأكيد/إلغاء عشان تبدأ تسجيل عملية الدفع
     if bm.photo and not is_from_owner:
+        photo_key = (chat_id, bm.message_id, False)
+        if photo_key in _processed_business_photo_keys:
+            logger.info("Ignoring duplicate business photo update: %s", photo_key)
+            return
+        _processed_business_photo_keys.add(photo_key)
         # نشغل وصف الصورة بالأرشيف كـ task موازي منفصل — ما يبطئ ولا
         # يأثر على فلو تأكيد الدفع الأساسي (كل وحدة تشتغل لحالها)
         asyncio.create_task(describe_and_archive_customer_photo(context, bm))
@@ -7016,6 +7060,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # مصروف، نحولها لمحادثتك مع البوت ونسألك تأكيد. بالتوازي، نؤرشفها
     # (وصف بالذكاء الاصطناعي) بدون ما يأثر على فلو المصروف
     if bm.photo and is_from_owner:
+        photo_key = (chat_id, bm.message_id, True)
+        if photo_key in _processed_business_photo_keys:
+            logger.info("Ignoring duplicate owner business photo update: %s", photo_key)
+            return
+        _processed_business_photo_keys.add(photo_key)
         asyncio.create_task(describe_and_archive_owner_photo(context, bm))
         await handle_owner_expense_photo(update, context, bm.photo)
         return
