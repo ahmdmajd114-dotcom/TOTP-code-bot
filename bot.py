@@ -450,25 +450,48 @@ def process_debt_repayment(row_number: int, remaining_before: int, paid_amount: 
 
 
 # ------------------------------------------------------------------
-# منع تكرار ردود الـ FAQ لنفس الزبون خلال ساعة — نفس نظام النظام
-# القديم. مخزن بذاكرة البرنامج (ينمحي عند اعادة تشغيل البوت، وهذا
-# مقبول). المفتاح: (chat_id, category) → آخر وقت انبعث فيه هذا الرد.
+# منع تكرار ردود الـ FAQ لنفس الزبون خلال ست ساعات. نتحقق من الأرشيف حتى
+# يبقى المنع فعالاً بعد إعادة التشغيل أو إعادة النشر، ونستخدم الذاكرة أيضاً
+# لمنع تكرارين متزامنين قبل اكتمال الأرشفة.
 # ------------------------------------------------------------------
-FAQ_REPEAT_COOLDOWN_SECONDS = 60 * 60  # ساعة كاملة
+FAQ_REPEAT_COOLDOWN_SECONDS = 6 * 60 * 60
 _faq_reply_log: dict[tuple[int, str], datetime] = {}
 
 
-def should_send_faq_reply(chat_id: int, category: str) -> bool:
+def should_send_faq_reply(chat_id: int, category: str, reply_text: str) -> bool:
     """
-    يتحقق هل نرسل رد هذي الفئة لهذا الزبون الحين، أو انتظرناها خلال
-    آخر ساعة (ونتجاهلها منعا للتكرار). يحدّث الطابع الزمني لو رح نرسل.
+    يمنع تكرار رد فئة FAQ لنفس الزبون والرد نفسه خلال ست ساعات.
+    الفحص من conversation_archive يبقى فعالاً بعد restart/deploy.
     """
     key = (chat_id, category)
     now = datetime.now(timezone.utc)
-    last_sent = _faq_reply_log.get(key)
+    last_memory_reply = _faq_reply_log.get(key)
+    if last_memory_reply is not None:
+        if (now - last_memory_reply).total_seconds() < FAQ_REPEAT_COOLDOWN_SECONDS:
+            return False
+        _faq_reply_log.pop(key, None)
 
-    if last_sent is not None and (now - last_sent) < timedelta(seconds=FAQ_REPEAT_COOLDOWN_SECONDS):
-        return False
+    try:
+        archived = (
+            supabase.table("conversation_archive")
+            .select("created_at")
+            .eq("customer_chat_id", chat_id)
+            .eq("sender_type", "bot")
+            .ilike("message_text", f"%{reply_text}%")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if archived.data:
+            latest_created_at = datetime.fromisoformat(
+                archived.data[0]["created_at"].replace("Z", "+00:00")
+            )
+            if (now - latest_created_at).total_seconds() < FAQ_REPEAT_COOLDOWN_SECONDS:
+                _faq_reply_log[key] = latest_created_at
+                return False
+    except Exception:
+        # إذا كان الأرشيف غير متاح، تبقى حماية الذاكرة فعالة ولا نوقف الرد.
+        logger.exception("Failed to check persistent FAQ reply history")
 
     _faq_reply_log[key] = now
     return True
@@ -669,9 +692,10 @@ FAQ_RULES = [
     (
         "chatgpt",
         [
-            "chatgpt", "chat gpt", "جات", "چات", "جي بي تي", "شات جي بي تي",
-            "شات", "چات جي بي تي", "شات جيبيتي", "جيبيتي", "gpt",
-            "open ai", "openai", "اوبن اي اي", "چاتجيبيتي", "جاتي",
+            "chatgpt", "chat gpt", "chat", "جات", "چات", "جي بي تي",
+            "شات جي بي تي", "شات", "چات جي بي تي", "شات جيبيتي",
+            "جيبيتي", "gpt", "open ai", "openai", "اوبن اي اي",
+            "چاتجيبيتي", "جاتي",
         ],
         "بلي موجود هاي الباقات المتوفرة Chat GPT\n"
         "اشتراك خاص شهر 25\n"
@@ -727,10 +751,8 @@ FAQ_RULES = [
     (
         "تليجرام_مميز",
         [
-            "تلي مميز", "التلي مميز", "تليجرام مميز", "التليجرام مميز",
-            "تلغرام مميز", "التلغرام مميز", "تليغرام مميز", "تليكرام مميز",
-            "تليجرام بريميوم", "تلغرام بريميوم", "اشتراك مميز",
-            "telegram premium", "premium", "بريميوم",
+            "تليجرام", "التليجرام", "تلغرام", "التلغرام", "تليغرام",
+            "التليغرام", "تليكرام", "التليكرام", "telegram", "تلي",
         ],
         "متوفر تلث اشهر ب 25 اما السة ب 35 والسنة ب55 الف",
     ),
@@ -7061,12 +7083,14 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 should_notify_stopped = True
             continue
 
-        # فئة FAQ عادية — منع تكرار نفس الرد لنفس الزبون خلال ساعة
+        # فئة FAQ عادية — لا نكرر نفس الرد لنفس الزبون حتى بعد restart/deploy.
         # التعديل يُعامل كرسالة جديدة: مثلاً «كانفات» ثم تعديلها إلى «كانفا»
         # يجب أن يشغّل رد Canva حتى لو كانت المحاولة الأولى قبل دقائق.
-        if not is_edited_message and not should_send_faq_reply(chat_id, category):
-            continue
         reply_text = get_reply_for_category(category)
+        if not reply_text:
+            continue
+        if not is_edited_message and not should_send_faq_reply(chat_id, category, reply_text):
+            continue
         if reply_text:
             replies_to_send.append(reply_text)
 
