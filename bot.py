@@ -727,8 +727,10 @@ FAQ_RULES = [
     (
         "تليجرام_مميز",
         [
-            "تلي مميز", "تليجرام مميز", "تليكرام مميز", "تليجرام بريميوم",
-            "telegram premium", "premium",
+            "تلي مميز", "التلي مميز", "تليجرام مميز", "التليجرام مميز",
+            "تلغرام مميز", "التلغرام مميز", "تليغرام مميز", "تليكرام مميز",
+            "تليجرام بريميوم", "تلغرام بريميوم", "اشتراك مميز",
+            "telegram premium", "premium", "بريميوم",
         ],
         "متوفر تلث اشهر ب 25 اما السة ب 35 والسنة ب55 الف",
     ),
@@ -3893,20 +3895,33 @@ def keyword_match_categories(text: str) -> list[str]:
     المصنف الأساسي — مطابقة كلمات مفتاحية مباشرة (بدون ذكاء اصطناعي).
     يرجع قائمة فئات مرتبة حسب موقع ظهور الكلمة المفتاحية بالرسالة.
     """
+    # وحّد اختلافات الكتابة العربية والتكرار قبل البحث؛ الرسائل الواردة من
+    # الزبائن كثيراً ما تكون مثل «تلغرام»، «تليغرام» أو «شاتتت».
     normalized = text.strip().lower()
+    normalized = re.sub(r"[أإآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"(.)\1{2,}", r"\1", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
     matches: list[tuple[int, str]] = []  # (موقع الظهور، اسم الفئة)
 
     for category, keywords, _ in FAQ_RULES:
         best_position = None
         for kw in keywords:
-            pos = normalized.find(kw.lower())
+            keyword = kw.lower()
+            keyword = re.sub(r"[أإآٱ]", "ا", keyword)
+            keyword = keyword.replace("ى", "ي").replace("ة", "ه")
+            keyword = re.sub(r"(.)\1{2,}", r"\1", keyword)
+            pos = normalized.find(keyword)
             if pos != -1 and (best_position is None or pos < best_position):
                 best_position = pos
         if best_position is not None:
             matches.append((best_position, category))
 
     for kw in CODE_REQUEST_KEYWORDS:
-        pos = normalized.find(kw.lower())
+        keyword = kw.lower()
+        keyword = re.sub(r"[أإآٱ]", "ا", keyword)
+        keyword = keyword.replace("ى", "ي").replace("ة", "ه")
+        pos = normalized.find(keyword)
         if pos != -1:
             matches.append((pos, "طلب_كود"))
             break  # فئة وحدة كافية لطلب الكود
@@ -3931,6 +3946,13 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     categories = keyword_match_categories(text)
 
     if "chatgpt" in categories:
+        # ذكر المنتج وحده («ChatGPT»، «شات») هو طلب شائع لفتح الباقات. لا
+        # نرسله للمصنف العام حتى لا يصنّفه أحياناً كموضوع غير متعلق ويسكت.
+        chatgpt_words = {"chatgpt", "chat", "gpt", "جات", "چات", "تشات", "شات", "جيبيتي"}
+        normalized_words = set(re.findall(r"[a-z0-9]+|[\u0600-\u06ff]+", text.lower()))
+        if normalized_words and normalized_words <= chatgpt_words:
+            return categories, False
+
         # أي ذكر لـ chatgpt يحتاج فحص AI يحدد القصد الحقيقي — مب بس
         # حالة الشكوى، عشان نمنع رد أسعار خاطئ على رسائل مب متعلقة
         verdict = await classify_chatgpt_context(text)
