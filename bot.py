@@ -81,6 +81,7 @@ OWNER_USER_ID = int(os.environ["OWNER_USER_ID"])  # الـ Telegram User ID تب
 INSTAGRAM_MANAGER_USER_ID = int(os.environ.get("INSTAGRAM_MANAGER_USER_ID", "0"))
 INSTAGRAM_COMMISSION_PERCENT = int(os.environ.get("INSTAGRAM_COMMISSION_PERCENT", "25"))
 NOTIFICATIONS_GROUP_ID = int(os.environ.get("NOTIFICATIONS_GROUP_ID", "-1003771659131"))  # قروب سجل الردود
+SUBSCRIPTION_FEEDBACK_URL = os.environ.get("SUBSCRIPTION_FEEDBACK_URL", "").strip()
 
 # أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
 TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشاكل الكود
@@ -755,6 +756,16 @@ CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تل�
 PAYMENT_PRODUCTS = ["جات", "انكي", "كانفا", "فرينوت", "گودنوت", "تليجرام مميز", "امبوس", "Coursera"]
 PAYMENT_METHODS = ["ماستر", "زين كاش", "رصيد اثير", "رصيد اسيا"]
 
+# مدد المنتجات الثابتة التي لا تحتاج سؤالاً إضافياً من الأونر.
+# القيمة None تعني منتج دائم، وبالتالي لا ينشأ له تنبيه انتهاء.
+FIXED_PRODUCT_DURATIONS = {
+    "كانفا": 365,
+    "انكي": None,
+    "فرينوت": 365,
+    "گودنوت": 365,
+}
+AMBOS_DURATION_OPTIONS = [("شهر", 30), ("3 أشهر", 90), ("6 أشهر", 180), ("سنة", 365)]
+
 # أسماء الخزائن — نفس أسماء طرق الدفع بالضبط، عشان كل طريقة دفع تربط
 # مباشرة بخزنتها المطابقة بدون أي تحويل إضافي
 VAULT_NAMES = PAYMENT_METHODS
@@ -1218,10 +1229,123 @@ def get_chatgpt_shared_vault_summary() -> str:
         return "⚠️ ما كدرت أقرأ خزينة حسابات ChatGPT."
 
 
+def get_chatgpt_shared_accounts() -> list[dict]:
+    try:
+        return (
+            supabase.table("chatgpt_shared_accounts")
+            .select("id, email, is_active, capacity")
+            .eq("is_active", True)
+            .order("created_at")
+            .execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to fetch shared ChatGPT accounts")
+        return []
+
+
+def build_shared_vault_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        f"{account.get('email') or 'حساب بدون اسم'}",
+        callback_data=f"vault_account_{account['id']}",
+    )] for account in accounts]
+    rows.append([InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_shared_account_actions_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 إرسال طلب إعادة تسجيل الدخول", callback_data=f"vault_relogin_{account_id}")],
+        [InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")],
+    ])
+
+
+async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAULT_TYPE, account_id: str) -> tuple[int, int]:
+    """ينبه المشتركين الفعّالين المرتبطين بحساب واحد بعد تسجيل الخروج الجماعي."""
+    try:
+        accounts = supabase.table("chatgpt_shared_accounts").select("id, email").eq("id", account_id).limit(1).execute().data or []
+        assignments = (
+            supabase.table("chatgpt_account_assignments")
+            .select("customer_chat_id")
+            .eq("account_id", account_id).eq("status", "active")
+            .execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to find shared-account customers")
+        return 0, 0
+
+    if not accounts:
+        return 0, 0
+    account_name = accounts[0].get("email") or "حساب ChatGPT المشترك"
+    customer_ids = sorted({row.get("customer_chat_id") for row in assignments if row.get("customer_chat_id") is not None})
+    sent = failed = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for customer_id in customer_ids:
+        try:
+            reminders = (
+                supabase.table("subscription_reminders")
+                .select("customer_chat_id, business_connection_id")
+                .eq("customer_chat_id", customer_id).eq("status", "active")
+                .eq("subscription_type", "shared").gt("expires_at", now)
+                .limit(1).execute().data or []
+            )
+            if not reminders:
+                continue
+            reminder = reminders[0]
+            text = (
+                "السلام عليكم،\n\n"
+                "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله."
+            )
+            send_kwargs = {"chat_id": customer_id, "text": text}
+            if reminder.get("business_connection_id"):
+                send_kwargs["business_connection_id"] = reminder["business_connection_id"]
+            await context.bot.send_message(**send_kwargs)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception("Failed to send shared-account relogin notice to %s", customer_id)
+    return sent, failed
+
+
+async def send_legacy_shared_account_relogin_notifications(
+    context: ContextTypes.DEFAULT_TYPE, account_id: str, account_name: str,
+) -> tuple[int, int]:
+    """نفس التنبيه للحسابات القديمة المرتبطة عبر totp_links."""
+    customer_ids = get_customers_for_account(account_id)
+    sent = failed = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for customer_id in sorted(set(customer_ids)):
+        try:
+            reminders = (
+                supabase.table("subscription_reminders")
+                .select("customer_chat_id, business_connection_id")
+                .eq("customer_chat_id", customer_id).eq("status", "active")
+                .eq("subscription_type", "shared").gt("expires_at", now)
+                .limit(1).execute().data or []
+            )
+            if not reminders:
+                continue
+            send_kwargs = {
+                "chat_id": customer_id,
+                "text": (
+                    "السلام عليكم،\n\n"
+                    "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله."
+                ),
+            }
+            if reminders[0].get("business_connection_id"):
+                send_kwargs["business_connection_id"] = reminders[0]["business_connection_id"]
+            await context.bot.send_message(**send_kwargs)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception("Failed to send legacy shared-account notice to %s", customer_id)
+    return sent, failed
+
+
 async def show_chatgpt_shared_vault(message) -> None:
+    accounts = get_chatgpt_shared_accounts()
     await message.reply_text(
         get_chatgpt_shared_vault_summary(),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")]]),
+        reply_markup=build_shared_vault_accounts_keyboard(accounts) if accounts else InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")]]),
     )
 
 
@@ -1230,6 +1354,35 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
     if query is None or query.from_user.id != OWNER_USER_ID:
         return
     await query.answer()
+    if query.data == "vault_accounts":
+        accounts = get_chatgpt_shared_accounts()
+        await query.edit_message_text(
+            get_chatgpt_shared_vault_summary(),
+            reply_markup=build_shared_vault_accounts_keyboard(accounts),
+        )
+        return
+    if query.data.startswith("vault_account_"):
+        account_id = query.data[len("vault_account_"):]
+        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]
+        if not accounts:
+            await query.edit_message_text("الحساب غير موجود أو متوقف.")
+            return
+        await query.edit_message_text(
+            f"الحساب المشترك:\n{accounts[0].get('email') or '—'}\n\n"
+            "بعد ما تسوي تسجيل خروج للكل من هذا الحساب، اضغط الزر حتى ننبه المشتركين الفعّالين.",
+            reply_markup=build_shared_account_actions_keyboard(account_id),
+        )
+        return
+    if query.data.startswith("vault_relogin_"):
+        account_id = query.data[len("vault_relogin_"):]
+        sent, failed = await send_shared_account_relogin_notifications(context, account_id)
+        await query.edit_message_text(
+            f"✅ تم إرسال الرسالة إلى {sent} مشترك فعّال."
+            + (f"\n⚠️ فشل الإرسال إلى {failed}." if failed else "")
+            + "\n\nإذا تريد ترسلها مرة ثانية، افتح الحساب واضغط الزر من جديد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")]]),
+        )
+        return
     if query.data == "vault_add_shared":
         context.user_data["pending_shared_account"] = {"step": "email"}
         await query.edit_message_text("أرسل إيميل حساب ChatGPT المشترك:")
@@ -1412,6 +1565,63 @@ def build_product_list_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def build_ambos_duration_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"pay_ambos_duration_{days}")]
+        for label, days in AMBOS_DURATION_OPTIONS
+    ])
+
+
+def duration_to_days(duration: str | None) -> int | None:
+    """يحوّل مدة الكاتالوج إلى أيام تقريبية ثابتة للتنبيه."""
+    text = normalize_style_text(duration or "")
+    joined = " ".join(text)
+    if any(word in text for word in {"سنه", "سنة", "عام", "سنه"}):
+        return 365
+    match = re.search(r"(\d+)\s*(?:شهر|اشهر|أشهر)", joined)
+    if match:
+        return int(match.group(1)) * 30
+    if "شهرين" in text:
+        return 60
+    if "شهر" in text:
+        return 30
+    match = re.search(r"(\d+)\s*(?:يوم|ايام|أيام)", joined)
+    return int(match.group(1)) if match else None
+
+
+def catalog_product_for_payment_name(name: str) -> dict | None:
+    normalized_name = " ".join(normalize_style_text(name))
+    for product in get_catalog_products():
+        candidates = [product.get("name") or "", *(product.get("aliases") or [])]
+        if any(normalized_name == " ".join(normalize_style_text(str(candidate))) for candidate in candidates):
+            return product
+    return None
+
+
+def prepare_generic_subscription(state: dict) -> list[dict]:
+    """يملأ الباقة تلقائياً إن كانت وحيدة، ويرجع الباقات التي تحتاج اختياراً."""
+    product_name = state.get("product") or ""
+    if product_name in FIXED_PRODUCT_DURATIONS:
+        state["duration_days"] = FIXED_PRODUCT_DURATIONS[product_name]
+        state["reminder_disabled"] = state["duration_days"] is None
+        return []
+    if product_name == "امبوس":
+        return [{"static_duration": True, "name": label, "duration": label, "days": days} for label, days in AMBOS_DURATION_OPTIONS]
+    product = catalog_product_for_payment_name(state.get("product") or "")
+    if not product or is_chatgpt_product(product):
+        return []
+    plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active") and duration_to_days(plan.get("duration"))]
+    if len(plans) == 1:
+        plan = plans[0]
+        state.update({
+            "plan_id": plan["id"], "plan_name": plan["name"],
+            "plan_duration": plan.get("duration"),
+            "duration_days": duration_to_days(plan.get("duration")),
+        })
+        return []
+    return plans
+
+
 def build_method_list_keyboard() -> InlineKeyboardMarkup:
     """قائمة كل طرق الدفع ما عدا الاختيار السريع + زر رجوع."""
     rows = [
@@ -1469,6 +1679,17 @@ def build_subscription_type_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_subscription_plan_keyboard(plans: list[dict]) -> InlineKeyboardMarkup:
+    """يختار الأونر مدة/باقة المنتج العام من الكاتالوج قبل تثبيت الدفع."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{plan['name']} — {plan['duration'] or 'بدون مدة'}",
+            callback_data=f"pay_plan_{plan['id']}",
+        )]
+        for plan in plans
+    ])
+
+
 def build_link_debt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ نعم، دين", callback_data="linkdebt_yes"),
@@ -1522,6 +1743,8 @@ def format_payment_summary(state: dict) -> str:
             lines.append(f"الاشتراك: {type_text} {duration_text}")
         else:
             lines.append("الاشتراك: — اختره عند تثبيت العملية —")
+    elif state.get("plan_name"):
+        lines.append(f"الباقة/المدة: {state['plan_name']} — {state.get('plan_duration') or '—'}")
 
     payments = state.get("payments", [])
     if payments:
@@ -1690,23 +1913,31 @@ def upsert_chatgpt_account(
 
 
 def save_subscription_reminder(state: dict) -> bool:
-    """يحفظ تنبيه الاشتراك من الاختيار اليدوي المؤكد داخل فلو الدفع الرسمي."""
+    """يحفظ تنبيه انتهاء أي منتج ذي مدة من الكاتالوج أو ChatGPT."""
     subscription_type = state.get("subscription_type")
     duration_months = state.get("duration_months")
     chat_id = state.get("customer_chat_id")
-    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+    duration_days = state.get("duration_days")
+    if duration_days is None and duration_months in {1, 2}:
+        duration_days = 30 * duration_months
+    if not chat_id or not duration_days or duration_days <= 0:
         return False
     now = datetime.now(timezone.utc)
     try:
         supabase.table("subscription_reminders").insert({
             "customer_chat_id": chat_id,
+            "business_connection_id": state.get("business_connection_id"),
             "customer_name": state["customer_name"],
             "customer_username": state.get("customer_username"),
-            "subscription_type": subscription_type,
+            "product_name": state.get("product") or state.get("product_name") or "غير محدد",
+            "plan_name": state.get("plan_name"),
+            "plan_duration": state.get("plan_duration"),
+            "subscription_type": subscription_type or "general",
             "duration_months": duration_months,
+            "duration_days": duration_days,
             "is_debt": bool(state.get("is_debt", False)),
             "started_at": now.isoformat(),
-            "expires_at": (now + timedelta(days=30 * duration_months)).isoformat(),
+            "expires_at": (now + timedelta(days=duration_days)).isoformat(),
         }).execute()
         return True
     except Exception:
@@ -3728,12 +3959,12 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
 
 
 async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يرسل تنبيه انتهاء واحداً للاشتراكات المثبتة ضمن فلو الدفع الرسمي."""
+    """يرسل رسالة Feedback للزبون مرة واحدة عند انتهاء أي اشتراك."""
     now = datetime.now(timezone.utc)
     try:
         reminders = (
             supabase.table("subscription_reminders")
-            .select("id, customer_chat_id, customer_name, customer_username, subscription_type, duration_months")
+            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months")
             .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
         )
     except Exception:
@@ -3741,8 +3972,8 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
         return
 
     for reminder in reminders:
-        type_text = "خاص" if reminder["subscription_type"] == "private" else "مشترك"
-        duration_text = "شهر" if reminder["duration_months"] == 1 else "شهرين"
+        product_text = reminder.get("product_name") or "اشتراكك"
+        plan_text = reminder.get("plan_name") or reminder.get("plan_duration") or ""
         customer = reminder["customer_name"]
         if reminder.get("customer_username"):
             customer += f" (@{reminder['customer_username']})"
@@ -3759,12 +3990,34 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
                 unlinked = True
 
+            feedback_text = (
+                "السلام عليكم.\n\n"
+                "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
+                "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا.\n\n"
+                "قيّم تجربتك:"
+            )
+            reply_markup = None
+            if SUBSCRIPTION_FEEDBACK_URL:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📝 قيّم تجربتك", url=SUBSCRIPTION_FEEDBACK_URL)]])
+
+            chat_id = reminder.get("customer_chat_id")
+            customer_send_error = False
+            if chat_id is not None:
+                try:
+                    send_kwargs = {"chat_id": chat_id, "text": feedback_text, "reply_markup": reply_markup}
+                    if reminder.get("business_connection_id"):
+                        send_kwargs["business_connection_id"] = reminder["business_connection_id"]
+                    await context.bot.send_message(**send_kwargs)
+                except Exception:
+                    customer_send_error = True
+                    logger.exception("Failed to send expiry feedback to customer %s", chat_id)
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
-                text=(f"🔔 انتهى اشتراك {type_text} {duration_text}\n"
-                      f"الزبون: {customer}\n"
+                text=(f"🔔 انتهى اشتراك {product_text} للزبون: {customer}\n"
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
-                      + "صار وقت تجديده أو ترتيب الحساب لزبون جديد."),
+                      + ("⚠️ فشل إرسال رسالة التقييم للزبون." if customer_send_error
+                         else "✅ أُرسلت رسالة التقييم للزبون." if chat_id is not None
+                         else "⚠️ ماكو chat_id لإرسال رسالة التقييم.")),
             )
         except Exception:
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
@@ -4226,6 +4479,7 @@ async def handle_incoming_payment_photo(
         "customer_name": customer_name,
         "customer_username": customer_username,
         "customer_chat_id": customer_chat_id,
+        "business_connection_id": bm.business_connection_id,
         "product": None,
         "payments": [],
         "pending_method": None,
@@ -4234,6 +4488,10 @@ async def handle_incoming_payment_photo(
         "awaiting_manual_product": False,
         "subscription_type": None,
         "duration_months": None,
+        "plan_id": None,
+        "plan_name": None,
+        "plan_duration": None,
+        "duration_days": None,
     }
 
 
@@ -4301,6 +4559,38 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state["duration_months"] = duration_months
         data = "pay_finalize"
 
+    if data.startswith("pay_plan_"):
+        plan_id = data[len("pay_plan_"):]
+        try:
+            rows = supabase.table("catalog_plans").select("id, product_id, name, duration, is_active").eq("id", plan_id).limit(1).execute().data or []
+        except Exception:
+            rows = []
+        selected_product = catalog_product_for_payment_name(state.get("product") or "")
+        if (not rows or not rows[0].get("is_active") or not duration_to_days(rows[0].get("duration"))
+                or (selected_product and rows[0].get("product_id") != selected_product.get("id"))):
+            await query.answer("الباقة غير متاحة أو بلا مدة.", show_alert=True)
+            return
+        plan = rows[0]
+        state.update({
+            "plan_id": plan["id"], "plan_name": plan["name"],
+            "plan_duration": plan.get("duration"),
+            "duration_days": duration_to_days(plan.get("duration")),
+        })
+        data = "pay_finalize"
+
+    if data.startswith("pay_ambos_duration_"):
+        try:
+            duration_days = int(data[len("pay_ambos_duration_"):])
+        except ValueError:
+            await query.answer("المدة غير صحيحة.", show_alert=True)
+            return
+        if duration_days not in {days for _, days in AMBOS_DURATION_OPTIONS}:
+            await query.answer("المدة غير متاحة.", show_alert=True)
+            return
+        label = next(label for label, days in AMBOS_DURATION_OPTIONS if days == duration_days)
+        state.update({"plan_name": label, "plan_duration": label, "duration_days": duration_days})
+        data = "pay_finalize"
+
     # -------------------- إلغاء --------------------
     if data == "pay_cancel":
         del _pending_payments[message_id]
@@ -4322,6 +4612,19 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("pay_product_") and data not in ("pay_product_list", "pay_product_manual"):
         product = data[len("pay_product_"):]
         state["product"] = product
+        if product == "امبوس":
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
+                reply_markup=build_ambos_duration_keyboard(),
+            )
+            return
+        generic_plans = prepare_generic_subscription(state)
+        if generic_plans:
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
+                reply_markup=build_subscription_plan_keyboard(generic_plans),
+            )
+            return
         customer_chat_id = state.get("customer_chat_id")
         has_debt = (
             customer_chat_id is not None and find_unpaid_debt(customer_chat_id, product) is not None
@@ -4456,9 +4759,22 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
+        if (state["product"] != CHATGPT_PRODUCT_NAME
+                and not state.get("duration_days")
+                and not state.get("reminder_disabled")):
+            generic_plans = prepare_generic_subscription(state)
+            if generic_plans:
+                await query.edit_message_caption(
+                    caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة حتى ينحفظ تنبيه النهاية:",
+                    reply_markup=build_subscription_plan_keyboard(generic_plans),
+                )
+                return
+            await query.answer("ما لقيت مدة مفعلة لهذا المنتج بالكاتالوج.", show_alert=True)
+            return
+
         saved = append_payment_row(state)
         subscription_saved = False
-        if saved and state["product"] == CHATGPT_PRODUCT_NAME:
+        if saved and (state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days")):
             subscription_saved = save_subscription_reminder(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
@@ -4494,7 +4810,10 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         del _pending_payments[message_id]
 
         if saved:
-            reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
+            if state.get("reminder_disabled"):
+                reminder_note = "\nℹ️ هذا المنتج دائم، ما يحتاج تنبيه انتهاء."
+            else:
+                reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
             final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح." + reminder_note
         else:
             final_text = format_payment_summary(state) + "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
@@ -4689,6 +5008,31 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
 
     state["product"] = product
     state["awaiting_manual_product"] = False
+
+    if product == "امبوس":
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=OWNER_USER_ID,
+                message_id=replied_id,
+                caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
+                reply_markup=build_ambos_duration_keyboard(),
+            )
+        except Exception:
+            logger.exception("Failed to show Ambos duration options")
+        return True
+
+    generic_plans = prepare_generic_subscription(state)
+    if generic_plans:
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=OWNER_USER_ID,
+                message_id=replied_id,
+                caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
+                reply_markup=build_subscription_plan_keyboard(generic_plans),
+            )
+        except Exception:
+            logger.exception("Failed to show generic subscription plans")
+        return True
 
     customer_chat_id = state.get("customer_chat_id")
     has_debt = (
@@ -5121,6 +5465,18 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text="اختر حساب:", reply_markup=build_shared_accounts_keyboard(accounts))
         return
 
+    if data.startswith("stats_account_relogin_"):
+        account_id = data[len("stats_account_relogin_"):]
+        accounts = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).limit(1).execute().data or []
+        account_name = (accounts[0].get("label") if accounts else None) or (accounts[0].get("link_code") if accounts else "الحساب المشترك")
+        sent, failed = await send_legacy_shared_account_relogin_notifications(context, account_id, account_name)
+        await query.edit_message_text(
+            f"✅ تم إرسال الرسالة إلى {sent} مشترك فعّال."
+            + (f"\n⚠️ فشل الإرسال إلى {failed}." if failed else ""),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع", callback_data=f"stats_account_{account_id}")]]),
+        )
+        return
+
     if data.startswith("stats_account_"):
         account_id = data[len("stats_account_"):]
         customer_chat_ids = get_customers_for_account(account_id)
@@ -5130,7 +5486,10 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
             text = f"عدد الزباين: {len(customer_chat_ids)}\n\n" + "\n".join(str(cid) for cid in customer_chat_ids)
         await query.edit_message_text(
             text=text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_shared")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📣 إعادة تسجيل الدخول للفعّالين", callback_data=f"stats_account_relogin_{account_id}")],
+                [InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_shared")],
+            ]),
         )
         return
 
@@ -6272,6 +6631,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     bm = update.business_message or update.edited_business_message
     if not bm:
         return
+    is_edited_message = update.edited_business_message is not None
 
     sender_id = bm.from_user.id if bm.from_user else None
     is_from_owner = sender_id == OWNER_USER_ID
@@ -6379,7 +6739,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             continue
 
         # فئة FAQ عادية — منع تكرار نفس الرد لنفس الزبون خلال ساعة
-        if not should_send_faq_reply(chat_id, category):
+        # التعديل يُعامل كرسالة جديدة: مثلاً «كانفات» ثم تعديلها إلى «كانفا»
+        # يجب أن يشغّل رد Canva حتى لو كانت المحاولة الأولى قبل دقائق.
+        if not is_edited_message and not should_send_faq_reply(chat_id, category):
             continue
         reply_text = get_reply_for_category(category)
         if reply_text:

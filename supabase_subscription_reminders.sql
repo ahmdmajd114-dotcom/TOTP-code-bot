@@ -1,12 +1,17 @@
--- تنبيهات انتهاء اشتراكات ChatGPT من فلو الدفع الرسمي.
+-- تنبيهات انتهاء كل الاشتراكات ورسالة Feedback تلقائية بعد النهاية.
 -- شغّل هذا الملف مرة واحدة في Supabase SQL Editor.
 create table if not exists public.subscription_reminders (
   id bigint generated always as identity primary key,
   customer_chat_id bigint,
+  business_connection_id text,
   customer_name text not null,
   customer_username text,
-  subscription_type text not null check (subscription_type in ('private', 'shared')),
-  duration_months smallint not null check (duration_months in (1, 2)),
+  subscription_type text not null default 'general',
+  duration_months smallint,
+  duration_days integer,
+  product_name text,
+  plan_name text,
+  plan_duration text,
   is_debt boolean not null default false,
   started_at timestamptz not null default now(),
   expires_at timestamptz not null,
@@ -24,6 +29,27 @@ alter table public.subscription_reminders
 
 alter table public.subscription_reminders
   add column if not exists is_debt boolean not null default false;
+
+alter table public.subscription_reminders
+  add column if not exists duration_days integer;
+alter table public.subscription_reminders
+  add column if not exists business_connection_id text;
+alter table public.subscription_reminders
+  add column if not exists product_name text;
+alter table public.subscription_reminders
+  add column if not exists plan_name text;
+alter table public.subscription_reminders
+  add column if not exists plan_duration text;
+alter table public.subscription_reminders
+  alter column subscription_type set default 'general';
+
+-- النسخ القديمة كانت تمنع إلا private/shared وشهر/شهرين.
+alter table public.subscription_reminders
+  drop constraint if exists subscription_reminders_subscription_type_check;
+alter table public.subscription_reminders
+  drop constraint if exists subscription_reminders_duration_months_check;
+alter table public.subscription_reminders
+  alter column duration_months drop not null;
 
 alter table public.subscription_reminders enable row level security;
 revoke all on table public.subscription_reminders from anon, authenticated;
