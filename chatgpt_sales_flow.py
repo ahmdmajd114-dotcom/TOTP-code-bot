@@ -173,6 +173,18 @@ def decide_code_retry(attempt_count: int, awaiting_restart: bool) -> CodeRetryDe
     return CodeRetryDecision("stop", next_count, False)
 
 
+def decide_private_code_retry(attempt_count: int, awaiting_restart: bool) -> CodeRetryDecision:
+    """سلوك كود الحساب الخاص: تنبيه بعد 5 محاولات، بدون إيقاف نهائي."""
+    if awaiting_restart:
+        return CodeRetryDecision("send_code", attempt_count + 1, False)
+    next_count = attempt_count + 1
+    if next_count <= 5:
+        return CodeRetryDecision("send_code", next_count, False)
+    if next_count == 6:
+        return CodeRetryDecision("ask_restart", next_count, True)
+    return CodeRetryDecision("send_code", next_count, False)
+
+
 def should_review_payment_photo(workflow_state: str) -> bool:
     """فحص الصورة مكلف وحساس؛ لا يتم إلا بعد اختيار الباقة/طلب الوصل."""
     return workflow_state in {"awaiting_payment", "awaiting_payment_proof"}

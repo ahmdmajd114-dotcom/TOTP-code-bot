@@ -12,6 +12,7 @@
 - طلب الكود (TOTP) حصري للزبائن المربوطين مسبقاً بأمر /link من الأونر،
   وله نظام عداد محاولات منفصل (ريستارت بعد 3، توقف بعد 5).
 - أنت (owner) تضيف حساب جديد بأمر /addaccount
+- أنت تضيف حساباً خاصاً مباشرة داخل محادثة الزبون بأمر /addprivate
 - أنت تربط زبون معين بحساب معين بأمر /link داخل محادثته
 - أنت تصفر عداد محاولات الكود بأمر /resetcode داخل محادثة الزبون
 """
@@ -43,6 +44,7 @@ from chatgpt_sales_flow import (
     asks_payment_guidance,
     can_request_account_code,
     decide_code_retry,
+    decide_private_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_chatgpt_support_issue,
@@ -738,6 +740,8 @@ TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال 
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
+PRIVATE_ADD_PATTERN = re.compile(r"^/addprivate\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
+PRIVATE_ADD_TARGET_PATTERN = re.compile(r"^/addprivate\s+(-?\d+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
 RESETCODE_PATTERN = re.compile(r"^/resetcode$", re.IGNORECASE)
 
 # كلمات مفتاحية لطلب الكود
@@ -4014,6 +4018,19 @@ def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
     return acc_res.data[0]["secret"], acc_res.data[0].get("label") or ""
 
 
+def is_private_totp_account(chat_id: int) -> bool:
+    """يتحقق هل الحساب المربوط أضيف عبر مسار الحساب الخاص."""
+    try:
+        links = supabase.table("totp_links").select("account_id").eq("chat_id", chat_id).limit(1).execute().data or []
+        if not links:
+            return False
+        accounts = supabase.table("totp_accounts").select("link_code").eq("id", links[0]["account_id"]).limit(1).execute().data or []
+        return bool(accounts and str(accounts[0].get("link_code") or "").startswith("private_"))
+    except Exception:
+        logger.exception("Failed to identify private TOTP account for chat %s", chat_id)
+        return False
+
+
 CHATGPT_DELIVERY_TEMPLATE = """ChatGPT
 
 {email}
@@ -4320,8 +4337,11 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     attempt_count = state["attempt_count"]
     awaiting_restart = state["awaiting_restart_confirmation"]
 
-    # حتى لو بقي /link موجوداً، انتهاء الاشتراك يلغي حق طلب كود جديد فوراً.
-    if not has_active_subscription(chat_id):
+    is_private_account = is_private_totp_account(chat_id)
+
+    # الحسابات المشتركة تحتاج اشتراكاً فعالاً؛ الحساب الخاص يعتمد على
+    # الربط الذي أنشأه /addprivate ولا يتوقف بانتهاء تذكير الاشتراك.
+    if not is_private_account and not has_active_subscription(chat_id):
         return None, False
 
     result = get_secret_for_chat(chat_id)
@@ -4331,7 +4351,11 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
 
     secret, label = result
 
-    decision = decide_code_retry(attempt_count, awaiting_restart)
+    decision = (
+        decide_private_code_retry(attempt_count, awaiting_restart)
+        if is_private_account
+        else decide_code_retry(attempt_count, awaiting_restart)
+    )
     if decision.action == "send_code":
         code = generate_totp_code(secret)
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
@@ -4405,8 +4429,61 @@ async def human_like_reply_sequence(
     await _show_typing(context, chat_id, business_connection_id, TYPING_DURATION_SECONDS)
 
 
+async def add_private_account(
+    context: ContextTypes.DEFAULT_TYPE,
+    target_chat_id: int,
+    secret: str,
+    label: str | None = None,
+) -> None:
+    """ينشئ حساباً خاصاً ويربطه بزبون محدد."""
+    try:
+        # Secret الـTOTP عادة Base32 (حروف وأرقام)، وليس كوداً من 6 أرقام.
+        pyotp.TOTP(secret.strip().replace(" ", "")).now()
+        link_code = "private_" + uuid.uuid4().hex[:12]
+        account = supabase.table("totp_accounts").insert({
+            "link_code": link_code,
+            "secret": secret.strip().replace(" ", ""),
+            "label": label or "حساب خاص",
+        }).execute().data
+        if not account:
+            raise RuntimeError("لم تُرجع قاعدة البيانات الحساب المضاف")
+        supabase.table("totp_links").upsert({
+            "chat_id": target_chat_id,
+            "account_id": account[0]["id"],
+        }).execute()
+
+        state = get_interactive_sale_state(target_chat_id)
+        if state.get("workflow_state") == "private_activation_pending":
+            set_interactive_sale_state(target_chat_id, "account_delivered")
+
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=(f"✅ تمت إضافة الحساب الخاص وربطه بالزبون.\n"
+                  f"chat_id: {target_chat_id}\n"
+                  f"ملاحظة: {label or 'حساب خاص'}\n"
+                  "من هسه إذا يطلب كود، ينرسل له تلقائياً."),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=NOTIFICATIONS_GROUP_ID,
+                message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
+                text=(f"➕ حساب خاص جديد مربوط تلقائياً\n"
+                      f"الزبون: {target_chat_id}\n"
+                      f"ملاحظة: {label or 'حساب خاص'}"),
+            )
+        except Exception:
+            logger.exception("Failed to notify private account link")
+    except Exception as e:
+        logger.exception("addprivate failed")
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=("⚠️ ما انضاف الحساب الخاص. تأكد أن الـ Secret هو مفتاح TOTP "
+                  "Base32 وليس كوداً مؤقتاً من 6 أرقام.\n" + str(e)),
+        )
+
+
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
-    """يعالج أوامر الأونر: /addaccount، /link، /resetcode، وaccept. يرجع True اذا كانت الرسالة أمر تم التعامل معه."""
+    """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وaccept."""
 
     # accept — رد على صورة دفع معينة من الزبون (بمحادثتك Business وياه)
     # عشان تحولها لمحادثتك مع البوت، حتى لو تجاوزت حد 3 صور/6 ساعات
@@ -4419,6 +4496,15 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=OWNER_USER_ID,
                 text="⚠️ لازم ترد على رسالة الصورة نفسها وتكتب accept.",
             )
+        return True
+
+    # /addprivate <secret> [label]
+    # يُستخدم داخل محادثة الزبون نفسها. ينشئ حساب TOTP ويربطه فوراً بهذا
+    # الزبون، ثم يفتح له مسار طلب الكود التلقائي.
+    private_match = PRIVATE_ADD_PATTERN.match(text.strip())
+    if private_match:
+        secret, label = private_match.groups()
+        await add_private_account(context, chat_id, secret, label)
         return True
 
     # /addaccount <link_code> <secret> [label]
@@ -4472,6 +4558,12 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         supabase.table("totp_links").upsert(
             {"chat_id": chat_id, "account_id": account_id}
         ).execute()
+
+        # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
+        # بطلب الكود تلقائياً. الحسابات المشتركة تبقى على مسارها المعتاد.
+        state = get_interactive_sale_state(chat_id)
+        if state.get("workflow_state") == "private_activation_pending":
+            set_interactive_sale_state(chat_id, "account_delivered")
 
         # لو اللابل يشبه إيميل، نعتبره حساب ChatGPT مشترك ونسجله بالشيت
         # (يكمل سطر ناقص لنفس الزبون لو موجود، وإلا يفتح سطر جديد)
@@ -6450,6 +6542,22 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     """
     if await handle_teaching_message(update, context):
         return
+    message = update.message
+    if message and message.text:
+        # من محادثة الأونر الخاصة استخدم: /addprivate <chat_id> <secret> [اسم]
+        target_match = PRIVATE_ADD_TARGET_PATTERN.match(message.text.strip())
+        if target_match:
+            target_chat_id, secret, label = target_match.groups()
+            await add_private_account(context, int(target_chat_id), secret, label)
+            return
+        if message.text.strip().lower().startswith("/addprivate"):
+            await message.reply_text(
+                "استخدم الأمر داخل محادثة الزبون هكذا:\n"
+                "/addprivate SECRET_KEY اسم اختياري\n\n"
+                "أو من محادثتك ويا البوت:\n"
+                "/addprivate CHAT_ID SECRET_KEY اسم اختياري"
+            )
+            return
     # أزرار الإدارة الرئيسية تأخذ الأولوية على أي وضع إدخال قديم.
     if await handle_reply_keyboard_button(update, context):
         return

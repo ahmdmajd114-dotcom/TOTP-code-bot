@@ -5,6 +5,7 @@ from chatgpt_sales_flow import (
     asks_payment_guidance,
     can_request_account_code,
     decide_code_retry,
+    decide_private_code_retry,
     is_acknowledgement,
     is_ambiguous_followup,
     is_chatgpt_support_issue,
@@ -99,6 +100,15 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertEqual(decide_code_retry(3, True).attempt_count, 4)
         self.assertEqual(decide_code_retry(4, False).attempt_count, 5)
         self.assertEqual(decide_code_retry(5, False).action, "stop")
+
+    def test_private_code_retry_warns_after_five_but_never_stops(self):
+        for attempt in range(5):
+            self.assertEqual(decide_private_code_retry(attempt, False).action, "send_code")
+        warning = decide_private_code_retry(5, False)
+        self.assertEqual(warning.action, "ask_restart")
+        self.assertTrue(warning.awaiting_restart)
+        self.assertEqual(decide_private_code_retry(6, True).action, "send_code")
+        self.assertEqual(decide_private_code_retry(7, False).action, "send_code")
 
     def test_payment_photo_is_only_reviewed_inside_payment_flow(self):
         self.assertFalse(should_review_payment_photo("observing"))
