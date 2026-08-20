@@ -12,6 +12,10 @@ create table if not exists public.subscription_reminders (
   product_name text,
   plan_name text,
   plan_duration text,
+  feedback_only boolean not null default false,
+  feedback_status text not null default 'none',
+  feedback_requested_at timestamptz,
+  feedback_responded_at timestamptz,
   is_debt boolean not null default false,
   started_at timestamptz not null default now(),
   expires_at timestamptz not null,
@@ -40,6 +44,14 @@ alter table public.subscription_reminders
   add column if not exists plan_name text;
 alter table public.subscription_reminders
   add column if not exists plan_duration text;
+alter table public.subscription_reminders
+  add column if not exists feedback_only boolean not null default false;
+alter table public.subscription_reminders
+  add column if not exists feedback_status text not null default 'none';
+alter table public.subscription_reminders
+  add column if not exists feedback_requested_at timestamptz;
+alter table public.subscription_reminders
+  add column if not exists feedback_responded_at timestamptz;
 alter table public.subscription_reminders
   alter column subscription_type set default 'general';
 

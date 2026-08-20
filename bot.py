@@ -2018,8 +2018,11 @@ def save_subscription_reminder(state: dict) -> bool:
     duration_months = state.get("duration_months")
     chat_id = state.get("customer_chat_id")
     duration_days = state.get("duration_days")
+    feedback_only = bool(state.get("reminder_disabled"))
     if duration_days is None and duration_months in {1, 2}:
         duration_days = 30 * duration_months
+    if feedback_only:
+        duration_days = 1
     if not chat_id or not duration_days or duration_days <= 0:
         return False
     now = datetime.now(timezone.utc)
@@ -2035,6 +2038,8 @@ def save_subscription_reminder(state: dict) -> bool:
             "subscription_type": subscription_type or "general",
             "duration_months": duration_months,
             "duration_days": duration_days,
+            "feedback_only": feedback_only,
+            "feedback_status": "scheduled" if feedback_only else "none",
             "is_debt": bool(state.get("is_debt", False)),
             "started_at": now.isoformat(),
             "expires_at": (now + timedelta(days=duration_days)).isoformat(),
@@ -4064,7 +4069,7 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
     try:
         reminders = (
             supabase.table("subscription_reminders")
-            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months")
+            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only")
             .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
         )
     except Exception:
@@ -4086,22 +4091,19 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
             # /link أيضاً. لذلك عداد زبائن الحساب بالإحصائيات ينقص فوراً.
             unlinked = False
             chat_id = reminder.get("customer_chat_id")
-            if chat_id is not None and can_unlink_expired_customer(chat_id):
+            if not reminder.get("feedback_only") and chat_id is not None and can_unlink_expired_customer(chat_id):
                 supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
                 unlinked = True
 
             feedback_text = (
                 "السلام عليكم.\n\n"
                 "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
-                "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا.\n\n"
-                "قيّم تجربتك:"
+                "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
             )
-            reply_markup = None
-            if SUBSCRIPTION_FEEDBACK_URL:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📝 قيّم تجربتك", url=SUBSCRIPTION_FEEDBACK_URL)]])
 
             chat_id = reminder.get("customer_chat_id")
             customer_send_error = False
+            reply_markup = None
             if chat_id is not None:
                 try:
                     send_kwargs = {"chat_id": chat_id, "text": feedback_text, "reply_markup": reply_markup}
@@ -4111,16 +4113,83 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 except Exception:
                     customer_send_error = True
                     logger.exception("Failed to send expiry feedback to customer %s", chat_id)
+            supabase.table("subscription_reminders").update({
+                "feedback_status": "awaiting_reply",
+                "feedback_requested_at": now.isoformat(),
+            }).eq("id", reminder["id"]).execute()
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=(f"🔔 انتهى اشتراك {product_text} للزبون: {customer}\n"
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
-                      + ("⚠️ فشل إرسال رسالة التقييم للزبون." if customer_send_error
-                         else "✅ أُرسلت رسالة التقييم للزبون." if chat_id is not None
-                         else "⚠️ ماكو chat_id لإرسال رسالة التقييم.")),
+                      + ("⚠️ فشل إرسال رسالة المتابعة للزبون." if customer_send_error
+                         else "✅ أُرسلت رسالة المتابعة وننتظر رده." if chat_id is not None
+                         else "⚠️ ماكو chat_id لإرسال رسالة المتابعة.")),
             )
         except Exception:
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
+
+
+def feedback_reply_is_positive(text: str) -> bool:
+    normalized = (text or "").lower()
+    negative = ("مو زين", "مو حلو", "سيئ", "سيء", "مشكله", "مشكلة", "ما يشتغل", "مايفتح", "تعويض", "استرجاع", "زفت")
+    if any(term in normalized for term in negative):
+        return False
+    positive = ("حلو", "زين", "ممتاز", "ممتعه", "ممتعة", "شكرا", "شكراً", "عاشت", "كلش", "راضي", "تمام")
+    return any(term in normalized for term in positive)
+
+
+async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text: str) -> bool:
+    """يعالج رد الزبون على رسالة المتابعة قبل دخوله إلى الردود العامة."""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id, business_connection_id")
+            .eq("customer_chat_id", bm.chat.id).eq("feedback_status", "awaiting_reply")
+            .order("feedback_requested_at", desc=True).limit(1).execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to find pending feedback reply")
+        return False
+    if not rows:
+        return False
+
+    reminder_id = rows[0]["id"]
+    if not feedback_reply_is_positive(text):
+        supabase.table("subscription_reminders").update({
+            "feedback_status": "needs_owner",
+            "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", reminder_id).execute()
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(
+                    "⚠️ رد غير إيجابي على متابعة التقييم\n"
+                    f"الزبون: {bm.chat.full_name or bm.chat.first_name or 'غير معروف'}\n"
+                    f"chat_id: {bm.chat.id}\n\n"
+                    f"كتب: {text}\n\n"
+                    "تم إيقاف الإرسال التلقائي لهذا الرد ويحتاج تدخلك."
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to notify owner about negative feedback")
+        return True
+
+    supabase.table("subscription_reminders").update({
+        "feedback_status": "positive",
+        "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", reminder_id).execute()
+    if SUBSCRIPTION_FEEDBACK_URL:
+        send_kwargs = {
+            "business_connection_id": rows[0].get("business_connection_id") or bm.business_connection_id,
+            "chat_id": bm.chat.id,
+            "text": "كلش خوش، عاشت إيدك 🌷\nإذا تحب، هذا رابط تقييم تجربتك ويانا:",
+            "reply_markup": InlineKeyboardMarkup([[InlineKeyboardButton("📝 قيّم تجربتك", url=SUBSCRIPTION_FEEDBACK_URL)]]),
+        }
+        try:
+            await context.bot.send_message(**send_kwargs)
+        except Exception:
+            logger.exception("Failed to send feedback link")
+    return True
 
 
 def generate_totp_code(secret: str) -> str:
@@ -4874,7 +4943,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
         saved = append_payment_row(state)
         subscription_saved = False
-        if saved and (state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days")):
+        if saved and (state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days") or state.get("reminder_disabled")):
             subscription_saved = save_subscription_reminder(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
@@ -6819,6 +6888,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # اسم الزبون واسم المستخدم (لو موجود) — نستخدمهن بالتنبيه للأونر
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
+
+    if not is_from_owner and await handle_feedback_followup(context, bm, text):
+        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        return
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
