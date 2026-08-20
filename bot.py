@@ -1991,12 +1991,12 @@ def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
     return None
 
 
-def append_payment_row(state: dict) -> bool:
+def append_payment_row(state: dict, force_new: bool = False) -> bool:
     """
     يضيف سطر جديد بـ Google Sheet لعملية دفع مكتملة، أو يكمل سطر ناقص
     موجود لنفس الزبون لو المنتج جات (خلال آخر أسبوع). يرجع True لو نجح
-    الحفظ، False لو فشل — الاستدعاء المسؤول يتعامل مع الفشل بتنبيه
-    الأونر بدل ما يفترض النجاح.
+    الحفظ، False لو فشل. force_new مخصص لتسديد الدين حتى ينحسب كدخل
+    جديد بتاريخ التسديد، ولا يكتب فوق سطر الدين/العملية الأصلية.
     """
     sheet = get_google_sheet()
     if sheet is None:
@@ -2015,7 +2015,7 @@ def append_payment_row(state: dict) -> bool:
 
     try:
         target_row = None
-        if product == CHATGPT_PRODUCT_NAME and chat_id is not None:
+        if not force_new and product == CHATGPT_PRODUCT_NAME and chat_id is not None:
             target_row = find_completable_chatgpt_row(sheet, chat_id)
 
         if target_row is not None:
@@ -5187,12 +5187,16 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         debt_row, remaining_before = debt_info
         repay_amount = sum(amount for _, amount in state["payments"])
         saved, new_remaining = process_debt_repayment(debt_row, remaining_before, repay_amount)
+        payment_stats_saved = False
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بالتسديد
         if saved:
             for method, amount in state["payments"]:
                 if method in VAULT_NAMES:
                     adjust_vault_balance(method, amount)
+            # تسديد الدين دخل جديد اليوم، حتى لو كان أصل الدين قديماً.
+            # force_new يمنع دمجه مع سطر ChatGPT قديم أو ناقص.
+            payment_stats_saved = append_payment_row(state, force_new=True)
 
         if saved:
             customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
@@ -5209,6 +5213,8 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                     f"المبلغ المسدد: {repay_amount}\nالمتبقي: {new_remaining}",
                 )
                 final_text = format_payment_summary(state) + f"\n\n✅ تم تسديد جزء من الدين. المتبقي: {new_remaining}"
+            if not payment_stats_saved:
+                final_text += "\n⚠️ تم تحديث الدين، لكن تعذر إضافة التسديد لإحصائيات الدخل."
         else:
             final_text = format_payment_summary(state) + "\n\n⚠️ فشل تحديث حالة الدين بـ Google Sheet — تحقق من الاتصال يدوياً."
 
