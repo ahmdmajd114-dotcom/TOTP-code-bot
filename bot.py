@@ -222,23 +222,23 @@ def get_instagram_sales_worksheet():
             _instagram_sales_sheet = spreadsheet.worksheet(INSTAGRAM_SALES_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
             _instagram_sales_sheet = spreadsheet.add_worksheet(
-                title=INSTAGRAM_SALES_WORKSHEET_NAME, rows=2000, cols=19
+                title=INSTAGRAM_SALES_WORKSHEET_NAME, rows=2000, cols=20
             )
             _instagram_sales_sheet.append_row(
                 [
                     "رقم العملية", "التاريخ والوقت", "يوزر الإنستغرام", "المنتج",
                     "نوع الجات", "نوع المحفظة", "المبلغ", "النسبة %",
                     "العمولة", "الحالة", "تم دفع العمولة؟", "المسجل",
-                    "Telegram User ID", "ملاحظات", "مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة",
+                    "Telegram User ID", "ملاحظات", "مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة", "مدة الاشتراك",
                 ],
                 value_input_option="USER_ENTERED",
             )
-        if getattr(_instagram_sales_sheet, "col_count", 0) < 19:
-            _instagram_sales_sheet.resize(rows=max(getattr(_instagram_sales_sheet, "row_count", 1000), 2000), cols=19)
+        if getattr(_instagram_sales_sheet, "col_count", 0) < 20:
+            _instagram_sales_sheet.resize(rows=max(getattr(_instagram_sales_sheet, "row_count", 1000), 2000), cols=20)
         header = _instagram_sales_sheet.row_values(1)
-        required_tail = ["مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة"]
+        required_tail = ["مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة", "مدة الاشتراك"]
         if header and not all(value in header for value in required_tail):
-            _instagram_sales_sheet.update("O1:R1", [required_tail])
+            _instagram_sales_sheet.update("O1:S1", [required_tail])
         return _instagram_sales_sheet
     except Exception:
         logger.exception("Failed to connect to Instagram sales worksheet")
@@ -258,6 +258,7 @@ def append_instagram_sale(sale: dict) -> bool:
                 "مؤكدة", "لا", sale["recorded_by"], sale["recorded_by_id"],
                 sale.get("notes") or "", sale.get("account_source") or "—",
                 sale.get("account_id") or "—", sale.get("account_display") or "—", "",
+                f"{sale.get('duration_months')} شهر" if sale.get("duration_months") else "—",
             ],
             value_input_option="USER_ENTERED",
         )
@@ -3154,12 +3155,7 @@ def calculate_chatgpt_account_stats() -> tuple[int, int]:
         except Exception:
             logger.exception("Failed to count private ChatGPT accounts from sheet")
 
-    shared_count = 0
-    try:
-        res = supabase.table("totp_accounts").select("id").execute()
-        shared_count = len(res.data) if res.data else 0
-    except Exception:
-        logger.exception("Failed to count shared accounts from Supabase")
+    shared_count = len(get_shared_accounts_list())
 
     return private_count, shared_count
 
@@ -3178,6 +3174,21 @@ def get_shared_accounts_list() -> list[dict]:
     except Exception:
         logger.exception("Failed to fetch legacy shared accounts list")
     return accounts
+
+
+def get_instagram_account_sales(account_id: str) -> list[list[str]]:
+    """Return Instagram sales linked to a specific internal account."""
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        return []
+    try:
+        return [
+            row for row in sheet.get_all_values()[1:]
+            if len(row) >= 16 and row[15].strip() == str(account_id) and row[9].strip() == "مؤكدة"
+        ]
+    except Exception:
+        logger.exception("Failed to fetch Instagram sales for account %s", account_id)
+        return []
 
 
 def get_all_accounts_with_secrets() -> list[dict]:
@@ -5962,13 +5973,41 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    if data.startswith("stats_native_account_"):
+        account_id = data[len("stats_native_account_"):]
+        accounts = supabase.table("chatgpt_shared_accounts").select("email, capacity").eq("id", account_id).limit(1).execute().data or []
+        if not accounts:
+            await query.edit_message_text("الحساب غير موجود.")
+            return
+        assignments = supabase.table("chatgpt_account_assignments").select("customer_chat_id").eq("account_id", account_id).eq("status", "active").execute().data or []
+        instagram_sales = get_instagram_account_sales(account_id)
+        capacity = min(int(accounts[0].get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
+        total_used = len(assignments) + len(instagram_sales)
+        instagram_lines = "\n".join(f"@{row[2]} — {row[19] if len(row) > 19 else '—'}" for row in instagram_sales) or "لا توجد مبيعات Instagram"
+        await query.edit_message_text(
+            f"الحساب المشترك: {accounts[0].get('email') or '—'}\n\n"
+            f"المستخدم: {total_used}/{capacity}\n"
+            f"المتبقي: {max(0, capacity - total_used)}\n"
+            f"مشتركو Telegram: {len(assignments)}\n"
+            f"مشتركو Instagram: {len(instagram_sales)}\n\n"
+            f"مبيعات Instagram:\n{instagram_lines}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_shared")]]),
+        )
+        return
+
     if data.startswith("stats_account_"):
         account_id = data[len("stats_account_"):]
         customer_chat_ids = get_customers_for_account(account_id)
-        if not customer_chat_ids:
-            text = "ماكو زباين مرتبطين بهذا الحساب."
-        else:
-            text = f"عدد الزباين: {len(customer_chat_ids)}\n\n" + "\n".join(str(cid) for cid in customer_chat_ids)
+        instagram_sales = get_instagram_account_sales(f"legacy:{account_id}")
+        total_used = len(customer_chat_ids) + len(instagram_sales)
+        instagram_lines = "\n".join(f"@{row[2]} — {row[19] if len(row) > 19 else '—'}" for row in instagram_sales) or "لا توجد مبيعات Instagram"
+        text = (
+            f"المستخدم: {total_used}/{SHARED_CHATGPT_ACCOUNT_CAPACITY}\n"
+            f"المتبقي: {max(0, SHARED_CHATGPT_ACCOUNT_CAPACITY - total_used)}\n"
+            f"مشتركو Telegram: {len(customer_chat_ids)}\n"
+            f"مشتركو Instagram: {len(instagram_sales)}\n\n"
+            f"مبيعات Instagram:\n{instagram_lines}"
+        )
         await query.edit_message_text(
             text=text,
             reply_markup=InlineKeyboardMarkup([
@@ -6881,6 +6920,7 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             "instagram_account": state["instagram_account"],
             "product": state["product"],
             "chat_type": state.get("chat_type"),
+            "duration_months": state.get("duration_months"),
             "wallet": state["wallet"],
             "amount": state["amount"],
             "commission_percent": INSTAGRAM_COMMISSION_PERCENT,
@@ -6918,6 +6958,8 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
                         f"المنتج: {sale['product']}"
                         + (f" ({sale['chat_type']})" if sale.get("chat_type") else "")
                         + f"\nالمبلغ: {format_iqd(sale['amount'])}"
+                        + f"\nالمدة: {sale.get('duration_months') or state.get('duration_months') or '—'} شهر"
+                        + f"\nالحساب المستخدم: {sale.get('account_display') or '—'}"
                         + f"\nالعمولة: {format_iqd(sale['commission'])}"
                     ),
                 )
