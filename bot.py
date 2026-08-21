@@ -84,6 +84,10 @@ INSTAGRAM_MANAGER_USER_ID = int(os.environ.get("INSTAGRAM_MANAGER_USER_ID", "0")
 INSTAGRAM_COMMISSION_PERCENT = int(os.environ.get("INSTAGRAM_COMMISSION_PERCENT", "25"))
 NOTIFICATIONS_GROUP_ID = int(os.environ.get("NOTIFICATIONS_GROUP_ID", "-1003771659131"))  # قروب سجل الردود
 SUBSCRIPTION_FEEDBACK_URL = os.environ.get("SUBSCRIPTION_FEEDBACK_URL", "").strip()
+# التحية الأولى بالمحادثة الجديدة تنتظر حتى نعرف إن كان الزبون سيكمل طلبه.
+# إذا بقيت تحية فقط، يرسلها البوت بعد هذه المدة؛ وإذا وصلت رسالة ثانية قبلها
+# تُضم للتحية وتُصنّف كرسالة واحدة.
+INITIAL_GREETING_WAIT_SECONDS = float(os.environ.get("INITIAL_GREETING_WAIT_SECONDS", "60"))
 
 # أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
 TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشاكل الكود
@@ -124,6 +128,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # للمفتاح الجاي بالقائمة تلقائياً، ونحدث المؤشر.
 # ------------------------------------------------------------------
 _current_groq_key_index = 0
+
+# {chat_id: {"task": asyncio.Task, "text": str, "business_connection_id": str,
+#            "message_id": int, "customer_name": str, "customer_username": str}}
+_pending_initial_greetings: dict[int, dict] = {}
 
 
 async def call_groq_api(payload: dict, timeout: float = 20.0) -> dict | None:
@@ -7001,6 +7009,86 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
 
+def _normalize_greeting_text(text: str) -> str:
+    """توحيد نص قصير فقط لغرض معرفة ما إذا كان تحية بلا طلب آخر."""
+    normalized = text.strip().lower()
+    normalized = re.sub(r"[أإآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"[،,.!؟?؛;:\-ـ_]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def is_greeting_only_message(text: str) -> bool:
+    """True للتحيات المعروفة فقط، وليس لتحية مرفقة بطلب أو مشكلة."""
+    normalized = _normalize_greeting_text(text)
+    greeting_phrases = {
+        _normalize_greeting_text(keyword)
+        for category, keywords, _ in FAQ_RULES
+        if category in {"سلام", "ترحيب"}
+        for keyword in keywords
+    }
+    return normalized in greeting_phrases
+
+
+def is_new_customer_conversation(chat_id: int) -> bool:
+    """يؤخر التحية فقط إذا ماكو رسالة حديثة ضمن نفس سياق المحادثة."""
+    try:
+        result = (
+            supabase.table("conversation_archive")
+            .select("created_at")
+            .eq("customer_chat_id", chat_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            return True
+        created_at = datetime.fromisoformat(result.data[0]["created_at"].replace("Z", "+00:00"))
+        return datetime.now(timezone.utc) - created_at >= timedelta(minutes=CONVERSATION_SESSION_GAP_MINUTES)
+    except Exception:
+        # عند تعذر قراءة الأرشيف، نختار الانتظار الآمن للتحية بدل إرسالها وحدها.
+        logger.exception("Failed to determine whether customer conversation is new")
+        return True
+
+
+async def _send_delayed_initial_greeting(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    business_connection_id: str,
+    message_id: int,
+    customer_name: str,
+    customer_username: str | None,
+    text: str,
+) -> None:
+    """يرسل تحية منفردة فقط بعد انتهاء نافذة الانتظار."""
+    try:
+        await asyncio.sleep(INITIAL_GREETING_WAIT_SECONDS)
+        reply = get_exact_test_faq_reply(text)
+        if not reply:
+            return
+        if not should_send_faq_reply(chat_id, "سلام" if "وعليكم" in reply else "ترحيب", reply):
+            archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+            return
+        await human_like_reply_sequence(context, chat_id, business_connection_id, message_id)
+        await context.bot.send_message(
+            business_connection_id=business_connection_id,
+            chat_id=chat_id,
+            text=reply,
+        )
+        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=reply)
+        await notify_owner(context, chat_id, customer_name, customer_username, text, reply)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Failed to send delayed initial greeting")
+    finally:
+        pending = _pending_initial_greetings.get(chat_id)
+        if pending and pending.get("task") is asyncio.current_task():
+            _pending_initial_greetings.pop(chat_id, None)
+
+
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعالج رسائل Telegram Business الجديدة والمعدلة (محادثتك الشخصية)."""
     bm = update.business_message or update.edited_business_message
@@ -7100,6 +7188,43 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
 
+    # لا نرسل تحية البداية وحدها فوراً. ننتظر قليلاً حتى تصل بقية رسالة
+    # الزبون؛ عندها تُصنّف التحية والطلب معاً، فيكون الرد إمّا كاملاً أو صامتاً
+    # إذا كان الطلب غير مدعوم/غير واضح.
+    if not is_from_owner:
+        pending_greeting = _pending_initial_greetings.pop(chat_id, None)
+        if pending_greeting:
+            pending_task = pending_greeting.get("task")
+            if pending_task and not pending_task.done():
+                pending_task.cancel()
+            text = f"{pending_greeting['text']}\n{text}"
+            logger.info("Merged follow-up into pending initial greeting for chat_id=%s", chat_id)
+        elif not is_edited_message and is_greeting_only_message(text) and is_new_customer_conversation(chat_id):
+            pending = {
+                "text": text,
+                "customer_name": customer_name,
+                "customer_username": customer_username,
+                "task": None,
+            }
+            pending["task"] = asyncio.create_task(
+                _send_delayed_initial_greeting(
+                    context,
+                    chat_id,
+                    bm.business_connection_id,
+                    bm.message_id,
+                    customer_name,
+                    customer_username,
+                    text,
+                )
+            )
+            _pending_initial_greetings[chat_id] = pending
+            logger.info(
+                "Delaying initial greeting for chat_id=%s by %ss",
+                chat_id,
+                INITIAL_GREETING_WAIT_SECONDS,
+            )
+            return
+
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
@@ -7115,6 +7240,15 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
     #    يتفعل بس لو فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة
     categories, is_chatgpt_complaint = await classify_intent(text)
+    # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
+    # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
+    # وبين «السلام عليكم، أريد منتجاً غير موجود».
+    if (
+        not is_greeting_only_message(text)
+        and categories
+        and set(categories).issubset({"سلام", "ترحيب"})
+    ):
+        categories = []
     logger.info(f"Classification for chat_id={chat_id}: {categories}")
 
     replies_to_send: list[str] = []
