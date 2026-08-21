@@ -4441,7 +4441,7 @@ async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
     state = _get_retry_state(chat_id)
     if is_private_totp_account(chat_id):
         return None
-    if state["attempt_count"] not in {1, 2} and not state["awaiting_restart_confirmation"]:
+    if state["attempt_count"] not in {1, 2, 4} and not state["awaiting_restart_confirmation"]:
         return None
     normalized = _normalize_greeting_text(text)
     if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
@@ -4903,10 +4903,17 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
     if awaiting_restart:
         if not restart_confirmed:
             return RESTART_CONFIRMATION_MESSAGE, False
-        # بعد تأكيد الريست يبدأ تسلسل جديد من المحاولة الأولى.
-        reset_retry_state(chat_id)
-        attempt_count = 0
-        awaiting_restart = False
+        # بعد تأكيد الريست نرسل الكود الرابع مباشرة؛ إذا فشل بعدها يتوقف
+        # الإرسال التلقائي وتنتقل الحالة إلى موافقة الأونر.
+        code = generate_totp_code(secret)
+        _save_retry_state(chat_id, 4, False)
+        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
+
+    if not is_private_account and attempt_count >= 4:
+        if attempt_count == 4:
+            _save_retry_state(chat_id, 5, False)
+            return STOPPED_MESSAGE, True
+        return None, True
 
     decision = (
         decide_private_code_retry(attempt_count, awaiting_restart)
@@ -4923,6 +4930,45 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
     # المحاولة السادسة وما بعدها: نوقف ونبلغ الأونر.
     _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
     return None, True
+
+
+async def handle_manual_extra_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يتيح للأونر إرسال كود إضافي يدوياً بعد توقف المحاولات التلقائية."""
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    data = query.data or ""
+    try:
+        chat_id = int(data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("معرف الزبون غير صحيح.", show_alert=True)
+        return
+    if data.startswith("code_manual_stop_"):
+        await query.answer("تم إيقاف الأكواد الإضافية.")
+        await query.edit_message_text(query.message.text + "\n\n❌ تم إيقاف الأكواد الإضافية.")
+        return
+    if not data.startswith("code_manual_send_"):
+        return
+    result = get_secret_for_chat(chat_id)
+    if result is None:
+        await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
+        return
+    secret, _ = result
+    code = generate_totp_code(secret)
+    send_kwargs = {"chat_id": chat_id, "text": f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا"}
+    try:
+        reminder = (supabase.table("subscription_reminders")
+            .select("business_connection_id")
+            .eq("customer_chat_id", chat_id).eq("status", "active")
+            .order("started_at", desc=True).limit(1).execute().data or [])
+        if reminder and reminder[0].get("business_connection_id"):
+            send_kwargs["business_connection_id"] = reminder[0]["business_connection_id"]
+        await context.bot.send_message(**send_kwargs)
+        await query.answer("تم إرسال كود إضافي.")
+        await query.edit_message_text(query.message.text + "\n\n➕ تم إرسال كود إضافي للزبون.")
+    except Exception:
+        logger.exception("Failed to send manual extra code to %s", chat_id)
+        await query.answer("تعذر إرسال الكود.", show_alert=True)
 
 
 async def _show_typing(
@@ -8123,7 +8169,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         try:
             await context.bot.send_message(
-                chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_NOTIFICATIONS, text=stopped_notification
+                chat_id=NOTIFICATIONS_GROUP_ID,
+                message_thread_id=TOPIC_NOTIFICATIONS,
+                text=stopped_notification,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ إرسال كود إضافي", callback_data=f"code_manual_send_{chat_id}")],
+                    [InlineKeyboardButton("❌ إيقاف", callback_data=f"code_manual_stop_{chat_id}")],
+                ]),
             )
         except Exception:
             logger.exception("Failed to send stopped-retry notification to owner")
@@ -8232,6 +8284,9 @@ def main() -> None:
 
     # إدارة خزينة حسابات ChatGPT المشتركة — للأونر فقط.
     app.add_handler(CallbackQueryHandler(handle_chatgpt_vault_callback, pattern=r"^vault_"))
+
+    # أزرار الأونر لإرسال كود إضافي أو إيقافه بعد توقف المحاولات التلقائية.
+    app.add_handler(CallbackQueryHandler(handle_manual_extra_code_callback, pattern=r"^code_manual_(?:send|stop)_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
