@@ -905,6 +905,7 @@ BTN_CATALOG = "🗂️ المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
+BTN_PERSONAL_REMINDER = "⏰ تذكير شخصي"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
 BTN_BACK = "◀️ رجوع"
@@ -917,6 +918,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
         [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
+        [KeyboardButton(BTN_PERSONAL_REMINDER)],
         [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
     ],
     resize_keyboard=True,
@@ -2013,6 +2015,34 @@ def build_manual_subscription_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def parse_personal_reminder_input(text: str, now: datetime | None = None) -> tuple[datetime, str] | None:
+    """Parse `YYYY-MM-DD HH:MM | purpose` (or the common DD/MM/YYYY form)."""
+    parts = [part.strip() for part in (text or "").split("|", 1)]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    raw_datetime, purpose = parts
+    parsed = None
+    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            parsed = datetime.strptime(raw_datetime, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    due_at = parsed.replace(tzinfo=timezone(timedelta(hours=3)))
+    current = now or datetime.now(timezone.utc)
+    if due_at.astimezone(timezone.utc) <= current.astimezone(timezone.utc):
+        return None
+    return due_at, purpose
+
+
+def personal_reminder_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ وصلني التذكير", callback_data=f"personal_reminder_ack_{reminder_id}"
+    )]])
+
+
 def format_payment_summary(state: dict) -> str:
     """يبني نص الملخص المعروض فوق الأزرار أثناء تسجيل الدفع."""
     lines = ["تسجيل عملية دفع"]
@@ -2215,6 +2245,7 @@ def save_subscription_reminder(state: dict) -> bool:
         duration_days = 1
     if not chat_id or not duration_days or duration_days <= 0:
         return False
+
     now = datetime.now(timezone.utc)
     try:
         supabase.table("subscription_reminders").insert({
@@ -2240,6 +2271,76 @@ def save_subscription_reminder(state: dict) -> bool:
         return False
 
 
+def save_personal_reminder(due_at: datetime, purpose: str) -> bool:
+    try:
+        supabase.table("personal_reminders").insert({
+            "owner_user_id": OWNER_USER_ID,
+            "remind_at": due_at.astimezone(timezone.utc).isoformat(),
+            "purpose": purpose,
+        }).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to save personal reminder")
+        return False
+
+
+async def check_personal_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Notify due personal reminders and repeat them until acknowledged."""
+    now = datetime.now(timezone.utc)
+    repeat_after = now - timedelta(minutes=15)
+    try:
+        reminders = (supabase.table("personal_reminders")
+            .select("id, remind_at, purpose, last_notified_at, notification_count")
+            .eq("owner_user_id", OWNER_USER_ID).eq("status", "pending")
+            .lte("remind_at", now.isoformat()).execute().data or [])
+    except Exception:
+        logger.exception("Failed to load personal reminders")
+        return
+
+    for reminder in reminders:
+        last_notified = reminder.get("last_notified_at")
+        if last_notified:
+            try:
+                if datetime.fromisoformat(last_notified.replace("Z", "+00:00")) > repeat_after:
+                    continue
+            except ValueError:
+                pass
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=f"⏰ تذكير\n\n{reminder['purpose']}\n\nيبقى هذا التذكير يتكرر كل 15 دقيقة إلى أن تأكد الاستلام.",
+                reply_markup=personal_reminder_keyboard(reminder["id"]),
+            )
+            supabase.table("personal_reminders").update({
+                "last_notified_at": now.isoformat(),
+                "notification_count": (reminder.get("notification_count") or 0) + 1,
+            }).eq("id", reminder["id"]).eq("status", "pending").execute()
+        except Exception:
+            logger.exception("Failed to send personal reminder %s", reminder.get("id"))
+
+
+async def handle_personal_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    try:
+        reminder_id = int(query.data.rsplit("_", 1)[1])
+    except (AttributeError, ValueError, TypeError):
+        await query.answer("التذكير غير صحيح.", show_alert=True)
+        return
+    try:
+        result = (supabase.table("personal_reminders")
+            .update({"status": "acknowledged", "acknowledged_at": datetime.now(timezone.utc).isoformat()})
+            .eq("id", reminder_id).eq("owner_user_id", OWNER_USER_ID).eq("status", "pending")
+            .execute())
+        if not result.data:
+            await query.answer("هذا التذكير مؤكد مسبقاً.", show_alert=True)
+            return
+        await query.answer("تم تأكيد الاستلام.")
+        await query.edit_message_text(query.message.text + "\n\n✅ تم تأكيد الاستلام.")
+    except Exception:
+        logger.exception("Failed to acknowledge personal reminder %s", reminder_id)
+        await query.answer("تعذر تأكيد التذكير، حاول مرة ثانية.", show_alert=True)
 def build_expense_amount_keyboard() -> InlineKeyboardMarkup:
     """شاشة تحديد مبلغ المصروف — نفس أزرار مبلغ الدفع، بس callback_data مختلف."""
     return InlineKeyboardMarkup([
@@ -5508,6 +5609,32 @@ async def handle_manual_subscription_input(update: Update, context: ContextTypes
     return True
 
 
+async def handle_personal_reminder_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.user_data.get("pending_personal_reminder"):
+        return False
+    message = update.message
+    if not message or not message.text:
+        return False
+    parsed = parse_personal_reminder_input(message.text.strip())
+    if parsed is None:
+        await message.reply_text(
+            "الصيغة أو الوقت غير صحيح. اكتب مثلاً:\n"
+            "2026-08-22 15:30 | أتصل بالمورّد\n"
+            "والوقت لازم يكون بالمستقبل."
+        )
+        return True
+    due_at, purpose = parsed
+    if save_personal_reminder(due_at, purpose):
+        context.user_data.pop("pending_personal_reminder", None)
+        await message.reply_text(
+            f"✅ تم حفظ التذكير.\nوقت التنبيه: {due_at.strftime('%Y-%m-%d %H:%M')} بتوقيت بغداد\n"
+            f"الغرض: {purpose}\n\nسأكرره كل 15 دقيقة إلى أن تضغط «وصلني التذكير»."
+        )
+    else:
+        await message.reply_text("⚠️ فشل حفظ التذكير. تأكد من تشغيل ملف Supabase الجديد.")
+    return True
+
+
 async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
@@ -6218,7 +6345,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
-        BTN_SUBSCRIPTION_REMINDER, BTN_INSTAGRAM_ADMIN,
+        BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -6240,6 +6367,16 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         await message.reply_text(
             "اختَر نوع ومدة الاشتراك اللي تريد تضيفه يدوياً:",
             reply_markup=build_manual_subscription_keyboard(),
+        )
+        return True
+
+    if text == BTN_PERSONAL_REMINDER:
+        context.user_data["pending_personal_reminder"] = True
+        await message.reply_text(
+            "اكتب التذكير بهذا الشكل:\n"
+            "YYYY-MM-DD HH:MM | الغرض من التذكير\n\n"
+            "مثال: 2026-08-22 15:30 | أتصل بالمورّد\n"
+            "وتكدر تستخدم أيضاً DD/MM/YYYY HH:MM. الوقت حسب توقيت بغداد."
         )
         return True
 
@@ -6861,6 +6998,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     if await handle_catalog_input(update, context):
         return
     if await handle_manual_subscription_input(update, context):
+        return
+    if await handle_personal_reminder_input(update, context):
         return
     if await handle_manual_product_entry(update, context):
         return
@@ -7776,6 +7915,7 @@ def main() -> None:
         logger.error("JobQueue غير متوفر: ثبّت python-telegram-bot[job-queue] لتفعيل تنبيهات الاشتراكات.")
     else:
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
+        app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
 
     # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
     # Telegram Business، وهي أساس عمل البوت
@@ -7794,6 +7934,7 @@ def main() -> None:
 
     # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
     app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
+    app.add_handler(CallbackQueryHandler(handle_personal_reminder_callback, pattern=r"^personal_reminder_ack_"))
 
     # سؤال الدين والباقته بعد ربط زبون بحساب /link.
     app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan)_"))

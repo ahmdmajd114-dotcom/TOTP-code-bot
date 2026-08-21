@@ -77,6 +77,27 @@ revoke all on table public.subscription_reminders from anon, authenticated;
 grant select, insert, update, delete on table public.subscription_reminders to service_role;
 grant usage, select on sequence public.subscription_reminders_id_seq to service_role;
 
+-- تذكيرات شخصية للأونر: تتكرر كل 15 دقيقة بعد وقتها إلى أن يضغط "وصلني".
+create table if not exists public.personal_reminders (
+  id bigint generated always as identity primary key,
+  owner_user_id bigint not null,
+  remind_at timestamptz not null,
+  purpose text not null,
+  status text not null default 'pending' check (status in ('pending', 'acknowledged', 'cancelled')),
+  last_notified_at timestamptz,
+  notification_count integer not null default 0,
+  acknowledged_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists personal_reminders_due_idx
+  on public.personal_reminders (owner_user_id, remind_at) where status = 'pending';
+
+alter table public.personal_reminders enable row level security;
+revoke all on table public.personal_reminders from anon, authenticated;
+grant select, insert, update, delete on table public.personal_reminders to service_role;
+grant usage, select on sequence public.personal_reminders_id_seq to service_role;
+
 -- ترحيل مرة واحدة للزبائن القدامى المرتبطين حالياً بـ /link:
 -- نعطي كل واحد اشتراكاً مشتركاً لمدة شهرين من وقت تشغيل هذا الملف، حتى
 -- يبقى حق طلب الكود متاحاً ولا تحتاج تضيفهم يدوياً واحداً واحداً.
