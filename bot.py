@@ -3978,7 +3978,11 @@ def keyword_match_categories(text: str) -> list[str]:
             keyword = re.sub(r"[أإآٱ]", "ا", keyword)
             keyword = keyword.replace("ى", "ي").replace("ة", "ه")
             keyword = re.sub(r"(.)\1{2,}", r"\1", keyword)
-            pos = normalized.find(keyword)
+            # طابق الكلمة/العبارة كاملة، لا جزءاً داخل كلمة ثانية؛ هذا يمنع
+            # كلمة قصيرة مثل «تلي» من تشغيل رد تليجرام داخل نص غير متعلق.
+            pattern = rf"(?<![\w\u0600-\u06ff]){re.escape(keyword)}(?![\w\u0600-\u06ff])"
+            match = re.search(pattern, normalized)
+            pos = match.start() if match else -1
             if pos != -1 and (best_position is None or pos < best_position):
                 best_position = pos
         if best_position is not None:
@@ -3988,7 +3992,9 @@ def keyword_match_categories(text: str) -> list[str]:
         keyword = kw.lower()
         keyword = re.sub(r"[أإآٱ]", "ا", keyword)
         keyword = keyword.replace("ى", "ي").replace("ة", "ه")
-        pos = normalized.find(keyword)
+        pattern = rf"(?<![\w\u0600-\u06ff]){re.escape(keyword)}(?![\w\u0600-\u06ff])"
+        match = re.search(pattern, normalized)
+        pos = match.start() if match else -1
         if pos != -1:
             matches.append((pos, "طلب_كود"))
             break  # فئة وحدة كافية لطلب الكود
