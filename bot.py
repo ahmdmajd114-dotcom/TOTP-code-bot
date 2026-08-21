@@ -963,9 +963,14 @@ def instagram_shared_accounts_keyboard() -> InlineKeyboardMarkup:
     accounts = get_chatgpt_shared_accounts()
     rows = []
     for account in accounts:
+        used = get_instagram_shared_account_usage(account)
+        capacity = min(int(account.get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
+        remaining = max(0, capacity - used)
+        if remaining <= 0:
+            continue
         label = account.get("email") or "حساب مشترك"
         account_id = account.get("id")
-        rows.append([InlineKeyboardButton(label, callback_data=f"ig_shared_{account_id}")])
+        rows.append([InlineKeyboardButton(f"{label} — متبقي {remaining}", callback_data=f"ig_shared_{account_id}")])
     if not rows:
         rows.append([InlineKeyboardButton("⚠️ لا توجد حسابات مشتركة", callback_data="ig_noop")])
     return InlineKeyboardMarkup(rows)
@@ -3189,6 +3194,27 @@ def get_instagram_account_sales(account_id: str) -> list[list[str]]:
     except Exception:
         logger.exception("Failed to fetch Instagram sales for account %s", account_id)
         return []
+
+
+def get_instagram_shared_account_usage(account: dict) -> int:
+    """Count active Telegram assignments plus confirmed Instagram seats."""
+    account_id = str(account.get("id") or "")
+    try:
+        if str(account_id).startswith("legacy:"):
+            telegram_used = len(get_customers_for_account(account_id[len("legacy:"):]))
+        else:
+            assignments = (
+                supabase.table("chatgpt_account_assignments")
+                .select("id")
+                .eq("account_id", account_id)
+                .eq("status", "active")
+                .execute().data or []
+            )
+            telegram_used = len(assignments)
+        return telegram_used + len(get_instagram_account_sales(account_id))
+    except Exception:
+        logger.exception("Failed to calculate available seats for account %s", account_id)
+        return 0
 
 
 def get_all_accounts_with_secrets() -> list[dict]:
@@ -6931,6 +6957,15 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             "account_id": state.get("account_id"),
             "account_display": state.get("account_display"),
         }
+        if sale.get("account_source") == "shared":
+            selected_accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == str(sale.get("account_id"))]
+            if not selected_accounts:
+                await query.edit_message_text("⚠️ الحساب المشترك لم يعد متاحاً.")
+                return
+            capacity = min(int(selected_accounts[0].get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
+            if get_instagram_shared_account_usage(selected_accounts[0]) >= capacity:
+                await query.edit_message_text("⚠️ هذا الحساب امتلأ أثناء التسجيل. ابدأ العملية واختر حساباً آخر.")
+                return
         saved = append_instagram_sale(sale)
         reminder_saved = save_instagram_subscription_reminder(sale, state) if saved else False
         if saved and sale.get("instagram_account"):
@@ -6968,6 +7003,8 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text(
                 "✅ تم حفظ عملية بيع الإنستغرام\n"
                 f"رقم العملية: {sale['sale_id']}\n"
+                f"الحساب: {sale.get('account_display') or '—'}\n"
+                f"المدة: {sale.get('duration_months') or '—'} شهر\n"
                 f"العمولة: {format_iqd(sale['commission'])}\n"
                 + ("🔔 تم تسجيل تنبيه الانتهاء." if reminder_saved else "⚠️ لم يتم تسجيل تنبيه الانتهاء.")
                 , reply_markup=InlineKeyboardMarkup(
@@ -7041,6 +7078,11 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
         accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]
         if not accounts:
             await query.answer("الحساب غير موجود أو متوقف.", show_alert=True)
+            return
+        account = accounts[0]
+        capacity = min(int(account.get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
+        if get_instagram_shared_account_usage(account) >= capacity:
+            await query.answer("هذا الحساب امتلأ، اختَر حساباً متوفراً.", show_alert=True)
             return
         state.update({"account_source": "shared", "account_source_label": "مشترك من عدنا", "account_id": account_id, "account_display": accounts[0].get("email") or "حساب مشترك", "step": "duration"})
         await query.edit_message_text("اختَر مدة الاشتراك:", reply_markup=instagram_duration_keyboard())
