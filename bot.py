@@ -1515,10 +1515,37 @@ def build_shared_vault_accounts_keyboard(accounts: list[dict]) -> InlineKeyboard
 
 def build_shared_account_actions_keyboard(account_id: str, legacy: bool = False) -> InlineKeyboardMarkup:
     prefix = "vault_legacy_relogin_" if legacy else "vault_relogin_"
+    cancel_prefix = "vault_cancel_customer_legacy_" if legacy else "vault_cancel_customer_native_"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📣 إرسال طلب إعادة تسجيل الدخول", callback_data=f"{prefix}{account_id}")],
+        [InlineKeyboardButton("🗑️ إلغاء ارتباط زبون", callback_data=f"{cancel_prefix}{account_id}")],
         [InlineKeyboardButton("◀️ رجوع للحسابات", callback_data="vault_accounts")],
     ])
+
+
+def get_latest_customer_payment(chat_id: int) -> tuple[int, list[str]] | None:
+    sheet = get_google_sheet()
+    if sheet is None:
+        return None
+    try:
+        rows = sheet.get_all_values()
+        for row_number in range(len(rows), 1, -1):
+            row = rows[row_number - 1]
+            if len(row) >= SHEET_COL_CHAT_ID and row[SHEET_COL_CHAT_ID - 1].strip() == str(chat_id):
+                if row[SHEET_COL_TOTAL - 1].strip() and row[SHEET_COL_PAYMENTS - 1].strip() != "ملغاة":
+                    return row_number, row
+    except Exception:
+        logger.exception("Failed to find customer payment for cancellation")
+    return None
+
+
+def parse_payment_vault_amounts(payments_text: str) -> dict[str, int]:
+    amounts: dict[str, int] = {}
+    for vault in VAULT_NAMES:
+        match = re.search(rf"{re.escape(vault)}\s+([\d,]+)", payments_text or "")
+        if match:
+            amounts[vault] = int(match.group(1).replace(",", ""))
+    return amounts
 
 
 async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAULT_TYPE, account_id: str) -> tuple[int, int]:
@@ -1616,6 +1643,71 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
     if query is None or query.from_user.id != OWNER_USER_ID:
         return
     await query.answer()
+    if query.data.startswith("vault_cancel_customer_"):
+        remainder = query.data[len("vault_cancel_customer_"):]
+        source, account_id = remainder.split("_", 1)
+        context.user_data["pending_cancel_customer"] = {"source": source, "account_id": account_id}
+        await query.edit_message_text(
+            "أرسل chat_id للزبون المراد إلغاء ارتباطه كـ رد على هذه الرسالة.\n"
+            "راح أعرض لك تفاصيل الدفع قبل أي إلغاء."
+        )
+        return
+    if query.data.startswith("vault_cancel_confirm_"):
+        parts = query.data[len("vault_cancel_confirm_"):].split("_", 3)
+        if len(parts) != 4:
+            await query.edit_message_text("⚠️ بيانات الإلغاء غير صحيحة.")
+            return
+        source, account_id, chat_id_text, row_text = parts
+        try:
+            chat_id, row_number = int(chat_id_text), int(row_text)
+        except ValueError:
+            await query.edit_message_text("⚠️ بيانات الزبون غير صحيحة.")
+            return
+        sheet = get_google_sheet()
+        payment_row = None
+        if sheet is not None:
+            try:
+                rows = sheet.get_all_values()
+                if 1 < row_number <= len(rows):
+                    payment_row = rows[row_number - 1]
+            except Exception:
+                logger.exception("Failed to read payment before cancellation")
+        if payment_row is None or len(payment_row) < SHEET_COL_CHAT_ID or payment_row[SHEET_COL_CHAT_ID - 1].strip() != str(chat_id):
+            await query.edit_message_text("⚠️ عملية الدفع غير موجودة أو تغيرت. أعد المحاولة.")
+            return
+        vault_amounts = parse_payment_vault_amounts(payment_row[SHEET_COL_PAYMENTS - 1])
+        changed = []
+        for vault, amount in vault_amounts.items():
+            if not adjust_vault_balance(vault, -amount):
+                for previous_vault, previous_amount in changed:
+                    adjust_vault_balance(previous_vault, previous_amount)
+                await query.edit_message_text("⚠️ تعذر تعديل الخزنة، لم يتم الإلغاء.")
+                return
+            changed.append((vault, amount))
+        try:
+            sheet.update_cell(row_number, SHEET_COL_TOTAL, "")
+            sheet.update_cell(row_number, SHEET_COL_PAYMENTS, "ملغاة")
+            sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")
+            if source == "native":
+                supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq("account_id", account_id).eq("customer_chat_id", chat_id).eq("status", "active").execute()
+            else:
+                supabase.table("totp_links").delete().eq("account_id", account_id).eq("chat_id", chat_id).execute()
+            supabase.table("subscription_reminders").update({"status": "cancelled"}).eq("customer_chat_id", chat_id).eq("subscription_type", "shared").eq("status", "active").execute()
+            context.user_data.pop("pending_cancel_customer", None)
+            await query.edit_message_text(
+                f"✅ تم إلغاء ارتباط الزبون وإلغاء الدفع.\n"
+                f"المبلغ المرتجع للخزنة: {', '.join(f'{v} {a}' for v, a in vault_amounts.items()) or '—'}"
+            )
+        except Exception:
+            for vault, amount in changed:
+                adjust_vault_balance(vault, amount)
+            logger.exception("Failed to complete customer cancellation")
+            await query.edit_message_text("⚠️ تعذر إكمال الإلغاء، وتمت محاولة إرجاع تعديل الخزنة.")
+        return
+    if query.data.startswith("vault_cancel_abort_"):
+        context.user_data.pop("pending_cancel_customer", None)
+        await query.edit_message_text("تم إلغاء العملية بدون أي تغيير.")
+        return
     if query.data == "vault_accounts":
         accounts = get_chatgpt_shared_accounts()
         await query.edit_message_text(
@@ -1728,6 +1820,35 @@ async def handle_shared_account_input(update: Update, context: ContextTypes.DEFA
         await show_chatgpt_shared_vault(message)
         return True
     return False
+
+
+async def handle_cancel_customer_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    state = context.user_data.get("pending_cancel_customer")
+    message = update.message
+    if not state or not message or not message.text or not message.reply_to_message:
+        return False
+    try:
+        chat_id = int(message.text.strip())
+    except ValueError:
+        await message.reply_text("أرسل chat_id صحيح كرقم فقط.")
+        return True
+    payment = get_latest_customer_payment(chat_id)
+    if payment is None:
+        await message.reply_text("ما لكيت دفعة مسجلة لهذا الزبون حتى ألغيها.")
+        return True
+    row_number, row = payment
+    context.user_data["pending_cancel_customer"]["chat_id"] = chat_id
+    await message.reply_text(
+        f"⚠️ تأكيد الإلغاء\n\nالزبون: {chat_id}\n"
+        f"المنتج: {row[3] if len(row) > 3 else '—'}\n"
+        f"المبلغ: {row[1]}\nطرق الدفع: {row[2]}\n\n"
+        "سيُفك الربط، يُلغى الدفع، ويُخصم المبلغ من الخزنة. هل تؤكد؟",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ نعم، ألغِ الربط والدفع", callback_data=f"vault_cancel_confirm_{state['source']}_{state['account_id']}_{chat_id}_{row_number}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data=f"vault_cancel_abort_{chat_id}")],
+        ]),
+    )
+    return True
 
 
 async def handle_payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2143,6 +2264,9 @@ def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
         total_empty = not row[SHEET_COL_TOTAL - 1].strip() if len(row) >= SHEET_COL_TOTAL else True
         payments_empty = not row[SHEET_COL_PAYMENTS - 1].strip() if len(row) >= SHEET_COL_PAYMENTS else True
         account_empty = not row[SHEET_COL_CHATGPT_ACCOUNT - 1].strip() if len(row) >= SHEET_COL_CHATGPT_ACCOUNT else True
+
+        if len(row) >= SHEET_COL_PAYMENTS and row[SHEET_COL_PAYMENTS - 1].strip() == "ملغاة":
+            continue
 
         if total_empty or payments_empty or account_empty:
             return i + 1  # gspread صفوف 1-indexed
@@ -3294,6 +3418,8 @@ def calculate_product_breakdown(period_key: str) -> str:
             amount = int(float(amount_str)) if amount_str else 0
         except ValueError:
             amount = 0
+        if amount <= 0:
+            continue
 
         product_totals[product] = product_totals.get(product, 0) + amount
         product_counts[product] = product_counts.get(product, 0) + 1
@@ -7084,6 +7210,8 @@ async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_T
     if await handle_teaching_message(update, context):
         return
     if await handle_payment_method_input(update, context):
+        return
+    if await handle_cancel_customer_input(update, context):
         return
     if await handle_shared_account_input(update, context):
         return
