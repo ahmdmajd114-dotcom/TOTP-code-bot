@@ -4436,6 +4436,61 @@ async def infer_contextual_payment_request(chat_id: int, text: str) -> bool:
     return any(term in normalized for term in ("هسه شسوي", "شنو اسوي", "شلون اكمل", "كيف اكمل", "بعدها شنو", "الخطوه الجايه"))
 
 
+async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
+    """يصنف ردود ما بعد الكود: retry أو restart_done أو لا علاقة لها بالكود."""
+    state = _get_retry_state(chat_id)
+    if is_private_totp_account(chat_id):
+        return None
+    if state["attempt_count"] not in {1, 2} and not state["awaiting_restart_confirmation"]:
+        return None
+    normalized = _normalize_greeting_text(text)
+    if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
+        return None
+    try:
+        rows = (supabase.table("conversation_archive")
+            .select("sender_type, message_text")
+            .eq("customer_chat_id", chat_id)
+            .order("created_at", desc=True).limit(10).execute().data or [])
+    except Exception:
+        logger.exception("Failed to load context for code retry intent")
+        rows = []
+    latest_bot = next((row for row in rows if row.get("sender_type") == "bot"), None)
+    if not latest_bot or not ("الكود:" in (latest_bot.get("message_text") or "") or state["awaiting_restart_confirmation"]):
+        return None
+    context_lines = []
+    for row in reversed(rows):
+        value = (row.get("message_text") or "").strip()
+        if value:
+            context_lines.append(("الزبون" if row.get("sender_type") == "customer" else "البوت") + f": {redact_context_text(value)}")
+    prompt = (
+        "أنت مصنف سياق لطلب كود دخول لحساب ChatGPT مشترك. لا تكتب رداً.\n"
+        "أجب retry إذا كان كلام الزبون يعني أن الكود لم يعمل أو يريد كوداً آخر، حتى لو لم يذكر كلمة كود.\n"
+        "أجب restart_done إذا قال إنه عمل رست/حذف الحساب/بدأ من جديد ويريد الكود بعد الريست.\n"
+        "أجب no_reply إذا كانت الرسالة شكراً أو تمام أو لا علاقة لها. كلمة واحدة فقط.\n\n"
+        f"السياق:\n{chr(10).join(context_lines[-8:])}\n\n"
+        f"الرسالة الحالية: {redact_context_text(text)}"
+    )
+    try:
+        data = await call_groq_api({
+            "model": CHATGPT_CONTEXT_MODEL,
+            "temperature": 0,
+            "max_completion_tokens": 20,
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": prompt}],
+        }, timeout=8.0)
+        raw = ((data or {}).get("choices") or [{}])[0].get("message", {}).get("content", "").strip().lower()
+        if raw in {"retry", "restart_done"}:
+            return raw
+    except Exception:
+        logger.exception("Failed to classify contextual code retry request")
+
+    if state["awaiting_restart_confirmation"] and any(term in normalized for term in ("سويت رست", "سويت ريست", "حذفت", "من البدايه", "من البداية")):
+        return "restart_done"
+    if any(term in normalized for term in ("ما اشتغل", "مايشتغل", "ما يشتغل", "ماصار", "ما صار", "مافتح", "ما فتح", "نزلي", "دزلي", "ثاني", "مره ثانيه", "مرة ثانية")):
+        return "retry"
+    return None
+
+
 def get_reply_for_category(category: str) -> str | None:
     """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/شكوى)."""
     for cat_name, _, reply in FAQ_RULES:
@@ -4809,13 +4864,18 @@ RESTART_MESSAGE = (
     "وابدأ عملية التسجيل من جديد من الأول، وبعدها راسلني وبعطيك كود جديد."
 )
 
+RESTART_CONFIRMATION_MESSAGE = (
+    "تمام. سوّي الريست واحذف الحساب من تطبيق Authenticator، وبعدها اكتبلي "
+    "«سويت رست» حتى أنزلك كود جديد."
+)
+
 STOPPED_MESSAGE = (
     "يبدو انه فيه مشكلة مستمرة، حولت طلبك لصاحب المتجر مباشرة "
     "وراح يتواصل معك قريباً."
 )
 
 
-def process_code_request(chat_id: int) -> tuple[str | None, bool]:
+def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple[str | None, bool]:
     """
     يقرر شنو الرد المناسب لطلب كود، حسب حالة عداد المحاولات.
 
@@ -4839,6 +4899,14 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
         return None, False
 
     secret, label = result
+
+    if awaiting_restart:
+        if not restart_confirmed:
+            return RESTART_CONFIRMATION_MESSAGE, False
+        # بعد تأكيد الريست يبدأ تسلسل جديد من المحاولة الأولى.
+        reset_retry_state(chat_id)
+        attempt_count = 0
+        awaiting_restart = False
 
     decision = (
         decide_private_code_retry(attempt_count, awaiting_restart)
@@ -7982,6 +8050,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         categories.append("طرق الدفع")
         logger.info("Inferred contextual payment request for chat_id=%s", chat_id)
+    contextual_code_action = await infer_contextual_code_request(chat_id, text)
+    restart_confirmed = contextual_code_action == "restart_done"
+    if contextual_code_action in {"retry", "restart_done"} and "طلب_كود" not in categories:
+        categories.append("طلب_كود")
+        logger.info("Inferred contextual code action=%s for chat_id=%s", contextual_code_action, chat_id)
     # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
     # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
     # وبين «السلام عليكم، أريد منتجاً غير موجود».
@@ -8007,7 +8080,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if category == "طلب_كود":
             # طلب كود — الشرط الأساسي يضل الربط المسبق بـ /link، وبعده
             # عداد المحاولات (process_code_request) يقرر شنو الرد بالضبط
-            reply_text, stopped = process_code_request(chat_id)
+            reply_text, stopped = process_code_request(chat_id, restart_confirmed=restart_confirmed)
             if reply_text:
                 replies_to_send.append(reply_text)
             if stopped:
