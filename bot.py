@@ -88,6 +88,10 @@ SUBSCRIPTION_FEEDBACK_URL = os.environ.get("SUBSCRIPTION_FEEDBACK_URL", "").stri
 # إذا بقيت تحية فقط، يرسلها البوت بعد هذه المدة؛ وإذا وصلت رسالة ثانية قبلها
 # تُضم للتحية وتُصنّف كرسالة واحدة.
 INITIAL_GREETING_WAIT_SECONDS = float(os.environ.get("INITIAL_GREETING_WAIT_SECONDS", "60"))
+# التحية وحدها لا تُرسل خلال فترة الهدوء الليلية؛ الطلب الواضح داخل نفس
+# الرسالة يبقى فورياً، وكذلك أي متابعة تصل قبل إرسال التحية المؤجلة.
+QUIET_HOURS_START = (0, 30)
+QUIET_HOURS_END = (9, 0)
 
 # أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
 TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشاكل الكود
@@ -7683,6 +7687,21 @@ def is_greeting_only_message(text: str) -> bool:
     return normalized in greeting_phrases
 
 
+def seconds_until_customer_replies_allowed(now: datetime | None = None) -> float:
+    """يرجع ثواني الانتظار إذا كانت الساعة ضمن فترة الهدوء، وإلا صفر."""
+    baghdad = timezone(timedelta(hours=3))
+    current = now.astimezone(baghdad) if now else datetime.now(baghdad)
+    start_hour, start_minute = QUIET_HOURS_START
+    end_hour, end_minute = QUIET_HOURS_END
+    quiet_start = current.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    quiet_end = current.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    if current < quiet_start:
+        return 0
+    if current < quiet_end:
+        return max(0, (quiet_end - current).total_seconds())
+    return 0
+
+
 def is_new_customer_conversation(chat_id: int) -> bool:
     """يؤخر التحية فقط إذا ماكو رسالة حديثة ضمن نفس سياق المحادثة."""
     try:
@@ -7716,6 +7735,10 @@ async def _send_delayed_initial_greeting(
     """يرسل تحية منفردة فقط بعد انتهاء نافذة الانتظار."""
     try:
         await asyncio.sleep(INITIAL_GREETING_WAIT_SECONDS)
+        quiet_wait = seconds_until_customer_replies_allowed()
+        if quiet_wait:
+            logger.info("Holding greeting until 09:00 Baghdad for chat_id=%s", chat_id)
+            await asyncio.sleep(quiet_wait)
         reply = get_exact_test_faq_reply(text)
         if not reply:
             return
