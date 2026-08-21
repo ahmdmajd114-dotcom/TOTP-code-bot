@@ -7105,7 +7105,15 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             if get_instagram_shared_account_usage(selected_accounts[0]) >= capacity:
                 await query.edit_message_text("⚠️ هذا الحساب امتلأ أثناء التسجيل. ابدأ العملية واختر حساباً آخر.")
                 return
+        # مبيعات إنستغرام تدخل مباشرة إلى الخزنة التي اختارها المدير.
+        wallet_added = adjust_vault_balance(sale["wallet"], sale["amount"])
+        if not wallet_added:
+            await query.edit_message_text("⚠️ تعذر تحديث الخزنة. لم يتم حفظ عملية البيع.")
+            return
         saved = append_instagram_sale(sale)
+        if not saved:
+            # إذا فشل سجل المبيعات، نرجع الزيادة حتى لا يبقى الرصيد خاطئاً.
+            adjust_vault_balance(sale["wallet"], -sale["amount"])
         reminder_saved = save_instagram_subscription_reminder(sale, state) if saved else False
         if saved and sale.get("instagram_account"):
             # هذا الحقل هو المعرف الذي يدخله مدير مبيعات الإنستغرام.
@@ -7134,6 +7142,7 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
                         + f"\nالمبلغ: {format_iqd(sale['amount'])}"
                         + f"\nالمدة: {sale.get('duration_months') or state.get('duration_months') or '—'} شهر"
                         + f"\nالحساب المستخدم: {sale.get('account_display') or '—'}"
+                        + f"\nالخزنة: {sale['wallet']} (تمت إضافة مبلغ البيع)"
                         + f"\nالعمولة: {format_iqd(sale['commission'])}"
                     ),
                 )
@@ -7144,6 +7153,7 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
                 f"رقم العملية: {sale['sale_id']}\n"
                 f"الحساب: {sale.get('account_display') or '—'}\n"
                 f"المدة: {sale.get('duration_months') or '—'} شهر\n"
+                f"الخزنة: {sale['wallet']} (تمت إضافة مبلغ البيع)\n"
                 f"العمولة: {format_iqd(sale['commission'])}\n"
                 + ("🔔 تم تسجيل تنبيه الانتهاء." if reminder_saved else "⚠️ لم يتم تسجيل تنبيه الانتهاء.")
                 , reply_markup=InlineKeyboardMarkup(
@@ -7402,10 +7412,30 @@ async def handle_instagram_commission_paid_callback(update: Update, context: Con
             await query.edit_message_text("العملية غير موجودة.")
             return
         row_number, row = match
+        if len(row) > 10 and row[10].strip() == "نعم":
+            await query.edit_message_text(f"✅ العمولة مسددة مسبقاً للعملية {sale_id}.")
+            return
+        wallet = row[5].strip() if len(row) > 5 else ""
+        commission = parse_amount(row[8]) if len(row) > 8 else None
+        if wallet not in VAULT_NAMES or commission is None:
+            await query.edit_message_text("⚠️ بيانات الخزنة أو العمولة غير صالحة لهذه العملية.")
+            return
+        if not adjust_vault_balance(wallet, -commission):
+            await query.edit_message_text("⚠️ تعذر خصم العمولة من الخزنة. لم يتم تأكيد الدفع.")
+            return
+        expense_reason = f"عمولة إنستغرام — العملية {sale_id} — @{row[2]}"
+        if not append_expense_row(commission, expense_reason):
+            adjust_vault_balance(wallet, commission)
+            await query.edit_message_text("⚠️ تعذر تسجيل العمولة كمصروف. لم يتم تأكيد الدفع.")
+            return
         sheet.update_cell(row_number, 11, "نعم")
         sheet.update_cell(row_number, 19, datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        await send_expense_notification(context, {
+            "amount": commission, "reason": expense_reason, "vault": wallet,
+        })
         await query.edit_message_text(
-            f"✅ تم تسجيل دفع العمولة\nرقم العملية: {sale_id}\nالعمولة: {row[8]}",
+            f"✅ تم تسجيل دفع العمولة\nرقم العملية: {sale_id}\nالعمولة: {row[8]}\n"
+            f"الخزنة: {wallet} (-{format_iqd(commission)})\nتم تسجيلها ضمن المصروفات.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع للعمولات", callback_data="igadmin_list")]]),
         )
     except Exception:
