@@ -3034,6 +3034,16 @@ def calculate_income_report() -> str:
         if row_date >= month_start:
             total_month += amount
 
+    instagram_rows = get_instagram_sales_rows_in_period("today")
+    if instagram_rows is not None:
+        total_today += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
+    instagram_rows = get_instagram_sales_rows_in_period("week")
+    if instagram_rows is not None:
+        total_week += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
+    instagram_rows = get_instagram_sales_rows_in_period("month")
+    if instagram_rows is not None:
+        total_month += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
+
     return (
         "تقرير الدخل\n\n"
         f"اليوم: {total_today}\n"
@@ -3047,30 +3057,53 @@ def calculate_income_report() -> str:
 # الوقت/تاريخ محدد يدوي)، تفصيل حسب المنتج، وإحصائيات حسابات ChatGPT.
 # ------------------------------------------------------------------
 
-def parse_stats_period(period_key: str) -> tuple[object, object] | None:
+STATS_TIMEZONE = timezone(timedelta(hours=3))
+
+
+def parse_stats_datetime(value: str) -> datetime:
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value.strip(), fmt).replace(tzinfo=STATS_TIMEZONE)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date/time: {value!r}")
+
+
+def parse_stats_period(period_key: str) -> tuple[datetime, datetime] | None:
     """
     يحول مفتاح فترة (جاهز أو نص يدوي) إلى (start_date, end_date) شامل
     الطرفين. يرجع None لو الفترة "كل الوقت" (بدون حدود)، أو يرمي
     ValueError لو نص يدوي غير مفهوم.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(STATS_TIMEZONE)
     today = now.date()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=STATS_TIMEZONE)
+    day_end = datetime.combine(today, datetime.max.time(), tzinfo=STATS_TIMEZONE)
 
     if period_key == "today":
-        return today, today
+        return day_start, day_end
     if period_key == "week":
         week_start = today - timedelta(days=today.weekday())
-        return week_start, today
+        return datetime.combine(week_start, datetime.min.time(), tzinfo=STATS_TIMEZONE), day_end
     if period_key == "month":
         month_start = today.replace(day=1)
-        return month_start, today
+        return datetime.combine(month_start, datetime.min.time(), tzinfo=STATS_TIMEZONE), day_end
     if period_key == "all":
         return None
+
+    # نطاق يدوي: YYYY-MM-DD HH:MM إلى YYYY-MM-DD HH:MM
+    range_parts = re.split(r"\s+(?:إلى|الى|to)\s+", period_key, maxsplit=1, flags=re.IGNORECASE)
+    if len(range_parts) == 2:
+        start = parse_stats_datetime(range_parts[0])
+        end = parse_stats_datetime(range_parts[1])
+        if end < start:
+            raise ValueError("نهاية الفترة أقدم من بدايتها")
+        return start, end
 
     # نص يدوي: YYYY-MM-DD (يوم محدد) أو YYYY-MM (شهر محدد)
     if len(period_key) == 10:
         d = datetime.strptime(period_key, "%Y-%m-%d").date()
-        return d, d
+        return datetime.combine(d, datetime.min.time(), tzinfo=STATS_TIMEZONE), datetime.combine(d, datetime.max.time(), tzinfo=STATS_TIMEZONE)
     if len(period_key) == 7:
         d = datetime.strptime(period_key + "-01", "%Y-%m-%d").date()
         if d.month == 12:
@@ -3078,7 +3111,7 @@ def parse_stats_period(period_key: str) -> tuple[object, object] | None:
         else:
             next_month = d.replace(month=d.month + 1)
         month_end = next_month - timedelta(days=1)
-        return d, month_end
+        return datetime.combine(d, datetime.min.time(), tzinfo=STATS_TIMEZONE), datetime.combine(month_end, datetime.max.time(), tzinfo=STATS_TIMEZONE)
 
     raise ValueError(f"Unrecognized period format: {period_key!r}")
 
@@ -3108,7 +3141,7 @@ def get_payment_rows_in_period(period_key: str) -> list[list[str]] | None:
         if len(row) < 1 or not row[0].strip():
             continue
         try:
-            row_date = datetime.strptime(row[0].split(" ")[0], "%Y-%m-%d").date()
+            row_date = parse_stats_datetime(row[0])
         except (ValueError, IndexError):
             continue
 
@@ -3144,7 +3177,7 @@ def get_expense_rows_in_period(period_key: str) -> list[list[str]] | None:
         if len(row) < 1 or not row[0].strip():
             continue
         try:
-            row_date = datetime.strptime(row[0].split(" ")[0], "%Y-%m-%d").date()
+            row_date = parse_stats_datetime(row[0])
         except (ValueError, IndexError):
             continue
 
@@ -3155,6 +3188,31 @@ def get_expense_rows_in_period(period_key: str) -> list[list[str]] | None:
 
         filtered.append(row)
 
+    return filtered
+
+
+def get_instagram_sales_rows_in_period(period_key: str) -> list[list[str]] | None:
+    """يرجع مبيعات إنستغرام المؤكدة ضمن الفترة، حسب وقت البيع."""
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        return None
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read Instagram sales for stats")
+        return None
+    date_range = parse_stats_period(period_key)
+    filtered = []
+    for row in rows[1:]:
+        if len(row) < 10 or row[9].strip() != "مؤكدة":
+            continue
+        try:
+            row_datetime = parse_stats_datetime(row[1])
+        except (ValueError, IndexError):
+            continue
+        if date_range is not None and not (date_range[0] <= row_datetime <= date_range[1]):
+            continue
+        filtered.append(row)
     return filtered
 
 
@@ -3171,8 +3229,9 @@ def calculate_totals_summary(period_key: str) -> str:
     """يحسب دخل/مصروف/صافي إجمالي لفترة معينة. يرجع نص جاهز للعرض."""
     payment_rows = get_payment_rows_in_period(period_key)
     expense_rows = get_expense_rows_in_period(period_key)
+    instagram_rows = get_instagram_sales_rows_in_period(period_key)
 
-    if payment_rows is None or expense_rows is None:
+    if payment_rows is None or expense_rows is None or instagram_rows is None:
         return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
 
     total_income = 0
@@ -3182,6 +3241,9 @@ def calculate_totals_summary(period_key: str) -> str:
                 total_income += int(float(row[1]))
             except ValueError:
                 continue
+
+    instagram_income = sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
+    total_income += instagram_income
 
     total_expense = 0
     for row in expense_rows:
@@ -3197,6 +3259,7 @@ def calculate_totals_summary(period_key: str) -> str:
     return (
         f"إحصائيات {label}\n\n"
         f"الدخل: {total_income}\n"
+        f"منه مبيعات إنستغرام: {instagram_income}\n"
         f"المصروف: {total_expense}\n"
         f"الصافي: {net}"
     )
@@ -3205,11 +3268,12 @@ def calculate_totals_summary(period_key: str) -> str:
 def calculate_product_breakdown(period_key: str) -> str:
     """يحسب دخل + عدد عمليات لكل منتج بفترة معينة. يرجع نص جاهز للعرض."""
     payment_rows = get_payment_rows_in_period(period_key)
-    if payment_rows is None:
+    instagram_rows = get_instagram_sales_rows_in_period(period_key)
+    if payment_rows is None or instagram_rows is None:
         return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
 
     label = format_period_label(period_key)
-    if not payment_rows:
+    if not payment_rows and not instagram_rows:
         return f"ماكو أي عمليات دفع مسجلة لفترة {label}."
 
     product_totals: dict[str, int] = {}
@@ -3227,6 +3291,14 @@ def calculate_product_breakdown(period_key: str) -> str:
         except ValueError:
             amount = 0
 
+        product_totals[product] = product_totals.get(product, 0) + amount
+        product_counts[product] = product_counts.get(product, 0) + 1
+
+    for row in instagram_rows:
+        if len(row) < 7:
+            continue
+        product = row[3].strip() or "غير محدد"
+        amount = parse_amount(row[6]) or 0
         product_totals[product] = product_totals.get(product, 0) + amount
         product_counts[product] = product_counts.get(product, 0) + 1
 
@@ -6067,7 +6139,9 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         next_action = data[len("stats_period_manual_"):]
         _pending_stats_period = {"message_id": query.message.message_id, "next_action": next_action}
         await query.edit_message_text(
-            text="اكتب التاريخ كـ رد على هذي الرسالة (مثال: 2026-07 لشهر، أو 2026-07-15 ليوم):",
+            text=("اكتب الفترة كـ رد على هذي الرسالة.\n"
+                  "يوم: 2026-08-21\n"
+                  "أو نطاق بالوقت: 2026-08-21 09:00 إلى 2026-08-21 18:00"),
             reply_markup=None,
         )
         return
@@ -6628,7 +6702,10 @@ async def handle_stats_manual_period_entry(update: Update, context: ContextTypes
     try:
         parse_stats_period(period_key)
     except ValueError:
-        await message.reply_text("صيغة غير صحيحة. استخدم YYYY-MM أو YYYY-MM-DD (مثال: 2026-07 أو 2026-07-15).")
+        await message.reply_text(
+            "صيغة غير صحيحة. استخدم مثلاً:\n"
+            "2026-08-21\nأو\n2026-08-21 09:00 إلى 2026-08-21 18:00"
+        )
         return True
 
     back_target = "stats_totals_period" if next_action == "totals" else "stats_products_period"
