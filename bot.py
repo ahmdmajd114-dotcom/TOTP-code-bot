@@ -4441,7 +4441,7 @@ async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
     state = _get_retry_state(chat_id)
     if is_private_totp_account(chat_id):
         return None
-    if state["attempt_count"] not in {1, 2, 4} and not state["awaiting_restart_confirmation"]:
+    if state["attempt_count"] not in {1, 2, 3, 4} and not state["awaiting_restart_confirmation"]:
         return None
     normalized = _normalize_greeting_text(text)
     if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
@@ -4763,9 +4763,9 @@ def generate_totp_code(secret: str) -> str:
 # التسلسل المتفق عليه لما الزبون يقول "ما صار" بشكل متكرر:
 #   محاولة 1، 2  → كود جديد تلقائياً
 #   محاولة 3     → رسالة "سوي ريستارت" بدون كود
-#   بعد تأكيد الريستارت → كود (تعتبر محاولة 4)
-#   محاولة 5     → كود أخير
-#   محاولة 6+    → توقف، تنبيه للأونر فقط، بدون كود
+#   بعد تأكيد الريستارت → كود 3
+#   المحاولة 4        → كود 4
+#   بعد فشل الرابع     → توقف، تنبيه للأونر مع أزرار التحكم
 # العداد يصفر تلقائياً بعد CODE_RETRY_RESET_HOURS ساعة من آخر محاولة.
 # ------------------------------------------------------------------
 
@@ -4903,10 +4903,10 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
     if awaiting_restart:
         if not restart_confirmed:
             return RESTART_CONFIRMATION_MESSAGE, False
-        # بعد تأكيد الريست نرسل الكود الرابع مباشرة؛ إذا فشل بعدها يتوقف
-        # الإرسال التلقائي وتنتقل الحالة إلى موافقة الأونر.
+        # بعد تأكيد الريست نرسل الكود الثالث؛ إذا فشل يليه الكود الرابع،
+        # وبعد فشل الرابع تنتقل الحالة إلى موافقة الأونر.
         code = generate_totp_code(secret)
-        _save_retry_state(chat_id, 4, False)
+        _save_retry_state(chat_id, 3, False)
         return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
 
     if not is_private_account and attempt_count >= 4:
