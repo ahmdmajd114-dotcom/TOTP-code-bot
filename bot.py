@@ -4377,6 +4377,65 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     return categories, False
 
 
+async def infer_contextual_payment_request(chat_id: int, text: str) -> bool:
+    """يفهم طلب الدفع غير المباشر بعد أن يرسل البوت عرض منتج أو باقة."""
+    normalized = _normalize_greeting_text(text)
+    if not normalized or any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
+        return False
+    try:
+        rows = (supabase.table("conversation_archive")
+            .select("sender_type, message_text, created_at")
+            .eq("customer_chat_id", chat_id)
+            .order("created_at", desc=True).limit(12).execute().data or [])
+    except Exception:
+        logger.exception("Failed to load context for payment intent")
+        return False
+    latest_bot = next((row for row in rows if row.get("sender_type") == "bot"), None)
+    if not latest_bot:
+        return False
+    offer_text = latest_bot.get("message_text") or ""
+    offer_markers = (
+        "الباقات", "الباقة", "اشتراك", "اختَر", "اختار", "المنتج", "الأسعار",
+        "السعر", "متوفر", "chatgpt", "كانفا", "انكي", "فرينوت", "گودنوت",
+    )
+    if not any(marker.lower() in offer_text.lower() for marker in offer_markers):
+        return False
+    if "طرق الدفع" in offer_text or any(term in offer_text for term in ("ماستر", "زين كاش", "رصيد اثير", "رصيد اسيا")):
+        return False
+
+    context_lines = []
+    for row in reversed(rows):
+        message_text = (row.get("message_text") or "").strip()
+        if message_text:
+            speaker = "الزبون" if row.get("sender_type") == "customer" else "البوت"
+            context_lines.append(f"{speaker}: {redact_context_text(message_text)}")
+    prompt = (
+        "أنت مصنف نوايا لمتجر عراقي. لا تكتب رداً.\n"
+        "قرر هل رسالة الزبون الحالية تطلب معرفة طرق الدفع أو الخطوة التالية لإتمام الشراء.\n"
+        "إذا كان المقصود مثل: هسه شسوي؟ شلون أكمل؟ بعدين شنو؟ بعد عرض منتج، أجب payment_methods.\n"
+        "إذا كانت شكراً أو تمام أو إقراراً بلا سؤال، أجب no_reply.\n"
+        "إذا كانت عن شيء آخر، أجب no_reply. أجب بكلمة واحدة فقط.\n\n"
+        f"آخر سياق:\n{chr(10).join(context_lines[-8:])}\n\n"
+        f"رسالة الزبون الحالية: {redact_context_text(text)}"
+    )
+    try:
+        data = await call_groq_api({
+            "model": CHATGPT_CONTEXT_MODEL,
+            "temperature": 0,
+            "max_completion_tokens": 20,
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": prompt}],
+        }, timeout=8.0)
+        raw = ((data or {}).get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if raw.strip().lower() == "payment_methods":
+            return True
+    except Exception:
+        logger.exception("Failed to classify contextual payment request")
+
+    # احتياط سريع إذا تعذر الـAI، مع بقاء شرط وجود عرض منتج سابق.
+    return any(term in normalized for term in ("هسه شسوي", "شنو اسوي", "شلون اكمل", "كيف اكمل", "بعدها شنو", "الخطوه الجايه"))
+
+
 def get_reply_for_category(category: str) -> str | None:
     """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/شكوى)."""
     for cat_name, _, reply in FAQ_RULES:
@@ -7915,6 +7974,14 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
     #    يتفعل بس لو فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة
     categories, is_chatgpt_complaint = await classify_intent(text)
+    if (
+        not is_chatgpt_complaint
+        and "طرق الدفع" not in categories
+        and (not categories or set(categories).issubset({"سلام", "ترحيب"}))
+        and await infer_contextual_payment_request(chat_id, text)
+    ):
+        categories.append("طرق الدفع")
+        logger.info("Inferred contextual payment request for chat_id=%s", chat_id)
     # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
     # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
     # وبين «السلام عليكم، أريد منتجاً غير موجود».
