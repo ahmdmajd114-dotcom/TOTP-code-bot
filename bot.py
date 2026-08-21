@@ -7375,6 +7375,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
         return
     if await handle_payment_method_input(update, context):
         return
+    if await handle_cancel_customer_input(update, context):
+        return
     if await handle_shared_account_input(update, context):
         return
     if await handle_catalog_input(update, context):
