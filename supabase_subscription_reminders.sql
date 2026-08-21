@@ -16,6 +16,9 @@ create table if not exists public.subscription_reminders (
   feedback_status text not null default 'none',
   feedback_requested_at timestamptz,
   feedback_responded_at timestamptz,
+  source text not null default 'telegram',
+  instagram_sale_id text,
+  instagram_account text,
   is_debt boolean not null default false,
   started_at timestamptz not null default now(),
   expires_at timestamptz not null,
@@ -52,6 +55,12 @@ alter table public.subscription_reminders
   add column if not exists feedback_requested_at timestamptz;
 alter table public.subscription_reminders
   add column if not exists feedback_responded_at timestamptz;
+alter table public.subscription_reminders
+  add column if not exists source text not null default 'telegram';
+alter table public.subscription_reminders
+  add column if not exists instagram_sale_id text;
+alter table public.subscription_reminders
+  add column if not exists instagram_account text;
 alter table public.subscription_reminders
   alter column subscription_type set default 'general';
 

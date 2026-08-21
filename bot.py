@@ -222,17 +222,23 @@ def get_instagram_sales_worksheet():
             _instagram_sales_sheet = spreadsheet.worksheet(INSTAGRAM_SALES_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
             _instagram_sales_sheet = spreadsheet.add_worksheet(
-                title=INSTAGRAM_SALES_WORKSHEET_NAME, rows=2000, cols=14
+                title=INSTAGRAM_SALES_WORKSHEET_NAME, rows=2000, cols=19
             )
             _instagram_sales_sheet.append_row(
                 [
                     "رقم العملية", "التاريخ والوقت", "يوزر الإنستغرام", "المنتج",
                     "نوع الجات", "نوع المحفظة", "المبلغ", "النسبة %",
                     "العمولة", "الحالة", "تم دفع العمولة؟", "المسجل",
-                    "Telegram User ID", "ملاحظات",
+                    "Telegram User ID", "ملاحظات", "مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة",
                 ],
                 value_input_option="USER_ENTERED",
             )
+        if getattr(_instagram_sales_sheet, "col_count", 0) < 19:
+            _instagram_sales_sheet.resize(rows=max(getattr(_instagram_sales_sheet, "row_count", 1000), 2000), cols=19)
+        header = _instagram_sales_sheet.row_values(1)
+        required_tail = ["مصدر الحساب", "معرف الحساب", "الحساب المستخدم", "تاريخ دفع العمولة"]
+        if header and not all(value in header for value in required_tail):
+            _instagram_sales_sheet.update("O1:R1", [required_tail])
         return _instagram_sales_sheet
     except Exception:
         logger.exception("Failed to connect to Instagram sales worksheet")
@@ -250,13 +256,45 @@ def append_instagram_sale(sale: dict) -> bool:
                 sale["product"], sale.get("chat_type") or "—", sale["wallet"],
                 sale["amount"], sale["commission_percent"], sale["commission"],
                 "مؤكدة", "لا", sale["recorded_by"], sale["recorded_by_id"],
-                sale.get("notes") or "",
+                sale.get("notes") or "", sale.get("account_source") or "—",
+                sale.get("account_id") or "—", sale.get("account_display") or "—", "",
             ],
             value_input_option="USER_ENTERED",
         )
         return True
     except Exception:
         logger.exception("Failed to append Instagram sale")
+        return False
+
+
+def save_instagram_subscription_reminder(sale: dict, state: dict) -> bool:
+    """Schedule an Instagram expiry reminder; Instagram has no Telegram chat id."""
+    duration_months = state.get("duration_months")
+    if sale.get("product") != CHATGPT_PRODUCT_NAME or duration_months not in {1, 2}:
+        return True
+    now = datetime.now(timezone.utc)
+    try:
+        supabase.table("subscription_reminders").insert({
+            "customer_chat_id": None,
+            "customer_name": sale["instagram_account"],
+            "customer_username": sale["instagram_account"],
+            "subscription_type": "instagram",
+            "duration_months": duration_months,
+            "duration_days": duration_months * 30,
+            "product_name": sale["product"],
+            "plan_name": f"{sale.get('chat_type') or ''} {duration_months} شهر".strip(),
+            "plan_duration": f"{duration_months} شهر",
+            "feedback_only": False,
+            "feedback_status": "none",
+            "started_at": now.isoformat(),
+            "expires_at": (now + timedelta(days=duration_months * 30)).isoformat(),
+            "source": "instagram",
+            "instagram_sale_id": sale["sale_id"],
+            "instagram_account": sale["instagram_account"],
+        }).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to save Instagram subscription reminder")
         return False
 
 
@@ -867,6 +905,7 @@ BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
+BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -877,6 +916,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
         [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
+        [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
     ],
     resize_keyboard=True,
 )
@@ -905,6 +945,42 @@ def instagram_chat_type_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def instagram_account_source_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("من عدنا", callback_data="ig_source_private_ours")],
+        [InlineKeyboardButton("خاص من الزبون", callback_data="ig_source_private_customer")],
+    ])
+
+
+def instagram_duration_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("شهر", callback_data="ig_duration_1"), InlineKeyboardButton("شهرين", callback_data="ig_duration_2")],
+    ])
+
+
+def instagram_shared_accounts_keyboard() -> InlineKeyboardMarkup:
+    accounts = get_chatgpt_shared_accounts()
+    rows = []
+    for account in accounts:
+        label = account.get("email") or "حساب مشترك"
+        account_id = account.get("id")
+        rows.append([InlineKeyboardButton(label, callback_data=f"ig_shared_{account_id}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("⚠️ لا توجد حسابات مشتركة", callback_data="ig_noop")])
+    return InlineKeyboardMarkup(rows)
+
+
+def instagram_private_accounts_keyboard() -> InlineKeyboardMarkup:
+    accounts = get_instagram_private_accounts()
+    rows = []
+    for account in accounts:
+        label = account.get("label") or "حساب خاص"
+        rows.append([InlineKeyboardButton(label, callback_data=f"ig_private_{account['id']}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("⚠️ لا توجد حسابات خاصة من عدنا", callback_data="ig_noop")])
+    return InlineKeyboardMarkup(rows)
+
+
 def instagram_wallet_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(method, callback_data=f"ig_wallet_{method}")] for method in PAYMENT_METHODS]
     return InlineKeyboardMarkup(rows)
@@ -915,6 +991,9 @@ def instagram_sale_prompt(state: dict) -> str:
         "📲 تسجيل بيع إنستغرام\n\n"
         f"المنتج: {state.get('product') or '—'}\n"
         f"نوع الجات: {state.get('chat_type') or '—'}\n"
+        f"مصدر الحساب: {state.get('account_source_label') or '—'}\n"
+        f"الحساب المستخدم: {state.get('account_display') or '—'}\n"
+        f"المدة: {state.get('duration_months') or '—'} شهر\n"
         f"الحساب: {state.get('instagram_account') or '—'}\n"
         f"المحفظة: {state.get('wallet') or '—'}\n"
         f"المبلغ: {format_iqd(state['amount']) if state.get('amount') else '—'}"
@@ -1375,6 +1454,38 @@ def get_chatgpt_shared_accounts() -> list[dict]:
     except Exception:
         logger.exception("Failed to fetch legacy shared ChatGPT accounts")
     return accounts
+
+
+def get_instagram_private_accounts() -> list[dict]:
+    """Private accounts owned by us; customer-owned private accounts are never listed."""
+    try:
+        return (
+            supabase.table("totp_accounts")
+            .select("id, label, link_code")
+            .like("link_code", "private_%")
+            .order("created_at")
+            .execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to fetch private accounts for Instagram sales")
+        return []
+
+
+def get_instagram_account_secret(account_source: str, account_id: str) -> str | None:
+    """Resolve only the selected account's TOTP secret for a code request."""
+    try:
+        if account_source == "shared":
+            if str(account_id).startswith("legacy:"):
+                rows = supabase.table("totp_accounts").select("secret").eq("id", str(account_id)[len("legacy:"):]).limit(1).execute().data or []
+                return rows[0].get("secret") if rows else None
+            rows = supabase.table("chatgpt_shared_accounts").select("totp_secret").eq("id", account_id).limit(1).execute().data or []
+            return rows[0].get("totp_secret") if rows else None
+        if account_source == "private_ours":
+            rows = supabase.table("totp_accounts").select("secret").eq("id", account_id).like("link_code", "private_%").limit(1).execute().data or []
+            return rows[0].get("secret") if rows else None
+    except Exception:
+        logger.exception("Failed to fetch selected Instagram account TOTP secret")
+    return None
 
 
 def build_shared_vault_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup:
@@ -3054,13 +3165,19 @@ def calculate_chatgpt_account_stats() -> tuple[int, int]:
 
 
 def get_shared_accounts_list() -> list[dict]:
-    """يرجع قائمة الحسابات المشتركة (id, link_code, label) من Supabase."""
+    """Return native and legacy shared accounts for owner statistics."""
+    accounts: list[dict] = []
     try:
-        res = supabase.table("totp_accounts").select("id, link_code, label").execute()
-        return res.data or []
+        native = supabase.table("chatgpt_shared_accounts").select("id, email, capacity").eq("is_active", True).order("created_at").execute().data or []
+        accounts.extend({"id": row["id"], "link_code": "", "label": row.get("email"), "capacity": row.get("capacity", SHARED_CHATGPT_ACCOUNT_CAPACITY), "source": "native"} for row in native)
     except Exception:
-        logger.exception("Failed to fetch shared accounts list")
-        return []
+        logger.exception("Failed to fetch native shared accounts list")
+    try:
+        legacy = supabase.table("totp_accounts").select("id, link_code, label").not_.like("link_code", "private_%").execute().data or []
+        accounts.extend({**row, "source": "legacy", "capacity": SHARED_CHATGPT_ACCOUNT_CAPACITY} for row in legacy)
+    except Exception:
+        logger.exception("Failed to fetch legacy shared accounts list")
+    return accounts
 
 
 def get_all_accounts_with_secrets() -> list[dict]:
@@ -3128,7 +3245,8 @@ def build_shared_accounts_keyboard(accounts: list[dict]) -> InlineKeyboardMarkup
     rows = []
     for acc in accounts:
         label = acc.get("label") or acc.get("link_code", "بدون اسم")
-        rows.append([InlineKeyboardButton(label, callback_data=f"stats_account_{acc['id']}")])
+        prefix = "stats_native_account_" if acc.get("source") == "native" else "stats_account_"
+        rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}{acc['id']}")])
     rows.append([InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -4181,7 +4299,7 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
     try:
         reminders = (
             supabase.table("subscription_reminders")
-            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only")
+            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only, source, instagram_sale_id, instagram_account")
             .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
         )
     except Exception:
@@ -4229,9 +4347,12 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 "feedback_status": "awaiting_reply",
                 "feedback_requested_at": now.isoformat(),
             }).eq("id", reminder["id"]).execute()
+            source_text = "\n📲 المصدر: Instagram" if reminder.get("source") == "instagram" else ""
+            sale_text = f"\nرقم العملية: {reminder.get('instagram_sale_id')}" if reminder.get("instagram_sale_id") else ""
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=(f"🔔 انتهى اشتراك {product_text} للزبون: {customer}\n"
+                      + source_text + sale_text + "\n"
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
                       + ("⚠️ فشل إرسال رسالة المتابعة للزبون." if customer_send_error
                          else "✅ أُرسلت رسالة المتابعة وننتظر رده." if chat_id is not None
@@ -6032,7 +6153,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
-        BTN_SUBSCRIPTION_REMINDER,
+        BTN_SUBSCRIPTION_REMINDER, BTN_INSTAGRAM_ADMIN,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -6075,6 +6196,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text == BTN_INCOME:
         report = calculate_income_report()
         await message.reply_text(report)
+        return True
+
+    if text == BTN_INSTAGRAM_ADMIN:
+        await show_instagram_admin(message)
         return True
 
     if text == BTN_ADD_ACCOUNT:
@@ -6762,8 +6887,12 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             "commission": commission_for(state["amount"], percent=INSTAGRAM_COMMISSION_PERCENT),
             "recorded_by": query.from_user.full_name,
             "recorded_by_id": query.from_user.id,
+            "account_source": state.get("account_source"),
+            "account_id": state.get("account_id"),
+            "account_display": state.get("account_display"),
         }
         saved = append_instagram_sale(sale)
+        reminder_saved = save_instagram_subscription_reminder(sale, state) if saved else False
         if saved and sale.get("instagram_account"):
             # هذا الحقل هو المعرف الذي يدخله مدير مبيعات الإنستغرام.
             # إذا كان يوزر الزبون، يبقى محفوظاً ضمن سجل العملاء للرسائل المستقبلية.
@@ -6775,6 +6904,10 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             )
         context.user_data.pop("instagram_sale", None)
         if saved:
+            if sale.get("account_source") in {"shared", "private_ours"}:
+                context.user_data.setdefault("instagram_code_refs", {})[sale["sale_id"]] = {
+                    "account_source": sale["account_source"], "account_id": sale["account_id"],
+                }
             try:
                 await context.bot.send_message(
                     chat_id=OWNER_USER_ID,
@@ -6793,12 +6926,50 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text(
                 "✅ تم حفظ عملية بيع الإنستغرام\n"
                 f"رقم العملية: {sale['sale_id']}\n"
-                f"العمولة: {format_iqd(sale['commission'])}"
+                f"العمولة: {format_iqd(sale['commission'])}\n"
+                + ("🔔 تم تسجيل تنبيه الانتهاء." if reminder_saved else "⚠️ لم يتم تسجيل تنبيه الانتهاء.")
+                , reply_markup=InlineKeyboardMarkup(
+                    ([[InlineKeyboardButton("🔐 جلب كود الحساب", callback_data=f"ig_code_{sale['sale_id']}")]]
+                     if sale.get("account_source") in {"shared", "private_ours"} else [])
+                    + [[InlineKeyboardButton("✅ إنهاء", callback_data="ig_done")]]
+                )
             )
         else:
             await query.edit_message_text("⚠️ تعذر الحفظ في Google Sheets. أعد المحاولة أو بلغ المالك.")
         return
     if not state:
+        if data == "ig_done":
+            await query.edit_message_text("تم إنهاء العملية.")
+            return
+        if data.startswith("ig_code_"):
+            sale_id = data[len("ig_code_"):]
+            code_ref = context.user_data.get("instagram_code_refs", {}).get(sale_id)
+            if not code_ref:
+                await query.answer("انتهت صلاحية زر الكود.", show_alert=True)
+                return
+            secret = get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])
+            if not secret:
+                await query.answer("تعذر جلب كود الحساب.", show_alert=True)
+                return
+            await query.message.reply_text(f"🔐 الكود الحالي: {pyotp.TOTP(secret).now()}\nيتغير تلقائياً.")
+            return
+        return
+    if data == "ig_done":
+        await query.edit_message_text("تم إنهاء العملية.")
+        return
+    if data.startswith("ig_code_"):
+        sale_id = data[len("ig_code_"):]
+        refs = context.user_data.get("instagram_code_refs", {})
+        code_ref = refs.get(sale_id)
+        if not code_ref:
+            # Keep the authorization bound to the exact sale message/session.
+            await query.answer("انتهت صلاحية زر الكود.", show_alert=True)
+            return
+        secret = get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])
+        if not secret:
+            await query.answer("تعذر جلب كود الحساب.", show_alert=True)
+            return
+        await query.message.reply_text(f"🔐 الكود الحالي: {pyotp.TOTP(secret).now()}\nيتغير تلقائياً.")
         return
     if data == "ig_product_manual":
         state["step"] = "product"
@@ -6816,6 +6987,42 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
         return
     if data.startswith("ig_type_"):
         state["chat_type"] = normalize_chat_type(data[len("ig_type_"):])
+        if state["chat_type"] == "مشترك":
+            state.update({"account_source": "shared", "account_source_label": "مشترك من عدنا", "step": "shared_account"})
+            await query.edit_message_text("اختَر الحساب المشترك:", reply_markup=instagram_shared_accounts_keyboard())
+        else:
+            state["step"] = "private_source"
+            await query.edit_message_text("الخاص من عدنا لو من الزبون؟", reply_markup=instagram_account_source_keyboard())
+        return
+    if data.startswith("ig_shared_"):
+        account_id = data[len("ig_shared_"):]
+        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]
+        if not accounts:
+            await query.answer("الحساب غير موجود أو متوقف.", show_alert=True)
+            return
+        state.update({"account_source": "shared", "account_source_label": "مشترك من عدنا", "account_id": account_id, "account_display": accounts[0].get("email") or "حساب مشترك", "step": "duration"})
+        await query.edit_message_text("اختَر مدة الاشتراك:", reply_markup=instagram_duration_keyboard())
+        return
+    if data.startswith("ig_source_private_"):
+        source = data[len("ig_source_private_"):]
+        if source == "ours":
+            state.update({"account_source": "private_ours", "account_source_label": "خاص من عدنا", "step": "private_account"})
+            await query.edit_message_text("اختَر الإيميل الخاص من عدنا:", reply_markup=instagram_private_accounts_keyboard())
+        else:
+            state.update({"account_source": "private_customer", "account_source_label": "خاص من الزبون", "account_id": None, "account_display": "خاص من الزبون", "step": "duration"})
+            await query.edit_message_text("اختَر مدة الاشتراك:", reply_markup=instagram_duration_keyboard())
+        return
+    if data.startswith("ig_private_"):
+        account_id = data[len("ig_private_"):]
+        accounts = [account for account in get_instagram_private_accounts() if str(account.get("id")) == account_id]
+        if not accounts:
+            await query.answer("الحساب غير موجود.", show_alert=True)
+            return
+        state.update({"account_source": "private_ours", "account_source_label": "خاص من عدنا", "account_id": account_id, "account_display": accounts[0].get("label") or "حساب خاص", "step": "duration"})
+        await query.edit_message_text("اختَر مدة الاشتراك:", reply_markup=instagram_duration_keyboard())
+        return
+    if data.startswith("ig_duration_"):
+        state["duration_months"] = int(data[len("ig_duration_"):])
         state["step"] = "account"
         await query.edit_message_text("اكتب اسم أو يوزر حساب الإنستغرام:")
         return
@@ -6832,6 +7039,9 @@ async def on_instagram_manager_private_message(update: Update, context: ContextT
         context.user_data["instagram_sale"] = {
             "step": "product", "product": None, "chat_type": None,
             "instagram_account": None, "wallet": None, "amount": None,
+            "duration_months": None, "account_source": None,
+            "account_source_label": None, "account_id": None,
+            "account_display": None,
         }
         await update.message.reply_text("اختَر المنتج:", reply_markup=instagram_product_keyboard())
         return
@@ -6872,6 +7082,112 @@ async def cmd_instagram_report(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         logger.exception("Failed to build Instagram report")
         await update.message.reply_text("⚠️ تعذر قراءة تقرير مبيعات الإنستغرام.")
+
+
+def get_instagram_commission_rows(unpaid_only: bool = False) -> list[tuple[int, list[str]]]:
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        return []
+    rows = sheet.get_all_values()
+    result = []
+    for row_number, row in enumerate(rows[1:], start=2):
+        if len(row) < 11 or not row[0].strip():
+            continue
+        if unpaid_only and row[10].strip() == "نعم":
+            continue
+        result.append((row_number, row))
+    return result
+
+
+async def show_instagram_admin(message) -> None:
+    """Owner-only commission control panel."""
+    try:
+        rows = get_instagram_commission_rows(unpaid_only=True)
+        total = sum(int(re.sub(r"[^0-9]", "", row[8])) for _, row in rows if len(row) > 8 and row[8])
+        text = (
+            "📲 إدارة عمولات الإنستغرام\n\n"
+            f"العمليات غير المسددة: {len(rows)}\n"
+            f"إجمالي العمولات غير المسددة: {format_iqd(total)}"
+        )
+        buttons = []
+        for _, row in rows[-20:]:
+            buttons.append([InlineKeyboardButton(
+                f"{row[0]} — {row[8]} — {row[2]}", callback_data=f"igadmin_sale_{row[0]}"
+            )])
+        buttons.append([InlineKeyboardButton("🔄 تحديث", callback_data="igadmin_list")])
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception:
+        logger.exception("Failed to show Instagram commission admin")
+        await message.reply_text("⚠️ تعذر قراءة عمولات الإنستغرام.")
+
+
+async def handle_instagram_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    if query.data == "igadmin_list":
+        await show_instagram_admin(query.message)
+        return
+    if not query.data.startswith("igadmin_sale_"):
+        return
+    sale_id = query.data[len("igadmin_sale_"):]
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        await query.edit_message_text("⚠️ تعذر الاتصال بالشيت.")
+        return
+    try:
+        rows = get_instagram_commission_rows(unpaid_only=False)
+        match = next(((row_number, row) for row_number, row in rows if row[0] == sale_id), None)
+        if match is None:
+            await query.edit_message_text("العملية غير موجودة.")
+            return
+        row_number, row = match
+        paid = len(row) > 10 and row[10].strip() == "نعم"
+        if not paid:
+            await query.edit_message_text(
+                f"رقم العملية: {row[0]}\n"
+                f"الحساب: @{row[2]}\n"
+                f"المبلغ: {row[6]}\n"
+                f"العمولة: {row[8]}\n\n"
+                "حالة العمولة: غير مسددة",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تم دفع العمولة", callback_data=f"igadmin_paid_{sale_id}")],
+                    [InlineKeyboardButton("◀️ رجوع", callback_data="igadmin_list")],
+                ]),
+            )
+        else:
+            await query.edit_message_text(f"✅ العمولة مسددة مسبقاً للعملية {sale_id}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع", callback_data="igadmin_list")]]))
+    except Exception:
+        logger.exception("Failed to show Instagram commission %s", sale_id)
+        await query.edit_message_text("⚠️ تعذر قراءة العملية.")
+
+
+async def handle_instagram_commission_paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    sale_id = (query.data or "")[len("igadmin_paid_"):]
+    sheet = get_instagram_sales_worksheet()
+    if sheet is None:
+        await query.edit_message_text("⚠️ تعذر الاتصال بالشيت.")
+        return
+    try:
+        match = next(((row_number, row) for row_number, row in get_instagram_commission_rows(False) if row[0] == sale_id), None)
+        if match is None:
+            await query.edit_message_text("العملية غير موجودة.")
+            return
+        row_number, row = match
+        sheet.update_cell(row_number, 11, "نعم")
+        sheet.update_cell(row_number, 19, datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        await query.edit_message_text(
+            f"✅ تم تسجيل دفع العمولة\nرقم العملية: {sale_id}\nالعمولة: {row[8]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ رجوع للعمولات", callback_data="igadmin_list")]]),
+        )
+    except Exception:
+        logger.exception("Failed to mark Instagram commission paid")
+        await query.edit_message_text("⚠️ تعذر تحديث حالة العمولة في الشيت.")
 
 
 async def cmd_import_archive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7389,6 +7705,8 @@ def main() -> None:
 
     # تسجيل مبيعات الإنستغرام — متاح فقط لمعرف المدير المحدد بالبيئة.
     app.add_handler(CallbackQueryHandler(handle_instagram_callback, pattern=r"^ig_"))
+    app.add_handler(CallbackQueryHandler(handle_instagram_admin_callback, pattern=r"^igadmin_(?:list|sale_)"))
+    app.add_handler(CallbackQueryHandler(handle_instagram_commission_paid_callback, pattern=r"^igadmin_paid_"))
 
     # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
     app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
