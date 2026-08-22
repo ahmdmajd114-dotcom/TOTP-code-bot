@@ -57,6 +57,7 @@ from chatgpt_sales_flow import (
 )
 from modesty_guard import is_flirtatious_text, is_guarded_chat
 from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
+from interactive_classifier import infer_action_from_archive_reply
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -3619,9 +3620,9 @@ def build_vault_edit_mode_keyboard(vault_name: str) -> InlineKeyboardMarkup:
 # العراقية من الموديل الافتراضي، يستخدم بس لهذا الفحص المحدد
 CHATGPT_CONTEXT_MODEL = "openai/gpt-oss-120b"
 
-# موديل تجربة فرع التفاعل فقط. يبقى منفصل عن موديل المسارات الحية حتى
-# نكدر نقارن الأداء قبل اعتماد Qwen خارج بيئة الاختبار.
-INTERACTIVE_MODEL = "qwen/qwen3.6-27b"
+# مصنف فرع التفاعل يحتاج فهم اللهجة والسياق أكثر من التوليد. نخليه قابلاً
+# للتبديل من البيئة، والافتراضي الأقوى المخصص للتفكير/التصنيف هو 120B.
+INTERACTIVE_MODEL = os.environ.get("INTERACTIVE_MODEL", "openai/gpt-oss-120b")
 
 # موديل مخصص لقراءة ووصف الصور (Vision) — الموديل الوحيد المدعوم
 # رسمياً لقراءة الصور بـ Groq حالياً (يدعم صور + نص بنفس الوقت)
@@ -3990,8 +3991,9 @@ def get_relevant_style_examples(query_text: str, limit: int = 8) -> list[dict]:
     return [example for _, _, example in ranked_examples[:limit]]
 
 
-def format_style_examples(examples: list[dict]) -> str:
+def format_style_examples(examples: list[dict], templates: dict[str, str] | None = None) -> str:
     """يحوّل أمثلة التلقين إلى نص واضح للموديل، مع استبعاد الصفوف الناقصة."""
+    templates = templates or {}
     formatted = []
     for index, example in enumerate(examples, start=1):
         customer_message = (example.get("customer_message") or "").strip()
@@ -3999,9 +4001,11 @@ def format_style_examples(examples: list[dict]) -> str:
         if customer_message and owner_reply:
             source = example.get("source") or ""
             responder = "رد البوت" if source.endswith(":bot") else "رد صاحب المتجر"
+            action_key = infer_action_from_archive_reply(owner_reply, templates)
+            action_line = f"\nالإجراء الذي نجح بهذا المثال: {action_key}" if action_key else ""
             formatted.append(
                 f"مثال {index}:\nسياق المحادثة:\n{redact_context_text(customer_message)}\n"
-                f"{responder}: {redact_context_text(owner_reply)}"
+                f"{responder}: {redact_context_text(owner_reply)}{action_line}"
             )
     return "\n\n".join(formatted)
 
@@ -4181,7 +4185,9 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         "static_faq", "payment_next_step", "support_pending", "no_reply", *templates.keys(),
     ]
     recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
-    style_examples_text = format_style_examples(get_relevant_style_examples(new_message))
+    style_examples_text = format_style_examples(
+        get_relevant_style_examples(new_message), templates
+    )
     context_lines = []
     for item in recent_messages:
         text = (item.get("message_text") or "").strip()
@@ -4348,8 +4354,8 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         data = await call_groq_api({
             "model": INTERACTIVE_MODEL,
             "temperature": 0,
-            "max_completion_tokens": 200,
-            "reasoning_effort": "none",
+            "max_completion_tokens": 350,
+            "reasoning_effort": "low",
             "messages": messages,
         }, timeout=20.0)
         if data is None:
