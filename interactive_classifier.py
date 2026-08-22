@@ -36,6 +36,15 @@ class IntentFrame:
     confidence: float = 0.0
 
 
+@dataclass(frozen=True)
+class GroundedAnswer:
+    """A customer answer that the model claims is supported by supplied knowledge."""
+
+    can_answer: bool = False
+    answer: str = ""
+    confidence: float = 0.0
+
+
 def normalize_classifier_text(text: str) -> str:
     """Normalize Arabic variants while preserving word order for prompt examples."""
     value = (text or "").lower().strip()
@@ -69,6 +78,8 @@ def should_enter_support_mode(
     recent_customer_text: str,
     workflow_state: str,
     selected_product_is_chatgpt: bool,
+    current_mentions_known_product: bool = False,
+    recent_mentions_known_product: bool = False,
 ) -> bool:
     """Support outranks sales when the problem belongs to the active product context."""
     if workflow_state in {"support_pending", "support_review"}:
@@ -79,12 +90,47 @@ def should_enter_support_mode(
         mentions_chatgpt(current_text)
         or mentions_chatgpt(recent_customer_text)
         or selected_product_is_chatgpt
+        or current_mentions_known_product
+        or recent_mentions_known_product
         or workflow_state in {
             "awaiting_plan_choice", "awaiting_payment", "awaiting_payment_proof",
             "payment_review", "payment_verified", "account_delivered", "code_sent",
         }
     )
     return has_product_context
+
+
+def is_support_cancellation(text: str) -> bool:
+    """Detect a clear request to leave the current support topic."""
+    normalized = normalize_classifier_text(text)
+    phrases = {
+        "عوف المشكله", "خلي المشكله", "اترك المشكله", "انسه المشكله",
+        "انسى المشكله", "ما اريد احلها", "مو مهمه المشكله",
+    }
+    return any(phrase in normalized for phrase in phrases)
+
+
+def should_switch_from_support(
+    workflow_state: str,
+    current_text: str,
+    mentions_known_product: bool,
+) -> bool:
+    """An explicit new product or cancellation may interrupt support mode."""
+    if workflow_state not in {"support_pending", "support_review"}:
+        return False
+    if is_support_cancellation(current_text):
+        return True
+    return mentions_known_product and not has_support_signal(current_text)
+
+
+def is_product_availability_followup(text: str) -> bool:
+    """Detect a short availability/price follow-up whose product comes from context."""
+    normalized = normalize_classifier_text(text)
+    words = set(re.findall(r"[\w\u0600-\u06ff]+", normalized))
+    asks_availability = bool(words & {"عدكم", "متوفر", "موجود", "اكو"})
+    asks_price = bool(words & {"شكد", "سعر", "سعره", "بكم"})
+    yes_or_no = "لو لا" in normalized
+    return asks_availability or asks_price or yes_or_no
 
 
 def parse_intent_frame(raw: str) -> IntentFrame:
@@ -104,8 +150,8 @@ def parse_intent_frame(raw: str) -> IntentFrame:
     intent = str(payload.get("intent") or "other").strip().lower()
     if intent not in INTERACTIVE_INTENTS:
         intent = "other"
-    product = str(payload.get("product") or "").strip().lower() or None
-    if product not in {None, "chatgpt"}:
+    product = normalize_classifier_text(str(payload.get("product") or "")) or None
+    if product and (len(product) > 80 or not re.search(r"[\w\u0600-\u06ff]", product)):
         product = None
     plan_type = str(payload.get("plan_type") or "").strip().lower() or None
     if plan_type not in {None, "private", "shared"}:
@@ -118,6 +164,30 @@ def parse_intent_frame(raw: str) -> IntentFrame:
     except (TypeError, ValueError):
         confidence = 0.0
     return IntentFrame(intent, product, plan_type, duration, confidence)
+
+
+def parse_grounded_answer(raw: str) -> GroundedAnswer:
+    """Accept only bounded JSON answers; malformed or low-data output is rejected."""
+    value = (raw or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s*```$", "", value)
+    match = re.search(r"\{.*\}", value, flags=re.DOTALL)
+    if not match:
+        return GroundedAnswer()
+    try:
+        payload = json.loads(match.group(0))
+    except (TypeError, ValueError):
+        return GroundedAnswer()
+    can_answer = payload.get("can_answer") is True
+    answer = str(payload.get("answer") or "").strip()
+    if not can_answer or not answer or len(answer) > 1_200:
+        return GroundedAnswer()
+    try:
+        confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return GroundedAnswer(True, answer, confidence)
 
 
 def guard_interactive_action(

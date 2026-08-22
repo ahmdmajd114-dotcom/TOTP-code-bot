@@ -1,12 +1,17 @@
 import unittest
 
 from interactive_classifier import (
+    GroundedAnswer,
     IntentFrame,
     guard_interactive_action,
     infer_action_from_archive_reply,
     infer_intent_from_archive_reply,
+    is_product_availability_followup,
+    is_support_cancellation,
     parse_intent_frame,
+    parse_grounded_answer,
     should_enter_support_mode,
+    should_switch_from_support,
     support_action_for_turn,
 )
 
@@ -57,6 +62,31 @@ class StructuredIntentTests(unittest.TestCase):
             "other",
         )
 
+    def test_any_known_product_can_survive_structured_parsing(self):
+        frame = parse_intent_frame(
+            '{"intent":"purchase","product":"canva","plan_type":null,'
+            '"duration":null,"confidence":0.91}'
+        )
+        self.assertEqual(frame.product, "canva")
+
+    def test_grounded_answer_requires_explicit_support_and_confidence(self):
+        answer = parse_grounded_answer(
+            '{"can_answer":true,"answer":"نعم متوفر اشتراك سنة.","confidence":0.94}'
+        )
+        self.assertEqual(
+            answer,
+            GroundedAnswer(True, "نعم متوفر اشتراك سنة.", 0.94),
+        )
+
+    def test_grounded_answer_rejects_plain_text_and_abstention(self):
+        self.assertEqual(parse_grounded_answer("أكيد موجود"), GroundedAnswer())
+        self.assertEqual(
+            parse_grounded_answer(
+                '{"can_answer":false,"answer":"تخمين","confidence":0.99}'
+            ),
+            GroundedAnswer(),
+        )
+
 
 class ConversationInvariantTests(unittest.TestCase):
     def test_problem_outranks_purchase_in_same_message(self):
@@ -86,6 +116,42 @@ class ConversationInvariantTests(unittest.TestCase):
                 "هلو",
                 "observing",
                 False,
+            )
+        )
+
+    def test_support_can_start_for_any_known_product(self):
+        self.assertTrue(
+            should_enter_support_mode(
+                "كانفا ما يشتغل",
+                "",
+                "observing",
+                False,
+                current_mentions_known_product=True,
+            )
+        )
+
+    def test_customer_can_cancel_support_topic(self):
+        self.assertTrue(is_support_cancellation("زين عوف المشكلة"))
+        self.assertTrue(
+            should_switch_from_support(
+                "support_review", "زين عوف المشكلة", False
+            )
+        )
+
+    def test_explicit_new_product_interrupts_support(self):
+        self.assertTrue(
+            should_switch_from_support(
+                "support_review", "اريد كانفا عدكم؟", True
+            )
+        )
+
+    def test_short_availability_question_uses_product_context(self):
+        self.assertTrue(is_product_availability_followup("عدكم لو لا؟"))
+        self.assertTrue(is_product_availability_followup("زين شكد سعره"))
+        self.assertFalse(is_product_availability_followup("زين تمام"))
+        self.assertFalse(
+            should_switch_from_support(
+                "support_review", "انكي ما يشتغل", True
             )
         )
 
