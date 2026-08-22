@@ -67,6 +67,8 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
     def test_acknowledgement_needs_no_reply(self):
         self.assertTrue(is_acknowledgement("تمام"))
         self.assertTrue(is_acknowledgement("اوكي"))
+        self.assertTrue(is_acknowledgement("زين تمام"))
+        self.assertFalse(is_acknowledgement("زين كاش"))
         self.assertFalse(is_acknowledgement("زين شكد ادفع"))
 
     def test_payment_guidance_needs_a_real_question(self):

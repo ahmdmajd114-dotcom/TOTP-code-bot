@@ -122,7 +122,11 @@ def is_ambiguous_followup(text: str) -> bool:
 def is_acknowledgement(text: str) -> bool:
     """رسالة تأكيد لا تحتاج جواباً من المتجر."""
     words = normalized_words(text)
-    return bool(words) and words <= {"تمام", "اوكي", "اوكيه", "ok", "اوك"}
+    acknowledgement_words = {"تمام", "اوكي", "اوكيه", "ok", "اوك"}
+    # «زين» وحدها قد تكون اسم طريقة دفع، لكن «زين تمام» تعبير محادثة واضح.
+    if "زين" in words and words & acknowledgement_words:
+        words = words - {"زين"}
+    return bool(words) and words <= acknowledgement_words
 
 
 def asks_payment_guidance(text: str) -> bool:
