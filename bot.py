@@ -809,7 +809,7 @@ FAQ_RULES = [
         [
             "طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع", "وين ادفع",
             "شلون الدفع", "طرق التسديد", "كيفية الدفع", "شنو طرق الدفع",
-            "زين كاش", "سوبر كي", "زد كاش", "اريد ادفع", "ادفع", "ماستر",
+            "زين كاش", "سوبر كي", "زد كاش", "اريد ادفع", "ادفع", "ماستر", "الماستر",
         ],
         "طرق الدفع\n"
         "رقم زين كاش التالي\n"
@@ -8559,7 +8559,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_text = get_reply_for_category(category)
         if not reply_text:
             continue
-        if not is_edited_message and not should_send_faq_reply(chat_id, category, reply_text):
+        # طلبات الدفع مباشرة وحساسة للسياق؛ لا نمنع تكرارها إذا كتب الزبون
+        # «ممكن الماستر؟» أو سأل عن طريقة دفع ثانية بعد رد سابق.
+        payment_category = category in {"طرق_الدفع", "دفع_رصيد"}
+        if not is_edited_message and not payment_category and not should_send_faq_reply(chat_id, category, reply_text):
             continue
         if reply_text:
             replies_to_send.append(reply_text)
