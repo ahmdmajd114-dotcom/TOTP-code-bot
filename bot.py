@@ -3679,9 +3679,19 @@ async def classify_chatgpt_context(text: str) -> str:
             return "شراء"
         raw = data["choices"][0]["message"]["content"].strip()
         logger.info(f"classify_chatgpt_context raw response: {raw!r} (input: {text!r})")
-        if "شكوى" in raw:
+        # موديلات reasoning قد ترجع شرحاً رغم طلب كلمة واحدة؛ نعتمد آخر
+        # سطر/كلمة تصنيف حتى لا تفسر كلمة «غير» داخل الشرح كحكم نهائي.
+        labels = {"شكوى", "غير_متعلق", "شراء"}
+        candidates = [line.strip().strip("`'\" .,،؛;") for line in raw.splitlines() if line.strip()]
+        for candidate in reversed(candidates):
+            if candidate in labels:
+                return candidate
+        normalized_raw = re.sub(r"\s+", " ", raw).strip()
+        if normalized_raw in labels:
+            return normalized_raw
+        if "شكوى" in normalized_raw and not any(term in normalized_raw for term in ("مو شكوى", "ليست شكوى", "مو مشكلة")):
             return "شكوى"
-        if "غير" in raw:
+        if normalized_raw.endswith("غير_متعلق"):
             return "غير_متعلق"
         return "شراء"
     except Exception:
@@ -4482,6 +4492,19 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     categories = keyword_match_categories(text)
 
     if "chatgpt" in categories:
+        # طلبات الشراء الواضحة لا تحتاج حكماً احتماليًا من النموذج. هذا
+        # يمنع شرح reasoning أو انقطاعه من إسكات زبون يريد السعر/الاشتراك.
+        normalized_text = _normalize_greeting_text(text)
+        explicit_purchase_terms = (
+            "اشتراك", "اشترك", "متوفر", "السعر", "سعر", "الباقات", "باقة",
+            "اريد", "اريد اشترك", "اريد اشتراك",
+        )
+        if (
+            any(term in normalized_text for term in explicit_purchase_terms)
+            and not is_chatgpt_support_issue(text)
+        ):
+            return categories, False
+
         # ذكر المنتج وحده («ChatGPT»، «شات») هو طلب شائع لفتح الباقات. لا
         # نرسله للمصنف العام حتى لا يصنّفه أحياناً كموضوع غير متعلق ويسكت.
         chatgpt_words = {"chatgpt", "chat", "gpt", "جات", "چات", "تشات", "شات", "جيبيتي"}
