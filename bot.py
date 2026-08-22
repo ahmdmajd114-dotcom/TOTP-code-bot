@@ -3155,7 +3155,7 @@ def calculate_income_report() -> str:
     if len(rows) <= 1:
         return "ماكو أي عمليات دفع مسجلة لحد الحين."
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(STATS_TIMEZONE)
     today = now.date()
     week_start = today - timedelta(days=today.weekday())  # الاثنين هو بداية الأسبوع
     month_start = today.replace(day=1)
@@ -3170,7 +3170,7 @@ def calculate_income_report() -> str:
             continue
         date_str, amount_str = row[0], row[1]
         try:
-            row_date = datetime.strptime(date_str.split(" ")[0], "%Y-%m-%d").date()
+            row_date = parse_sheet_datetime(date_str).date()
             amount = int(float(amount_str))
         except (ValueError, IndexError):
             continue  # صف فيه بيانات غير متوقعة — نتجاهله بدل ما نكرش
@@ -3215,6 +3215,16 @@ def parse_stats_datetime(value: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized date/time: {value!r}")
+
+
+def parse_sheet_datetime(value: str) -> datetime:
+    """يقرأ أوقات Google Sheet المحفوظة كـ UTC ويحوّلها إلى توقيت بغداد."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc).astimezone(STATS_TIMEZONE)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized sheet date/time: {value!r}")
 
 
 def parse_stats_period(period_key: str) -> tuple[datetime, datetime] | None:
@@ -3289,7 +3299,7 @@ def get_payment_rows_in_period(period_key: str) -> list[list[str]] | None:
         if len(row) < 1 or not row[0].strip():
             continue
         try:
-            row_date = parse_stats_datetime(row[0])
+            row_date = parse_sheet_datetime(row[0])
         except (ValueError, IndexError):
             continue
 
@@ -3325,7 +3335,7 @@ def get_expense_rows_in_period(period_key: str) -> list[list[str]] | None:
         if len(row) < 1 or not row[0].strip():
             continue
         try:
-            row_date = parse_stats_datetime(row[0])
+            row_date = parse_sheet_datetime(row[0])
         except (ValueError, IndexError):
             continue
 
