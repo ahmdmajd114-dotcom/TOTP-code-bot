@@ -3168,6 +3168,8 @@ def calculate_income_report() -> str:
     for row in rows[1:]:
         if len(row) < 2:
             continue
+        if is_debt_payment_row(row):
+            continue
         date_str, amount_str = row[0], row[1]
         try:
             row_date = parse_sheet_datetime(date_str).date()
@@ -3225,6 +3227,11 @@ def parse_sheet_datetime(value: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognized sheet date/time: {value!r}")
+
+
+def is_debt_payment_row(row: list[str]) -> bool:
+    """يميز أسطر الدين القديمة في ورقة المدفوعات حتى لا تُحسب كدخل."""
+    return len(row) > 2 and row[2].strip().startswith("دين")
 
 
 def parse_stats_period(period_key: str) -> tuple[datetime, datetime] | None:
@@ -3394,6 +3401,8 @@ def calculate_totals_summary(period_key: str) -> str:
 
     total_income = 0
     for row in payment_rows:
+        if is_debt_payment_row(row):
+            continue
         if len(row) >= 2 and row[1].strip():
             try:
                 total_income += int(float(row[1]))
@@ -3438,6 +3447,8 @@ def calculate_product_breakdown(period_key: str) -> str:
     product_counts: dict[str, int] = {}
 
     for row in payment_rows:
+        if is_debt_payment_row(row):
+            continue
         if len(row) < 4:
             continue
         product = row[3].strip()
@@ -6513,16 +6524,9 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("لازم تحدد الزبون والمنتج والمبلغ قبل التثبيت.", show_alert=True)
             return
 
-        saved_main = append_payment_row({
-            "customer_name": debt["customer_line"],
-            "customer_username": None,
-            "customer_chat_id": debt["chat_id"],
-            "product": debt["product"],
-            "payments": [("دين", debt["amount"])],
-        })
         saved_debt = append_debt_row(debt["chat_id"], debt["customer_line"], debt["product"], debt["amount"])
 
-        if saved_main and saved_debt:
+        if saved_debt:
             final_text = format_debt_summary(debt) + "\n\n✅ تم تسجيل الدين بنجاح."
             await send_debt_notification(
                 context,
