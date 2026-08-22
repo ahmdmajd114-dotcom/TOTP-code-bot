@@ -3618,6 +3618,10 @@ def build_vault_edit_mode_keyboard(vault_name: str) -> InlineKeyboardMarkup:
 # العراقية من الموديل الافتراضي، يستخدم بس لهذا الفحص المحدد
 CHATGPT_CONTEXT_MODEL = "openai/gpt-oss-120b"
 
+# موديل تجربة فرع التفاعل فقط. يبقى منفصل عن موديل المسارات الحية حتى
+# نكدر نقارن الأداء قبل اعتماد Qwen خارج بيئة الاختبار.
+INTERACTIVE_MODEL = "qwen/qwen3.6-27b"
+
 # موديل مخصص لقراءة ووصف الصور (Vision) — الموديل الوحيد المدعوم
 # رسمياً لقراءة الصور بـ Groq حالياً (يدعم صور + نص بنفس الوقت)
 IMAGE_VISION_MODEL = "qwen/qwen3.6-27b"
@@ -4331,10 +4335,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     })
     try:
         data = await call_groq_api({
-            "model": CHATGPT_CONTEXT_MODEL,
+            "model": INTERACTIVE_MODEL,
             "temperature": 0,
             "max_completion_tokens": 200,
-            "reasoning_effort": "low",
+            "reasoning_effort": "none",
             "messages": messages,
         }, timeout=20.0)
         if data is None:
