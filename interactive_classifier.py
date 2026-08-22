@@ -146,6 +146,13 @@ def guard_interactive_action(
     return action_key
 
 
+def support_action_for_turn(workflow_state: str, current_text: str) -> str:
+    """Ask for evidence once when support starts, then wait for the customer."""
+    if workflow_state in {"support_pending", "support_review"}:
+        return "no_reply"
+    return "request_support_screenshot" if has_support_signal(current_text) else "no_reply"
+
+
 def infer_action_from_archive_reply(reply: str, templates: dict[str, str]) -> str | None:
     """Infer a safe action label from an archived fixed reply.
 

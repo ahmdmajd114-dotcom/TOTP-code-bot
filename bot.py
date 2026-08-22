@@ -59,10 +59,10 @@ from modesty_guard import is_flirtatious_text, is_guarded_chat
 from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
 from interactive_classifier import (
     guard_interactive_action,
-    has_support_signal,
     infer_intent_from_archive_reply,
     parse_intent_frame,
     should_enter_support_mode,
+    support_action_for_turn,
 )
 
 # ------------------------------------------------------------------
@@ -4223,10 +4223,9 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         workflow_state,
         is_chatgpt_product(selected_product),
     ):
-        if workflow_state in {"support_pending", "support_review"} and is_acknowledgement(new_message):
-            return "no_reply"
+        support_action = support_action_for_turn(workflow_state, new_message)
         set_interactive_sale_state(customer_chat_id, "support_review")
-        return "request_support_screenshot" if has_support_signal(new_message) else "no_reply"
+        return support_action
     # بعد إرسال الوصل لا نسمح لأي كلمة لاحقة (مثل "هسة" أو "جات") أن ترجع
     # المحادثة للباقات أو للردود العامة. النتيجة الوحيدة تكون فحص الصورة ثم
     # التسليم تلقائياً عند القبول، أو طلب وصل صحيح عند الرفض.

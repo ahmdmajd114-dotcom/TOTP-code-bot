@@ -7,6 +7,7 @@ from interactive_classifier import (
     infer_intent_from_archive_reply,
     parse_intent_frame,
     should_enter_support_mode,
+    support_action_for_turn,
 )
 
 
@@ -94,6 +95,16 @@ class ConversationInvariantTests(unittest.TestCase):
                 "chatgpt_plans", "support_review", False, False
             ),
             "request_support_screenshot",
+        )
+
+    def test_support_screenshot_is_requested_once(self):
+        self.assertEqual(
+            support_action_for_turn("awaiting_payment", "عندي مشكلة"),
+            "request_support_screenshot",
+        )
+        self.assertEqual(
+            support_action_for_turn("support_review", "اقصد عندي مشكلة جات"),
+            "no_reply",
         )
 
     def test_price_and_payment_require_a_confirmed_plan(self):
