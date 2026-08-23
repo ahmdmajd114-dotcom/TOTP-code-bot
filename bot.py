@@ -4869,7 +4869,7 @@ async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
     state = _get_retry_state(chat_id)
     if is_private_totp_account(chat_id):
         return None
-    if state["attempt_count"] not in {1, 2, 3, 4} and not state["awaiting_restart_confirmation"]:
+    if state["attempt_count"] not in {1, 2, 3, 4, 5, 6, 7} and not state["awaiting_restart_confirmation"]:
         return None
     normalized = _normalize_greeting_text(text)
     if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
@@ -5189,11 +5189,10 @@ def generate_totp_code(secret: str) -> str:
 # ------------------------------------------------------------------
 # نظام تتبع محاولات الكود الفاشلة (code_retry_tracker بقاعدة Supabase)
 # التسلسل المتفق عليه لما الزبون يقول "ما صار" بشكل متكرر:
-#   محاولة 1، 2  → كود جديد تلقائياً
-#   محاولة 3     → رسالة "سوي ريستارت" بدون كود
-#   بعد تأكيد الريستارت → كود 3
-#   المحاولة 4        → كود 4
-#   بعد فشل الرابع     → توقف، تنبيه للأونر مع أزرار التحكم
+#   المحاولات 1، 2، 3 → كود جديد تلقائياً
+#   المحاولة 4         → رسالة "سوي ريستارت" بدون كود
+#   بعد تأكيد الريستارت → 3 أكواد جديدة (المحاولات 5، 6، 7)
+#   بعد فشل الكود السابع → توقف، تنبيه للأونر مع أزرار التحكم
 # العداد يصفر تلقائياً بعد CODE_RETRY_RESET_HOURS ساعة من آخر محاولة.
 # ------------------------------------------------------------------
 
@@ -5288,13 +5287,13 @@ def can_unlink_expired_customer(chat_id: int) -> bool:
 
 RESTART_MESSAGE = (
     "يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
-    "جرب تسوي التالي: احذف الحساب من تطبيق المصادقة (Authenticator) "
-    "وابدأ عملية التسجيل من جديد من الأول، وبعدها راسلني وبعطيك كود جديد."
+    "سوي رست، واحذف الحساب من تطبيق Authenticator وثبته من جديد، "
+    "وبعدها اكتبلي حتى أنزلك كود جديد."
 )
 
 RESTART_CONFIRMATION_MESSAGE = (
-    "تمام. سوّي الريست واحذف الحساب من تطبيق Authenticator، وبعدها اكتبلي "
-    "«سويت رست» حتى أنزلك كود جديد."
+    "تمام. سوّي الريست واحذف الحساب من تطبيق Authenticator وثبته من جديد، "
+    "وبعدها اكتبلي «سويت رست» حتى أنزلك كود جديد."
 )
 
 STOPPED_MESSAGE = (
@@ -5331,17 +5330,10 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
     if awaiting_restart:
         if not restart_confirmed:
             return RESTART_CONFIRMATION_MESSAGE, False
-        # بعد تأكيد الريست نرسل الكود الثالث؛ إذا فشل يليه الكود الرابع،
-        # وبعد فشل الرابع تنتقل الحالة إلى موافقة الأونر.
+        # بعد تأكيد الريست نبدأ مرحلة جديدة من ثلاثة أكواد.
         code = generate_totp_code(secret)
-        _save_retry_state(chat_id, 3, False)
+        _save_retry_state(chat_id, 5, False)
         return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
-
-    if not is_private_account and attempt_count >= 4:
-        if attempt_count == 4:
-            _save_retry_state(chat_id, 5, False)
-            return STOPPED_MESSAGE, True
-        return None, True
 
     decision = (
         decide_private_code_retry(attempt_count, awaiting_restart)
@@ -5355,7 +5347,7 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
     if decision.action == "ask_restart":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         return RESTART_MESSAGE, False
-    # المحاولة السادسة وما بعدها: نوقف ونبلغ الأونر.
+    # بعد الكود السابع نوقف ونبلغ الأونر.
     _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
     return None, True
 

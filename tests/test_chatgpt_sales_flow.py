@@ -96,12 +96,13 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
 
     def test_code_retry_sequence(self):
         self.assertEqual(decide_code_retry(0, False).action, "send_code")
-        self.assertEqual(decide_code_retry(1, False).attempt_count, 2)
-        restart = decide_code_retry(2, False)
-        self.assertEqual((restart.action, restart.attempt_count, restart.awaiting_restart), ("ask_restart", 3, True))
-        self.assertEqual(decide_code_retry(3, True).attempt_count, 4)
-        self.assertEqual(decide_code_retry(4, False).attempt_count, 5)
-        self.assertEqual(decide_code_retry(5, False).action, "stop")
+        self.assertEqual(decide_code_retry(2, False).action, "send_code")
+        restart = decide_code_retry(3, False)
+        self.assertEqual((restart.action, restart.attempt_count, restart.awaiting_restart), ("ask_restart", 4, True))
+        self.assertEqual(decide_code_retry(4, True).attempt_count, 5)
+        self.assertEqual(decide_code_retry(5, False).action, "send_code")
+        self.assertEqual(decide_code_retry(6, False).action, "send_code")
+        self.assertEqual(decide_code_retry(7, False).action, "stop")
 
     def test_private_code_retry_warns_after_five_but_never_stops(self):
         for attempt in range(5):
