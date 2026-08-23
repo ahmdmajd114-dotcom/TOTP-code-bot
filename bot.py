@@ -2343,12 +2343,13 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
 
 
 def upsert_chatgpt_account(
-    chat_id: int, customer_name: str, customer_username: str | None, account_text: str
+    chat_id: int, customer_name: str, customer_username: str | None, account_text: str,
+    create_if_missing: bool = True,
 ) -> bool:
     """
     يسجل معلومة حساب ChatGPT (إيميل أو 'خاص') لزبون معين — يكمل سطر
-    ناقص موجود (خلال آخر أسبوع، منتجه جات) لو لقى، وإلا يفتح سطر جديد
-    مستقل (التاريخ + بيانات الزبون + عمود حسابات جات، الباقي فاضي).
+    ناقص موجود (خلال آخر أسبوع، منتجه جات) لو لقى. عند create_if_missing=True
+    يفتح سطرًا جديدًا إذا لم يجد السطر.
     """
     sheet = get_google_sheet()
     if sheet is None:
@@ -2363,7 +2364,7 @@ def upsert_chatgpt_account(
 
         if target_row is not None:
             sheet.update_cell(target_row, SHEET_COL_CHATGPT_ACCOUNT, account_text)
-        else:
+        elif create_if_missing:
             row = [
                 date_time_str,
                 "",  # المبلغ الكلي — يُعبى لاحقاً عند تسجيل الدفع
@@ -2374,6 +2375,8 @@ def upsert_chatgpt_account(
                 str(chat_id),
             ]
             sheet.append_row(row, value_input_option="USER_ENTERED")
+        else:
+            return False
         return True
     except Exception:
         logger.exception("Failed to upsert ChatGPT account info in Google Sheet")
@@ -3498,7 +3501,7 @@ def calculate_chatgpt_account_stats() -> tuple[int, int]:
                     continue
                 account_text = row[SHEET_COL_CHATGPT_ACCOUNT - 1].strip()
                 chat_id = row[SHEET_COL_CHAT_ID - 1].strip() if len(row) >= SHEET_COL_CHAT_ID else ""
-                if account_text.startswith("خاص") and chat_id and chat_id not in seen_chat_ids:
+                if (account_text.startswith("خاص") or "(خاص)" in account_text) and chat_id and chat_id not in seen_chat_ids:
                     seen_chat_ids.add(chat_id)
                     private_count += 1
         except Exception:
@@ -5484,12 +5487,22 @@ async def add_private_account(
         if state.get("workflow_state") == "private_activation_pending":
             set_interactive_sale_state(target_chat_id, "account_delivered")
 
+        account_name = (label or "حساب خاص").strip()
+        sheet_account_saved = upsert_chatgpt_account(
+            target_chat_id,
+            f"chat_id: {target_chat_id}",
+            None,
+            f"{account_name} (خاص)",
+            create_if_missing=False,
+        )
+
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
             text=(f"✅ تمت إضافة الحساب الخاص وربطه بالزبون.\n"
                   f"chat_id: {target_chat_id}\n"
-                  f"ملاحظة: {label or 'حساب خاص'}\n"
-                  "من هسه إذا يطلب كود، ينرسل له تلقائياً."),
+                  f"اسم الحساب: {account_name} (خاص)\n"
+                  + ("✅ تم تسجيله في Google Sheet.\n" if sheet_account_saved else "⚠️ تعذر تسجيله في Google Sheet.\n")
+                  + "من هسه إذا يطلب كود، ينرسل له تلقائياً."),
         )
         try:
             await context.bot.send_message(
@@ -5497,7 +5510,7 @@ async def add_private_account(
                 message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
                 text=(f"➕ حساب خاص جديد مربوط تلقائياً\n"
                       f"الزبون: {target_chat_id}\n"
-                      f"ملاحظة: {label or 'حساب خاص'}"),
+                      f"اسم الحساب: {account_name} (خاص)"),
             )
         except Exception:
             logger.exception("Failed to notify private account link")
