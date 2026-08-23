@@ -8522,6 +8522,31 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
+        # اختصار المالك: كلمة «كود» وحدها داخل محادثة زبون مربوط ترسل
+        # الكود فوراً لذلك الزبون. أي صياغة أطول لا تدخل بهذا المسار.
+        if text.strip() == "كود":
+            linked_account = get_secret_for_chat(chat_id)
+            if linked_account is None:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ ماكو حساب مرتبط بهذا الزبون ({chat_id}).",
+                )
+                return
+            secret, _ = linked_account
+            code = generate_totp_code(secret)
+            try:
+                await context.bot.send_message(
+                    business_connection_id=bm.business_connection_id,
+                    chat_id=chat_id,
+                    text=f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا",
+                )
+            except Exception:
+                logger.exception("Failed to send owner-requested code to %s", chat_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ تعذر إرسال الكود للزبون ({chat_id}).",
+                )
+            return
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
         if not handled:
             # ردود الأونر الحقيقية هي أهم مصدر للتعلم. الأوامر لا نؤرشفها
