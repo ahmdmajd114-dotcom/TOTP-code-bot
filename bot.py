@@ -4899,6 +4899,18 @@ async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
     if state["attempt_count"] not in {1, 2, 3, 4, 5, 6, 7} and not state["awaiting_restart_confirmation"]:
         return None
     normalized = _normalize_greeting_text(text)
+    if state["awaiting_restart_confirmation"]:
+        last_attempt_at = state.get("last_attempt_at")
+        if last_attempt_at:
+            try:
+                elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_attempt_at)
+                if elapsed <= timedelta(minutes=1):
+                    return "restart_wait"
+            except (TypeError, ValueError):
+                pass
+        # بعد مرور دقيقة، أول رسالة من الزبون تعني أن التسجيل الجديد جاهز
+        # ونرسل الكود مباشرة، حتى لو كتب «تمام» أو «أوكي».
+        return "restart_done"
     if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
         return None
     try:
@@ -5319,13 +5331,11 @@ def can_unlink_expired_customer(chat_id: int) -> bool:
 
 RESTART_MESSAGE = (
     "يبدو انه الكود ما يشتغل معك بشكل صحيح.\n"
-    "سوي رست، واحذف الحساب من تطبيق Authenticator وثبته من جديد، "
-    "وبعدها اكتبلي حتى أنزلك كود جديد."
+    "سوي رست وأعيد التسجيل من جديد، وبعدها خبرني."
 )
 
 RESTART_CONFIRMATION_MESSAGE = (
-    "تمام. سوّي الريست واحذف الحساب من تطبيق Authenticator وثبته من جديد، "
-    "وبعدها اكتبلي «سويت رست» حتى أنزلك كود جديد."
+    "سوي رست وأعيد التسجيل من جديد، وبعدها خبرني."
 )
 
 STOPPED_MESSAGE = (
@@ -8609,9 +8619,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("Inferred contextual payment request for chat_id=%s", chat_id)
     contextual_code_action = await infer_contextual_code_request(chat_id, text)
     restart_confirmed = contextual_code_action == "restart_done"
+    restart_wait = contextual_code_action == "restart_wait"
     if contextual_code_action in {"retry", "restart_done"} and "طلب_كود" not in categories:
         categories.append("طلب_كود")
         logger.info("Inferred contextual code action=%s for chat_id=%s", contextual_code_action, chat_id)
+    if restart_wait:
+        # لا نجاوب على «تمام/أوكي/كود» خلال الدقيقة الأولى بعد طلب الريست.
+        categories = []
     # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
     # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
     # وبين «السلام عليكم، أريد منتجاً غير موجود».
