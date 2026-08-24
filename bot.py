@@ -3570,13 +3570,35 @@ def get_instagram_shared_account_usage(account: dict) -> int:
 
 
 def get_all_accounts_with_secrets() -> list[dict]:
-    """يرجع كل الحسابات (id, link_code, label, secret) — تستخدم لتوليد أكواد TOTP بفرع التفاعل."""
+    """يرجع الحسابات القديمة والجديدة لعرض أكواد TOTP بفرع التفاعل بدون تكرار."""
+    accounts: list[dict] = []
+    legacy_labels: set[str] = set()
     try:
-        res = supabase.table("totp_accounts").select("id, link_code, label, secret").execute()
-        return res.data or []
+        legacy = supabase.table("totp_accounts").select("id, link_code, label, secret").execute().data or []
+        for account in legacy:
+            accounts.append(account)
+            label = (account.get("label") or "").strip().lower()
+            if label:
+                legacy_labels.add(label)
     except Exception:
-        logger.exception("Failed to fetch accounts with secrets")
-        return []
+        logger.exception("Failed to fetch legacy accounts")
+
+    try:
+        native = supabase.table("chatgpt_shared_accounts").select("id, email, totp_secret").eq("is_active", True).execute().data or []
+        for account in native:
+            label = (account.get("email") or "").strip()
+            if label.lower() in legacy_labels:
+                continue
+            accounts.append({
+                "id": f"native:{account['id']}",
+                "link_code": "",
+                "label": label,
+                "secret": account.get("totp_secret"),
+                "source": "native",
+            })
+    except Exception:
+        logger.exception("Failed to fetch native shared accounts")
+    return accounts
 
 
 def get_customers_for_account(account_id) -> list[int]:
@@ -5186,8 +5208,13 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
     return True
 
 
+def normalize_totp_secret(secret: str) -> str:
+    """ينظف مفتاح Base32 قبل التوليد حتى لا تؤثر المسافات أو الأحرف الصغيرة."""
+    return re.sub(r"\s+", "", secret or "").upper()
+
+
 def generate_totp_code(secret: str) -> str:
-    totp = pyotp.TOTP(secret)
+    totp = pyotp.TOTP(normalize_totp_secret(secret))
     return totp.now()
 
 
@@ -5466,11 +5493,12 @@ async def add_private_account(
     """ينشئ حساباً خاصاً ويربطه بزبون محدد."""
     try:
         # Secret الـTOTP عادة Base32 (حروف وأرقام)، وليس كوداً من 6 أرقام.
-        pyotp.TOTP(secret.strip().replace(" ", "")).now()
+        normalized_secret = normalize_totp_secret(secret)
+        pyotp.TOTP(normalized_secret).now()
         link_code = "private_" + uuid.uuid4().hex[:12]
         account = supabase.table("totp_accounts").insert({
             "link_code": link_code,
-            "secret": secret.strip().replace(" ", ""),
+            "secret": normalized_secret,
             "label": label or "حساب خاص",
         }).execute().data
         if not account:
@@ -5551,7 +5579,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         link_code, secret, label = add_match.groups()
         try:
             supabase.table("totp_accounts").insert(
-                {"link_code": link_code, "secret": secret, "label": label or ""}
+                {"link_code": link_code, "secret": normalize_totp_secret(secret), "label": label or ""}
             ).execute()
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
@@ -8242,7 +8270,12 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("getcode_show_"):
         account_id = data[len("getcode_show_"):]
         try:
-            res = supabase.table("totp_accounts").select("secret, label, link_code").eq("id", account_id).execute()
+            if account_id.startswith("native:"):
+                res = supabase.table("chatgpt_shared_accounts").select("totp_secret, email").eq("id", account_id[len("native:"):]).execute()
+                secret = res.data[0].get("totp_secret") if res.data else None
+            else:
+                res = supabase.table("totp_accounts").select("secret, label, link_code").eq("id", account_id).execute()
+                secret = res.data[0].get("secret") if res.data else None
         except Exception:
             logger.exception("Failed to fetch account secret for getcode")
             await query.answer("صار خطأ أثناء جلب الكود.", show_alert=True)
@@ -8252,7 +8285,9 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("هذا الحساب ما عاد موجود.", show_alert=True)
             return
 
-        secret = res.data[0]["secret"]
+        if not secret:
+            await query.answer("هذا الحساب ما عاد موجود.", show_alert=True)
+            return
         code = generate_totp_code(secret)
         await query.answer()
         try:
@@ -8264,7 +8299,10 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("getcode_back_"):
         account_id = data[len("getcode_back_"):]
         try:
-            res = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).execute()
+            if account_id.startswith("native:"):
+                res = supabase.table("chatgpt_shared_accounts").select("email").eq("id", account_id[len("native:"):]).execute()
+            else:
+                res = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).execute()
         except Exception:
             logger.exception("Failed to fetch account label for getcode back")
             await query.answer("صار خطأ.", show_alert=True)
@@ -8272,7 +8310,11 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
 
         display_name = "بدون اسم"
         if res.data:
-            display_name = res.data[0].get("label") or res.data[0].get("link_code", "بدون اسم")
+            display_name = (
+                res.data[0].get("email")
+                if account_id.startswith("native:")
+                else res.data[0].get("label") or res.data[0].get("link_code", "بدون اسم")
+            ) or "بدون اسم"
 
         await query.answer()
         try:
@@ -8780,6 +8822,7 @@ def main() -> None:
     # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
     # لكل حساب TOTP مع زر لعرض الكود
     app.add_handler(CommandHandler("getcode", cmd_getcode))
+    app.add_handler(CommandHandler("getcodes", cmd_getcode))
 
     # أمر /newtest — يبدأ سياق اختبار مستقل بفرع التفاعل.
     app.add_handler(CommandHandler("newtest", cmd_newtest))
