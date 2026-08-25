@@ -5881,7 +5881,8 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     data = query.data
-    await query.answer()
+    # لا نجاوب مسبقاً؛ بعض مسارات التثبيت تحتاج عرض تنبيه رفض لاحقاً.
+    # Telegram يسمح بإجابة واحدة فقط لكل ضغطة، والجواب المسبق كان يخفي التنبيه.
 
     # بعد دفع منتج «جات» الأونر هو من يثبت النوع والمدة، لذلك لا يخلط
     # البوت بين خاص/مشترك أو شهر/شهرين من كلام الزبون وحده.
