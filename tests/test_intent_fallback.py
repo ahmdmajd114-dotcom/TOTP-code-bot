@@ -34,10 +34,16 @@ class FAQIntentParserTests(unittest.TestCase):
 
 
 class LiveContextPolicyTests(unittest.TestCase):
-    def test_product_request_outranks_greeting_and_thanks(self):
+    def test_greeting_is_kept_before_product_and_incidental_thanks_is_dropped(self):
         self.assertEqual(
             prioritize_action_categories(["سلام", "catalog:p1", "شكر"]),
-            ["catalog:p1"],
+            ["سلام", "catalog:p1"],
+        )
+
+    def test_religious_greeting_outranks_generic_greeting(self):
+        self.assertEqual(
+            prioritize_action_categories(["ترحيب", "سلام", "catalog:p1"]),
+            ["سلام", "catalog:p1"],
         )
 
     def test_conversational_only_categories_are_preserved(self):

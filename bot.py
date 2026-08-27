@@ -836,7 +836,7 @@ FAQ_RULES = [
     (
         "سلام",
         [
-            "السلام عليكم", "سلام عليكم", "سلامو عليكم", "سلامة عليكم",
+            "سلام", "السلام عليكم", "سلام عليكم", "سلامو عليكم", "سلامة عليكم",
             "السلام عليكم ورحمة الله", "assalamu alaikum", "salam alaikum",
         ],
         "وعليكم السلام ورحمة الله وبركاته اهلا وسهلا",
@@ -4968,9 +4968,14 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     # الكلمات الواضحة تبقى سريعة ومضمونة. الرسائل غير المحسومة أو التي
     # تحتوي تحية فقط مع كلام إضافي تمر على Qwen لفهم النية، ثم الكود نفسه
     # يختار نص FAQ المعتمد ولا يسمح للنموذج بكتابة الرد أو تنفيذ إجراء.
+    has_catalog_category = any(catalog_product_id(category) for category in categories)
     needs_ai_fallback = not categories or (
         set(categories).issubset(conversational_categories)
         and len(normalized_text.split()) > 2
+    ) or (
+        # إذا انعرف المنتج ضمن رسالة مركبة، يبقى Qwen يفحص بقية الكلام؛
+        # قد تكون تحية بصياغة جديدة أو غاية ثانية لا تغطيها الكلمات الحرفية.
+        has_catalog_category and len(normalized_text.split()) > 2
     )
     if needs_ai_fallback:
         inferred_categories = await classify_unmatched_faq_with_ai(text)
@@ -9046,9 +9051,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         and set(categories).issubset({"سلام", "ترحيب"})
     ):
         categories = []
-    # الطلب الحقيقي له أولوية على المجاملات الموجودة بنفس الرسالة. مثلاً
-    # «السلام عليكم، عندكم كانفا؟» يرسل الباقات فقط، لا رد تحية منفصل.
+    # نحافظ على تحية واحدة قبل الطلب الحقيقي؛ الشكر العرضي وحده يُحذف.
+    # رد السلام واجب ولا يجوز أن تسقطه أولوية المنتج.
     categories = prioritize_action_categories(categories)
+    has_greeting_and_action = (
+        any(category in {"سلام", "ترحيب"} for category in categories)
+        and any(category not in {"سلام", "ترحيب", "شكر"} for category in categories)
+    )
     logger.info(f"Classification for chat_id={chat_id}: {categories}")
 
     replies_to_send: list[str] = []
@@ -9103,8 +9112,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             continue
         # طلبات الدفع مباشرة وحساسة للسياق؛ لا نمنع تكرارها إذا كتب الزبون
         # «ممكن الماستر؟» أو سأل عن طريقة دفع ثانية بعد رد سابق.
-        payment_category = category in {"طرق_الدفع", "دفع_رصيد"}
-        if not is_edited_message and not payment_category and not should_send_faq_reply(chat_id, category, reply_text):
+        repeatable_category = category in {"سلام", "ترحيب", "طرق_الدفع", "دفع_رصيد"}
+        if not is_edited_message and not repeatable_category and not should_send_faq_reply(chat_id, category, reply_text):
             continue
         if reply_text:
             replies_to_send.append(reply_text)
@@ -9153,14 +9162,19 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await human_like_reply_sequence(
             context, chat_id, bm.business_connection_id, bm.message_id
         )
-    for reply_text in replies_to_send:
+    outgoing_replies = (
+        ["\n\n".join(replies_to_send)]
+        if has_greeting_and_action and len(replies_to_send) > 1
+        else replies_to_send
+    )
+    for reply_text in outgoing_replies:
         await context.bot.send_message(
             business_connection_id=bm.business_connection_id,
             chat_id=chat_id,
             text=reply_text,
         )
-    logger.info(f"Sent {len(replies_to_send)} reply(ies) to chat_id={chat_id}")
-    combined_reply = "\n---\n".join(replies_to_send)
+    logger.info(f"Sent {len(outgoing_replies)} reply(ies) to chat_id={chat_id}")
+    combined_reply = "\n---\n".join(outgoing_replies)
     archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
     archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=combined_reply)
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)

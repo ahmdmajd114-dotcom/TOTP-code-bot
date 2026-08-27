@@ -56,10 +56,12 @@ def parse_faq_intent(raw: str, allowed_categories: Iterable[str]) -> FAQIntent:
 
 
 def prioritize_action_categories(categories: Iterable[str]) -> list[str]:
-    """Drop greetings/thanks when the same customer turn contains a real request."""
+    """Keep one greeting before a real request, while dropping incidental thanks."""
     ordered = list(dict.fromkeys(categories))
     if any(category not in CONVERSATIONAL_CATEGORIES for category in ordered):
-        return [category for category in ordered if category not in CONVERSATIONAL_CATEGORIES]
+        greeting = "سلام" if "سلام" in ordered else "ترحيب" if "ترحيب" in ordered else None
+        actions = [category for category in ordered if category not in CONVERSATIONAL_CATEGORIES]
+        return ([greeting] if greeting else []) + actions
     return ordered
 
 
