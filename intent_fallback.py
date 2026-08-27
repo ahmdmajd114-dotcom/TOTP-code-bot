@@ -25,6 +25,20 @@ def normalize_arabic_text(text: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
+def infer_greeting_category(text: str) -> str | None:
+    """Recognize common Iraqi greeting variants, including stretched spellings."""
+    normalized = normalize_arabic_text(text)
+    if re.match(r"^(?:السلام|سلام)(?:\s+عليكم)?(?:\b|$)", normalized):
+        return "سلام"
+    first_word = normalized.split(maxsplit=1)[0] if normalized else ""
+    if (
+        re.fullmatch(r"ه(?:لا|لو)و*", first_word)
+        or first_word in {"مرحبا", "مرحبتين", "اهلا", "اهلين", "hi", "hello", "hey"}
+    ):
+        return "ترحيب"
+    return None
+
+
 @dataclass(frozen=True)
 class FAQIntent:
     categories: tuple[str, ...] = ()

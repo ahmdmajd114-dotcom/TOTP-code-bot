@@ -57,13 +57,31 @@ def format_customer_catalog_reply(
     if not active_plans:
         return None
 
-    lines = [f"بلي موجود، هاي الباقات المتوفرة {product.get('name')}:", ""]
+    lines = [f"بلي موجود، عدنا باقات {product.get('name')} التالية:", ""]
     for plan in active_plans:
-        details = [str(plan.get("name") or "").strip(), str(plan.get("price"))]
-        if plan.get("duration"):
-            details.append(str(plan["duration"]).strip())
-        line = " — ".join(value for value in details if value)
+        title = re.sub(r"^اشتراك\s+", "", str(plan.get("name") or "").strip()).strip()
+        duration = str(plan.get("duration") or "").strip()
+        normalized_title = normalize_arabic_text(title)
+        account_type = "خاص" if "خاص" in normalized_title else "مشترك" if "مشترك" in normalized_title else ""
+        simple_plan_words = set(normalized_title.split()) <= {"شهر", "شهرين", "خاص", "مشترك"}
+        if duration and account_type and simple_plan_words:
+            title = f"{duration} {account_type}"
+        elif duration and normalize_arabic_text(duration) not in normalized_title:
+            title = f"{title} لمدة {duration}" if title else duration
+
+        raw_price = plan.get("price")
+        try:
+            numeric_price = float(raw_price)
+            if numeric_price >= 1000:
+                numeric_price /= 1000
+            shown_price = int(numeric_price) if numeric_price.is_integer() else numeric_price
+            unit = "آلاف" if 3 <= numeric_price <= 10 else "ألف"
+            price_text = f"{shown_price} {unit}"
+        except (TypeError, ValueError):
+            price_text = str(raw_price or "").strip()
+
+        line = f"- {title}، سعره {price_text}."
         if plan.get("description"):
-            line += f" — {str(plan['description']).strip()}"
-        lines.append(f"- {line}")
+            line += f"\n  ملاحظة: {str(plan['description']).strip()}"
+        lines.append(line)
     return "\n".join(lines)

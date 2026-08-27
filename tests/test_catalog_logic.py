@@ -36,8 +36,24 @@ class CatalogReplyTests(unittest.TestCase):
                 {"name": "قديم", "price": 10, "is_active": False},
             ],
         )
-        self.assertIn("سنة — 25 — 12 شهر — خاص", reply)
+        self.assertIn("سنة لمدة 12 شهر، سعره 25 ألف.", reply)
+        self.assertIn("ملاحظة: خاص", reply)
         self.assertNotIn("قديم", reply)
+
+    def test_chatgpt_plans_are_rendered_as_natural_customer_lines(self):
+        reply = format_customer_catalog_reply(
+            {"id": "chat", "name": "ChatGPT", "is_active": True},
+            [
+                {"name": "اشتراك شهر مشترك", "price": 8, "duration": "شهر", "is_active": True},
+                {"name": "اشتراك شهر خاص", "price": 28000, "duration": "شهر", "description": "تفعيل على حسابك", "is_active": True},
+                {"name": "اشتراك خاص شهرين", "price": 39, "duration": "شهرين", "is_active": True},
+            ],
+        )
+
+        self.assertIn("- شهر مشترك، سعره 8 آلاف.", reply)
+        self.assertIn("- شهر خاص، سعره 28 ألف.", reply)
+        self.assertIn("- شهرين خاص، سعره 39 ألف.", reply)
+        self.assertIn("ملاحظة: تفعيل على حسابك", reply)
 
     def test_no_active_plan_means_no_customer_offer(self):
         self.assertIsNone(format_customer_catalog_reply(PRODUCTS[0], []))

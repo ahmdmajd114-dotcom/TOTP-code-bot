@@ -2,6 +2,7 @@ import unittest
 
 from intent_fallback import (
     contextual_thanks_reply,
+    infer_greeting_category,
     normalize_arabic_text,
     parse_faq_intent,
     prioritize_action_categories,
@@ -14,6 +15,14 @@ class ArabicNormalizationTests(unittest.TestCase):
 
     def test_tatweel_and_exaggerated_letters_are_normalized(self):
         self.assertEqual(normalize_arabic_text("شــــكرااا"), "شكرا")
+
+    def test_understands_iraqi_greeting_before_a_product_request(self):
+        self.assertEqual(infer_greeting_category("هلاو رايد جات"), "ترحيب")
+        self.assertEqual(infer_greeting_category("هلوو أريد كانفا"), "ترحيب")
+
+    def test_distinguishes_salam_from_generic_greeting(self):
+        self.assertEqual(infer_greeting_category("سلام أريد أمبوس"), "سلام")
+        self.assertIsNone(infer_greeting_category("أريد أمبوس"))
 
 
 class FAQIntentParserTests(unittest.TestCase):
