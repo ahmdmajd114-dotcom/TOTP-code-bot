@@ -3,6 +3,7 @@ from datetime import datetime
 
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    asks_shared_private_difference,
     can_request_account_code,
     decide_code_retry,
     decide_private_code_retry,
@@ -53,6 +54,11 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
 
     def test_unique_price_is_a_valid_choice(self):
         self.assert_plan(["اريد باقة 25"], "private-1")
+
+    def test_understands_shared_private_comparison_followups(self):
+        self.assertTrue(asks_shared_private_difference("شنو الفرق بين المشترك والخاص؟"))
+        self.assertTrue(asks_shared_private_difference("الخاص احسن لو المشترك"))
+        self.assertFalse(asks_shared_private_difference("أريد اشتراك خاص"))
 
     def test_ambiguous_or_empty_choice_requests_clarification(self):
         choice = resolve_plan_choice(["اختارته"], PLANS)

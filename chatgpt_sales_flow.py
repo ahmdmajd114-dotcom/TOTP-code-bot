@@ -137,6 +137,19 @@ def asks_payment_guidance(text: str) -> bool:
     return has_question and has_next_step
 
 
+def asks_shared_private_difference(text: str) -> bool:
+    """يفهم سؤال الفرق أو المفاضلة بين اشتراك ChatGPT الخاص والمشترك."""
+    words = normalized_words(text)
+    private_words = {"خاص", "الخاص", "والخاص"}
+    shared_words = {"مشترك", "المشترك", "والمشترك"}
+    mentions_both = bool(words & private_words) and bool(words & shared_words)
+    comparison_words = {
+        "شنو", "فرق", "الفرق", "يختلف", "اختلاف", "الاختلاف",
+        "احسن", "افضل", "اختار", "انسب",
+    }
+    return mentions_both and bool(words & comparison_words)
+
+
 def is_payment_claim(text: str) -> bool:
     """يميز تصريح الدفع عن سؤال الأسعار أو الاستفسار العام."""
     return bool(normalized_words(text) & {"حولت", "دفعت", "دافعل", "محول"})

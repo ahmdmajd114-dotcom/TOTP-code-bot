@@ -57,6 +57,7 @@ from intent_fallback import (
 from photo_intent import PhotoIntent, is_confident_code_verification, parse_photo_intent
 from chatgpt_sales_flow import (
     asks_payment_guidance,
+    asks_shared_private_difference,
     can_request_account_code,
     decide_code_retry,
     decide_private_code_retry,
@@ -879,6 +880,16 @@ FAQ_RULES = [
         "شهرين مشترك 15",
     ),
     (
+        "فرق_شات",
+        [
+            "شنو الفرق بين المشترك والخاص", "شنو الفرق بين الخاص والمشترك",
+            "الفرق بين المشترك والخاص", "الفرق بين الخاص والمشترك",
+            "المشترك شنو يختلف عن الخاص", "الخاص احسن لو المشترك",
+        ],
+        "المشترك يكون الحساب ويا أشخاص آخرين، وتكدر تفتحه على جهاز واحد فقط.\n"
+        "الخاص يكون إلك وحدك، وتكدر تفتحه على أكثر من جهاز.",
+    ),
+    (
         "طرق_الدفع",
         [
             "طرق الدفع", "طريقة الدفع", "شلون ادفع", "كيف ادفع", "وين ادفع",
@@ -943,7 +954,7 @@ FAQ_RULES = [
 # وكيل التفاعل لاكتشاف الانتقال الصريح من موضوع إلى منتج آخر.
 INTERACTIVE_PRODUCT_FAQ_CATEGORIES = {
     category for category, _, _ in FAQ_RULES
-    if category not in {"سلام", "ترحيب", "شكر", "طرق_الدفع", "دفع_رصيد"}
+    if category not in {"سلام", "ترحيب", "شكر", "طرق_الدفع", "دفع_رصيد", "فرق_شات"}
 }
 
 SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
@@ -4968,6 +4979,8 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     greeting_category = infer_greeting_category(text)
     if greeting_category and greeting_category not in categories:
         categories.insert(0, greeting_category)
+    if asks_shared_private_difference(text) and "فرق_شات" not in categories:
+        categories.append("فرق_شات")
     catalog_products = get_catalog_products()
     matched_products = match_catalog_products(text, catalog_products)
     categories.extend(catalog_category(product["id"]) for product in matched_products)
