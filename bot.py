@@ -55,6 +55,7 @@ from intent_fallback import (
     prioritize_action_categories,
 )
 from photo_intent import PhotoIntent, is_confident_code_verification, parse_photo_intent
+from conversation_policy import is_within_context_gap
 from chatgpt_sales_flow import (
     asks_payment_guidance,
     asks_shared_private_difference,
@@ -183,6 +184,7 @@ _pending_customer_text_batches: dict[int, dict] = {}
 # النص المجمع الجاهز لإعادة إدخاله إلى المعالج من دون جدولة ثانية.
 _ready_customer_texts: dict[tuple[int, int], str] = {}
 _delayed_greeting_delivery_keys: set[tuple[int, int]] = set()
+_support_context_until: dict[int, datetime] = {}
 
 
 async def _call_alibaba_api(payload: dict, timeout: float) -> dict | None:
@@ -2899,7 +2901,9 @@ def get_context_event_types(
         events.append("payment_or_support_image")
     if has("كود", "رمز", "code"):
         events.append("code_request_or_help")
-    if has("ما صار", "ما قبل", "ماقبل", "ما يشتغل", "مايشتغل", "مشكلة", "خطأ"):
+    if (
+        sender_type == "customer" and has_support_signal(message_text or "")
+    ) or has("ما صار", "ما قبل", "ماقبل", "ما يشتغل", "مايشتغل", "مشكلة", "خطأ"):
         events.append("support_issue")
     if has("شكراً", "شكرا", "تعبتكم", "عاشت ايدكم", "عاشت إيدكم"):
         events.append("thanks")
@@ -3032,6 +3036,59 @@ def archive_message(
         }).eq("id", session_id).execute()
     except Exception:
         logger.exception("Failed to archive conversation message")
+
+
+def mark_live_support_context(chat_id: int) -> None:
+    """يبقي الصمت التلقائي فعالاً حتى تمر 30 دقيقة بلا أي متابعة."""
+    _support_context_until[chat_id] = datetime.now(timezone.utc) + timedelta(
+        minutes=CONVERSATION_SESSION_GAP_MINUTES
+    )
+
+
+def is_live_support_context_active(chat_id: int) -> bool:
+    """هل تحتوي الجلسة الحية الحالية على مشكلة تستلزم تدخلاً بشرياً؟"""
+    now = datetime.now(timezone.utc)
+    memory_until = _support_context_until.get(chat_id)
+    if memory_until and now < memory_until:
+        # كل متابعة جديدة تعني أن فترة السكوت لم تبدأ بعد.
+        mark_live_support_context(chat_id)
+        return True
+    _support_context_until.pop(chat_id, None)
+
+    try:
+        latest_rows = (
+            supabase.table("conversation_archive")
+            .select("conversation_session_id, created_at")
+            .eq("customer_chat_id", chat_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute().data or []
+        )
+        if not latest_rows or not is_within_context_gap(
+            latest_rows[0].get("created_at"),
+            now=now,
+            gap_minutes=CONVERSATION_SESSION_GAP_MINUTES,
+        ):
+            return False
+        session_id = latest_rows[0].get("conversation_session_id")
+        if not session_id:
+            return False
+        support_events = (
+            supabase.table("conversation_context_events")
+            .select("id")
+            .eq("conversation_session_id", session_id)
+            .eq("sender_type", "customer")
+            .eq("event_type", "support_issue")
+            .limit(1)
+            .execute().data or []
+        )
+        if support_events:
+            mark_live_support_context(chat_id)
+            return True
+        return False
+    except Exception:
+        logger.exception("Failed to check active live support context for chat %s", chat_id)
+        return False
 
 
 CONVERSATION_SUMMARY_GAP_MINUTES = 30  # فترة صمت تستدعي دمج الرسائل الجديدة بالملخص التراكمي
@@ -8991,6 +9048,23 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         queue_customer_text_batch(update, context, bm, text)
         return
 
+    # إذا بدأت مشكلة ضمن الجلسة الحالية، كل المتابعات تبقى بلا رد تلقائي
+    # حتى تمر 30 دقيقة سكوت. نؤرشفها وننبه الأونر حتى يكمل هو الحوار.
+    if not is_from_owner and is_live_support_context_active(chat_id):
+        archive_message(
+            chat_id, customer_name, customer_username,
+            sender_type="customer", message_text=text,
+        )
+        await notify_owner(
+            context,
+            chat_id,
+            customer_name,
+            customer_username,
+            text,
+            "ما رد تلقائياً — هذه متابعة ضمن سياق مشكلة مفتوح وتحتاج تدخلك.",
+        )
+        return
+
     if not is_from_owner and await handle_feedback_followup(context, bm, text):
         archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
@@ -9042,6 +9116,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if has_support_signal(text) and not is_support_cancellation(text):
         categories = ["شكوى_منتج"]
         is_chatgpt_complaint = True
+    if is_chatgpt_complaint:
+        mark_live_support_context(chat_id)
     if (
         not is_chatgpt_complaint
         and "طرق_الدفع" not in categories
