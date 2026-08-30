@@ -2,6 +2,7 @@ import unittest
 
 from intent_fallback import (
     contextual_thanks_reply,
+    feedback_reply_is_positive,
     infer_greeting_category,
     normalize_arabic_text,
     parse_faq_intent,
@@ -64,6 +65,25 @@ class LiveContextPolicyTests(unittest.TestCase):
     def test_thanks_reply_depends_on_fulfilled_service(self):
         self.assertEqual(contextual_thanks_reply(False), "اهلاً وسهلاً")
         self.assertEqual(contextual_thanks_reply(True), "تدللون، بالخدمة")
+
+
+class FeedbackSatisfactionTests(unittest.TestCase):
+    def test_customer_message_in_screenshot_is_positive_despite_mentioning_problem(self):
+        text = (
+            "عاشت ايدكم وشكرا جزيلا ما كان اكو اي تقصير من ناحيتكم "
+            "وساعدتوني هواي وحاولتوا حل المشكلة واخدت من وقتكم "
+            "الله يوفقكم يارب"
+        )
+        self.assertTrue(feedback_reply_is_positive(text))
+
+    def test_past_problem_that_was_resolved_is_positive(self):
+        self.assertTrue(feedback_reply_is_positive("شكراً، ساعدتوني وانحلت المشكلة"))
+
+    def test_unresolved_problem_is_not_eligible_for_rating_link(self):
+        self.assertFalse(feedback_reply_is_positive("شكراً بس ما انحلت المشكلة واريد تعويض"))
+
+    def test_empty_or_vague_reply_is_not_eligible_for_rating_link(self):
+        self.assertFalse(feedback_reply_is_positive("المشكلة موجودة"))
 
 
 if __name__ == "__main__":

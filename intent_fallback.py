@@ -82,3 +82,42 @@ def prioritize_action_categories(categories: Iterable[str]) -> list[str]:
 def contextual_thanks_reply(service_fulfilled: bool) -> str:
     """A polite exit differs from thanks after actual fulfillment."""
     return "تدللون، بالخدمة" if service_fulfilled else "اهلاً وسهلاً"
+
+
+def feedback_reply_is_positive(text: str) -> bool:
+    """Return whether an Iraqi-Arabic follow-up clearly expresses satisfaction.
+
+    This deliberately evaluates phrases rather than treating every occurrence of
+    words such as "مشكلة" or "تقصير" as negative.  Customers often mention a
+    past problem while thanking the team for resolving it.
+    """
+    normalized = normalize_arabic_text(text)
+    if not normalized:
+        return False
+
+    # An unresolved problem or an explicit complaint must always reach the owner,
+    # even if the customer begins politely with "شكراً".
+    explicit_negative_phrases = (
+        "مو زين", "مو حلو", "سيء", "زفت", "ما يشتغل", "مايفتح",
+        "ما انحلت", "ما انحل", "ما انحلت المشكله", "ما ساعدتوني",
+        "ما فادتني", "اريد تعويض", "اريد استرجاع", "استرجاع فلوسي",
+        "تقصير منكم", "قصرتوا وياي",
+    )
+    if any(normalize_arabic_text(phrase) in normalized for phrase in explicit_negative_phrases):
+        return False
+
+    positive_phrases = (
+        "ما كان اكو تقصير", "ماكو تقصير", "ما قصرتوا", "ماقصرتوا",
+        "عاشت ايدكم", "عاشوا ايدكم", "شكرا جزيلا", "شكرا الكم",
+        "اشكركم", "تجربتي ممتعه", "تجربه ممتعه", "تجربة مفيدة",
+        "تجربه مفيده", "راضي عن الخدمه", "راضية عن الخدمة",
+        "انحلت المشكله", "انحل الموضوع", "حليتوا المشكله",
+        "ساعدتوني", "اخذتوا من وقتكم", "بارك الله بيكم",
+    )
+    if any(normalize_arabic_text(phrase) in normalized for phrase in positive_phrases):
+        return True
+
+    # Short, unambiguous approvals are safe too.  Do not use broad terms such as
+    # "كلش" alone: they occur in both praise and complaints.
+    positive_words = ("ممتاز", "ممتعه", "مفيده", "راضي", "راضية", "تمام")
+    return any(normalize_arabic_text(word) in normalized for word in positive_words)
