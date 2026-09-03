@@ -5,6 +5,7 @@ from family_assistant import (
     ANKI_PRICE_IQD,
     AnkiTopic,
     anki_family_guidance,
+    classify_anki_family_topic,
     review_anki_receipt,
 )
 
@@ -19,6 +20,11 @@ class AnkiFamilyGuidanceTests(unittest.TestCase):
         guidance = anki_family_guidance(AnkiTopic.INSTALLATION)
         self.assertTrue(guidance.requires_owner)
         self.assertTrue(any("لا تحفظوه" in item for item in guidance.family_checklist))
+
+    def test_classifies_common_family_requests(self):
+        self.assertEqual(classify_anki_family_topic("الزبون حول زين كاش",), AnkiTopic.RECEIPT_REVIEW)
+        self.assertEqual(classify_anki_family_topic("شلون ننزله على الايفون؟"), AnkiTopic.INSTALLATION)
+        self.assertEqual(classify_anki_family_topic("حذف التطبيق"), AnkiTopic.SUPPORT)
 
 
 class AnkiReceiptReviewTests(unittest.TestCase):

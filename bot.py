@@ -88,6 +88,7 @@ from interactive_classifier import (
     should_switch_from_support,
     support_action_for_turn,
 )
+from family_assistant import anki_family_guidance, classify_anki_family_topic
 
 # ------------------------------------------------------------------
 # توافق Python 3.14: بعض إصدارات python-telegram-bot تعتمد على وجود
@@ -131,6 +132,9 @@ TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشا�
 TOPIC_PAYMENTS = 8        # إشعار كل عملية دفع/إضافة منتج
 TOPIC_EXPENSES = 10       # إشعار كل عملية مصروف
 TOPIC_INTERACTIVE = 12    # محجوز لاحقاً — تفاعل مباشر مع البوت
+# فرع الأهل داخل نفس گروب الإشعارات. يمكن تغيير الرقم من Render عند الحاجة
+# من دون تعديل الكود.
+TOPIC_FAMILY_ASSISTANT = int(os.environ.get("TOPIC_FAMILY_ASSISTANT", "1735"))
 TOPIC_CHATGPT_ACCOUNTS = 33  # إضافة حساب مشترك جديد + ربط زبون بحساب
 TOPIC_DEBTS = int(os.environ.get("TOPIC_DEBTS", "0"))  # تسجيل دين جديد + تسديد دين — لازم تحدد رقمه الحقيقي
 SHARED_CHATGPT_ACCOUNT_CAPACITY = 3  # الحد الثابت لكل حساب ChatGPT مشترك
@@ -7912,6 +7916,12 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     message = update.message
     if not message or (not message.text and not message.voice and not message.photo):
         return
+    # «مساعدك الذكي» يستعمل نفس البوت ونفس الگروب، لكنه فرع مستقل تماماً
+    # عن تفاعل الاختبار وأوامر الـTOTP. لا يحتاج قائمة IDs لأن الدخول يتم
+    # بحساب دعم المتجر الذي اختاره المالك.
+    if message.message_thread_id == TOPIC_FAMILY_ASSISTANT:
+        await on_family_assistant_topic_message(update, context)
+        return
     if message.text and message.text.startswith("/"):
         return  # الأوامر (زي /getcode) تُعالج بـ handlers منفصلة
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
@@ -8051,6 +8061,44 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         )
     except Exception:
         logger.exception("Failed to send test chat reply to interactive topic")
+
+
+async def on_family_assistant_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يرد داخل Topic «مساعدك الذكي» بدليل عملي مخصص للأهل.
+
+    لا يلمس فلو تسليم الحسابات أو TOTP ولا يقرأ/يحفظ بيانات اعتماد. النصوص
+    والصوت والصور كلها تبقى داخل فرع الإدارة الخاص.
+    """
+    message = update.message
+    if message is None:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    if message.voice:
+        try:
+            file = await context.bot.get_file(message.voice.file_id)
+            text = await transcribe_audio(bytes(await file.download_as_bytearray()))
+        except Exception:
+            logger.exception("Failed to transcribe family-assistant voice message")
+            text = None
+        if not text:
+            await message.reply_text("ما كدرت أفهم الفويس هسه. دزوه كنص أو عيدوه مرة ثانية.")
+            return
+    elif message.photo:
+        # الصورة قد تكون وصل؛ قرار قبولها يبقى بيد الأهل، لا قرار آلي.
+        text = "وصل تحويل صورة"
+    else:
+        text = message.text or ""
+
+    guidance = anki_family_guidance(classify_anki_family_topic(text))
+    checklist = "\n".join(f"• {item}" for item in guidance.family_checklist)
+    owner_note = "\n\n📌 هذه الحالة تحتاج مراجعة صاحب المتجر." if guidance.requires_owner else ""
+    await message.reply_text(
+        f"🤖 مساعدك الذكي — أنكي\n\n"
+        f"شنو تسوون هسه:\n{checklist}\n\n"
+        f"رد مقترح للزبون:\n{guidance.customer_reply}{owner_note}"
+    )
 
 
 async def on_owner_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

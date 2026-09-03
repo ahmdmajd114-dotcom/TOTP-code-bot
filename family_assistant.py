@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
+import re
 
 
 ANKI_PRICE_IQD = 5_000
@@ -41,6 +42,30 @@ class ReceiptReview:
 
     status: str  # needs_receipt | needs_manual_review | mismatch | eligible_for_delivery
     checklist: tuple[str, ...]
+
+
+def classify_anki_family_topic(text: str) -> AnkiTopic:
+    """يصنف سؤال الأهل إلى خطوة أنكي، ولا يفسر النص كتعليمات برمجية.
+
+    هذا تصنيف ضيق ومقصود للحالات المتكررة. إذا ما كانت الحالة واضحة نعيدها
+    لصاحب المتجر بدلاً من تخمين قرار حساس.
+    """
+    value = (text or "").lower()
+    value = re.sub(r"[أإآٱ]", "ا", value).replace("ى", "ي").replace("ة", "ه")
+    words = set(re.findall(r"[\w\u0600-\u06ff]+", value))
+    if words & {"حذف", "محذوف", "مشكل", "مشكله", "مايشتغل", "مايفتح", "دعم", "خربان"}:
+        return AnkiTopic.SUPPORT
+    if words & {"وصل", "تحويل", "ماستر", "زين", "كاش", "اثير", "رصيد"}:
+        return AnkiTopic.RECEIPT_REVIEW if words & {"وصل", "حول", "حولت", "دافعل", "دفعت"} else AnkiTopic.PAYMENT
+    if words & {"تثبيت", "تنزيل", "ابستور", "ابل", "ايفون", "ايباد", "تسجيل", "كود", "رمز"} or any(
+        fragment in value for fragment in ("ننز", "تنزل", "ينزل", "نزله", "اب ستور")
+    ):
+        return AnkiTopic.INSTALLATION
+    if words & {"ادفع", "دفع", "اشترك", "اشتراك", "سعر", "بكم"}:
+        return AnkiTopic.PAYMENT
+    if words & {"انكي", "anki", "انچي"}:
+        return AnkiTopic.OFFER
+    return AnkiTopic.ESCALATE
 
 
 def anki_family_guidance(topic: AnkiTopic) -> FamilyGuidance:
