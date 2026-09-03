@@ -1032,6 +1032,7 @@ BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
 BTN_PERSONAL_REMINDER = "⏰ تذكير شخصي"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
+BTN_CAMPAIGNS = "📣 إرسال رسالة للعملاء"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -1042,7 +1043,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
         [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
-        [KeyboardButton(BTN_PERSONAL_REMINDER)],
+        [KeyboardButton(BTN_PERSONAL_REMINDER), KeyboardButton(BTN_CAMPAIGNS)],
         [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
     ],
     resize_keyboard=True,
@@ -1483,6 +1484,163 @@ def get_payment_methods() -> list[dict]:
         return []
 
 
+CAMPAIGN_AUDIENCES = {
+    "active_all": "كل المشتركين الفعّالين",
+    "active_private": "المشتركون الخاصون الفعّالون",
+    "active_shared": "المشتركون المشتركون الفعّالون",
+    "joined_30": "من اشترك خلال آخر 30 يوم",
+    "support_recent": "حالات الدعم الحديثة",
+    "all_contacts": "كل العملاء الذين راسلوا الحساب",
+}
+CAMPAIGN_SEND_DELAY_SECONDS = 0.08
+
+
+def build_campaign_audience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ المشتركين الفعّالين", callback_data="campaign_aud_active_all")],
+        [InlineKeyboardButton("👤 الخاص الفعّال", callback_data="campaign_aud_active_private"),
+         InlineKeyboardButton("👥 المشترك الفعّال", callback_data="campaign_aud_active_shared")],
+        [InlineKeyboardButton("🗓️ اشتركوا آخر 30 يوم", callback_data="campaign_aud_joined_30")],
+        [InlineKeyboardButton("🛠️ حالات دعم حديثة", callback_data="campaign_aud_support_recent")],
+        [InlineKeyboardButton("👥 كل العملاء", callback_data="campaign_aud_all_contacts")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="campaign_cancel")],
+    ])
+
+
+def _dedupe_campaign_recipients(rows: list[dict]) -> list[dict]:
+    recipients: dict[int, dict] = {}
+    for row in rows:
+        chat_id = row.get("customer_chat_id") or row.get("chat_id")
+        if chat_id is None:
+            continue
+        try:
+            chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            continue
+        existing = recipients.get(chat_id)
+        if existing is None or (not existing.get("business_connection_id") and row.get("business_connection_id")):
+            recipients[chat_id] = {
+                "customer_chat_id": chat_id,
+                "business_connection_id": row.get("business_connection_id"),
+                "customer_name": row.get("customer_name") or row.get("display_name"),
+            }
+    return list(recipients.values())
+
+
+def get_campaign_recipients(audience_key: str) -> list[dict]:
+    """Return a deduplicated, snapshot-ready recipient list for one audience."""
+    now = datetime.now(timezone.utc)
+    try:
+        if audience_key.startswith("active_") or audience_key == "joined_30":
+            query = supabase.table("subscription_reminders").select(
+                "customer_chat_id, business_connection_id, customer_name, subscription_type, started_at"
+            ).not_.is_("customer_chat_id", "null")
+            if audience_key.startswith("active_"):
+                query = query.eq("status", "active").gt("expires_at", now.isoformat())
+                if audience_key == "active_private":
+                    query = query.eq("subscription_type", "private")
+                elif audience_key == "active_shared":
+                    query = query.eq("subscription_type", "shared")
+            else:
+                query = query.gte("started_at", (now - timedelta(days=30)).isoformat())
+            return _dedupe_campaign_recipients(query.execute().data or [])
+
+        if audience_key == "all_contacts":
+            rows = supabase.table("customer_contacts").select(
+                "chat_id, business_connection_id, display_name"
+            ).eq("platform", "telegram").not_.is_("chat_id", "null").execute().data or []
+            return _dedupe_campaign_recipients(rows)
+
+        if audience_key == "support_recent":
+            sessions = supabase.table("conversation_sessions").select(
+                "customer_chat_id, customer_name"
+            ).eq("latest_stage", "support_needed").gte(
+                "last_activity_at", (now - timedelta(days=30)).isoformat()
+            ).execute().data or []
+            contact_rows = supabase.table("customer_contacts").select(
+                "chat_id, business_connection_id, display_name"
+            ).eq("platform", "telegram").not_.is_("chat_id", "null").execute().data or []
+            by_chat = {int(row["chat_id"]): row for row in contact_rows if row.get("chat_id") is not None}
+            return _dedupe_campaign_recipients([
+                {**session, **(by_chat.get(int(session["customer_chat_id"])) or {})}
+                for session in sessions if session.get("customer_chat_id") is not None
+            ])
+    except Exception:
+        logger.exception("Failed to build campaign audience %s", audience_key)
+    return []
+
+
+def create_campaign_snapshot(audience_key: str, message_text: str) -> tuple[dict | None, list[dict]]:
+    recipients = get_campaign_recipients(audience_key)
+    try:
+        campaign = (supabase.table("customer_campaigns").insert({
+            "owner_user_id": OWNER_USER_ID,
+            "audience_key": audience_key,
+            "message_text": message_text,
+            "recipient_count": len(recipients),
+        }).execute().data or [None])[0]
+        if campaign and recipients:
+            supabase.table("customer_campaign_recipients").insert([
+                {"campaign_id": campaign["id"], **recipient}
+                for recipient in recipients
+            ]).execute()
+        return campaign, recipients
+    except Exception:
+        logger.exception("Failed to create campaign snapshot")
+        return None, []
+
+
+async def send_campaign(context: ContextTypes.DEFAULT_TYPE, campaign_id: str) -> tuple[int, int, int]:
+    """Send a confirmed campaign sequentially and persist every delivery result."""
+    try:
+        campaign_rows = supabase.table("customer_campaigns").select("message_text, status").eq("id", campaign_id).limit(1).execute().data or []
+        if not campaign_rows or campaign_rows[0].get("status") != "draft":
+            return 0, 0, 0
+        message_text = campaign_rows[0]["message_text"]
+        supabase.table("customer_campaigns").update({"status": "sending"}).eq("id", campaign_id).execute()
+        recipients = supabase.table("customer_campaign_recipients").select(
+            "id, customer_chat_id, business_connection_id"
+        ).eq("campaign_id", campaign_id).eq("delivery_status", "pending").execute().data or []
+    except Exception:
+        logger.exception("Failed to start campaign %s", campaign_id)
+        return 0, 0, 0
+
+    sent = failed = skipped = 0
+    for recipient in recipients:
+        status = "sent"
+        error_text = None
+        if not recipient.get("business_connection_id"):
+            status, skipped = "skipped", skipped + 1
+            error_text = "لا يوجد اتصال Business محفوظ لهذا العميل"
+        else:
+            try:
+                await context.bot.send_message(
+                    business_connection_id=recipient["business_connection_id"],
+                    chat_id=recipient["customer_chat_id"], text=message_text,
+                )
+                sent += 1
+            except Exception as exc:
+                status, failed = "failed", failed + 1
+                error_text = str(exc)[:500]
+                logger.exception("Campaign delivery failed campaign=%s chat=%s", campaign_id, recipient["customer_chat_id"])
+        try:
+            supabase.table("customer_campaign_recipients").update({
+                "delivery_status": status, "error_text": error_text,
+                "delivered_at": datetime.now(timezone.utc).isoformat() if status == "sent" else None,
+            }).eq("id", recipient["id"]).execute()
+        except Exception:
+            logger.exception("Failed to save campaign recipient result")
+        await asyncio.sleep(CAMPAIGN_SEND_DELAY_SECONDS)
+    try:
+        supabase.table("customer_campaigns").update({
+            "status": "sent", "sent_count": sent, "failed_count": failed,
+            "skipped_count": skipped, "sent_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", campaign_id).execute()
+    except Exception:
+        logger.exception("Failed to finalize campaign %s", campaign_id)
+    return sent, failed, skipped
+
+
 def format_customer_payment_methods(methods: list[dict]) -> str | None:
     """Format only active, owner-configured payment methods for a customer."""
     active_methods = [method for method in methods if method.get("is_active")]
@@ -1535,6 +1693,68 @@ def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
 
 async def show_payment_methods(message) -> None:
     await message.reply_text("💳 طرق الدفع\nاختَر طريقة لتعديلها، أو أضف طريقة جديدة.", reply_markup=payment_keyboard(get_payment_methods()))
+
+
+async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "campaign_cancel":
+        context.user_data.pop("campaign_draft", None)
+        await query.edit_message_text("تم إلغاء الحملة.")
+        return
+    if data.startswith("campaign_aud_"):
+        audience_key = data[len("campaign_aud_"):]
+        if audience_key not in CAMPAIGN_AUDIENCES:
+            return
+        context.user_data["campaign_draft"] = {"audience_key": audience_key, "step": "message"}
+        await query.edit_message_text(
+            f"الجمهور: {CAMPAIGN_AUDIENCES[audience_key]}\n\n"
+            "اكتب الآن نص الرسالة الموحدة. لن تُرسل بعد؛ سأعرض العدد والمعاينة أولاً."
+        )
+        return
+    if not data.startswith("campaign_send_"):
+        return
+    campaign_id = data[len("campaign_send_"):]
+    await query.edit_message_text("⏳ بدأ الإرسال التدريجي… لا تغلق البوت إلى أن يظهر التقرير.")
+    sent, failed, skipped = await send_campaign(context, campaign_id)
+    await query.message.reply_text(
+        "✅ اكتملت الحملة\n\n"
+        f"تم الإرسال: {sent}\nفشل الإرسال: {failed}\nتم التخطي: {skipped}"
+    )
+
+
+async def handle_campaign_message_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    draft = context.user_data.get("campaign_draft")
+    message = update.message
+    if not draft or draft.get("step") != "message" or not message or not message.text:
+        return False
+    text = message.text.strip()
+    if not text or len(text) > 3_500:
+        await message.reply_text("اكتب رسالة بين 1 و3500 حرف.")
+        return True
+    campaign, recipients = create_campaign_snapshot(draft["audience_key"], text)
+    context.user_data.pop("campaign_draft", None)
+    if campaign is None:
+        await message.reply_text("⚠️ تعذر حفظ الحملة. شغّل ملف Supabase الجديد وتأكد من الاتصال.")
+        return True
+    ready = sum(1 for row in recipients if row.get("business_connection_id"))
+    missing_connection = len(recipients) - ready
+    preview = text if len(text) <= 900 else text[:900] + "…"
+    await message.reply_text(
+        f"📣 معاينة الحملة\n\nالجمهور: {CAMPAIGN_AUDIENCES[draft['audience_key']]}\n"
+        f"عدد العملاء: {len(recipients)}\nجاهزون للإرسال: {ready}\n"
+        f"سيتخطاهم البوت لعدم وجود اتصال Business: {missing_connection}\n\n"
+        f"نص الرسالة:\n{preview}\n\n"
+        "لن يُرسل أي شيء إلا بعد ضغط التأكيد.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأكيد الإرسال", callback_data=f"campaign_send_{campaign['id']}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="campaign_cancel")],
+        ]),
+    )
+    return True
 
 
 def get_chatgpt_shared_vault_summary() -> str:
@@ -7293,10 +7513,11 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
-        BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN,
+        BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
+        context.user_data.pop("campaign_draft", None)
 
     if text == BTN_CATALOG:
         await show_catalog_main(message)
@@ -7325,6 +7546,15 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
             "YYYY-MM-DD HH:MM | الغرض من التذكير\n\n"
             "مثال: 2026-08-22 15:30 | أتصل بالمورّد\n"
             "وتكدر تستخدم أيضاً DD/MM/YYYY HH:MM. الوقت حسب توقيت بغداد."
+        )
+        return True
+
+    if text == BTN_CAMPAIGNS:
+        context.user_data.pop("campaign_draft", None)
+        await message.reply_text(
+            "📣 رسالة موحدة للعملاء\n\nاختَر الجمهور. بعدها تكتب الرسالة، "
+            "ثم تشوف العدد والمعاينة قبل أي إرسال.",
+            reply_markup=build_campaign_audience_keyboard(),
         )
         return True
 
@@ -7963,6 +8193,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     if await handle_shared_account_input(update, context):
         return
     if await handle_catalog_input(update, context):
+        return
+    if await handle_campaign_message_input(update, context):
         return
     if await handle_manual_subscription_input(update, context):
         return
@@ -9244,6 +9476,9 @@ def main() -> None:
 
     # إدارة تفاصيل الدفع المعتمدة — للأونر فقط.
     app.add_handler(CallbackQueryHandler(handle_payment_method_callback, pattern=r"^pm_"))
+
+    # حملات الرسائل الموحدة — لا ترسل شيئاً قبل معاينة وتأكيد الأونر.
+    app.add_handler(CallbackQueryHandler(handle_campaign_callback, pattern=r"^campaign_"))
 
     # إدارة خزينة حسابات ChatGPT المشتركة — للأونر فقط.
     app.add_handler(CallbackQueryHandler(handle_chatgpt_vault_callback, pattern=r"^vault_"))
