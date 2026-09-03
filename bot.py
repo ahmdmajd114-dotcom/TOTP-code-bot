@@ -184,6 +184,12 @@ _pending_customer_text_batches: dict[int, dict] = {}
 _ready_customer_texts: dict[tuple[int, int], str] = {}
 _delayed_greeting_delivery_keys: set[tuple[int, int]] = set()
 _support_context_until: dict[int, datetime] = {}
+# ربط المالك اليدوي يفتح نافذة قصيرة فقط لطلب OTP؛ لا يتحول إلى إذن
+# مفتوح للحسابات المشتركة المنتهية. تُسجَّل عند نجاح /link.
+_manual_link_code_authorizations: dict[int, datetime] = {}
+MANUAL_LINK_CODE_WINDOW_MINUTES = int(
+    os.environ.get("MANUAL_LINK_CODE_WINDOW_MINUTES", "30")
+)
 
 
 async def _call_alibaba_api(payload: dict, timeout: float) -> dict | None:
@@ -5196,6 +5202,25 @@ def generate_totp_code(secret: str) -> str:
     return totp.now()
 
 
+def authorize_recently_linked_customer_code(chat_id: int) -> None:
+    """Permit OTP requests briefly after an owner manually links the account."""
+    _manual_link_code_authorizations[chat_id] = (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=MANUAL_LINK_CODE_WINDOW_MINUTES)
+    )
+
+
+def has_recent_manual_link_code_authorization(chat_id: int) -> bool:
+    """Return whether the owner-approved post-/link OTP window is still open."""
+    expires_at = _manual_link_code_authorizations.get(chat_id)
+    if expires_at is None:
+        return False
+    if expires_at > datetime.now(timezone.utc):
+        return True
+    _manual_link_code_authorizations.pop(chat_id, None)
+    return False
+
+
 # ------------------------------------------------------------------
 # نظام تتبع محاولات الكود الفاشلة (code_retry_tracker بقاعدة Supabase)
 # التسلسل المتفق عليه لما الزبون يقول "ما صار" بشكل متكرر:
@@ -5363,9 +5388,14 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
 
     is_private_account = is_private_totp_account(chat_id)
 
-    # الحسابات المشتركة تحتاج اشتراكاً فعالاً؛ الحساب الخاص يعتمد على
-    # الربط الذي أنشأه /addprivate ولا يتوقف بانتهاء تذكير الاشتراك.
-    if not is_private_account and not has_active_subscription(chat_id):
+    # الحساب المشترك المنتهي لا يستلم كوداً عادةً. الاستثناء الوحيد هو
+    # نافذة قصيرة فتحها المالك بنفسه بعد /link، حتى يقدر الزبون الذي ربطه
+    # للتو يطلب «الرمز» أو «كود المصادقة» من دون انتظار تدخل يدوي.
+    if (
+        not is_private_account
+        and not has_active_subscription(chat_id)
+        and not has_recent_manual_link_code_authorization(chat_id)
+    ):
         return None, False
 
     result = get_secret_for_chat(chat_id)
@@ -5640,6 +5670,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         supabase.table("totp_links").upsert(
             {"chat_id": chat_id, "account_id": account_id}
         ).execute()
+        authorize_recently_linked_customer_code(chat_id)
 
         # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
         # بطلب الكود تلقائياً. الحسابات المشتركة تبقى على مسارها المعتاد.
