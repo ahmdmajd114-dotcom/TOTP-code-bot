@@ -8863,6 +8863,16 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id=OWNER_USER_ID,
                     text=f"⚠️ تعذر إرسال الكود للزبون ({chat_id}).",
                 )
+                return
+            try:
+                # نخفي كلمة الاختصار بعد نجاح إرسال الكود، مثل اختصار «دفع».
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                # إرسال الكود نجح؛ لا نعيده إذا تعذر حذف رسالة الاختصار.
+                logger.warning("Sent code but could not delete owner shortcut for %s", chat_id)
             return
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
         if not handled:
