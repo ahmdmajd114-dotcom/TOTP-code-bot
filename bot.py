@@ -60,7 +60,6 @@ from photo_intent import PhotoIntent, is_confident_code_verification, parse_phot
 from conversation_policy import is_within_context_gap
 from chatgpt_sales_flow import (
     asks_payment_guidance,
-    asks_shared_private_difference,
     can_request_account_code,
     decide_code_retry,
     decide_private_code_retry,
@@ -957,12 +956,13 @@ FAQ_RULES = [
     ),
 ]
 
-# فئات المعرفة التي تمثل منتجات فعلية، وليست تحية أو طريقة دفع. يستخدمها
-# وكيل التفاعل لاكتشاف الانتقال الصريح من موضوع إلى منتج آخر.
-INTERACTIVE_PRODUCT_FAQ_CATEGORIES = {
-    category for category, _, _ in FAQ_RULES
-    if category not in {"سلام", "ترحيب", "شكر", "طرق_الدفع", "دفع_رصيد", "فرق_شات"}
+# هذه قواعد منتجات قديمة بنصوص وأسعار ثابتة. لا يجوز استخدامها لرد العميل:
+# المصدر الوحيد للمنتجات والكلمات البديلة والباقات هو الكاتالوج الحي.
+LEGACY_PRODUCT_FAQ_CATEGORIES = {
+    "chatgpt", "فرق_شات", "amboss", "anki", "freenote", "goodnote", "canva", "تليجرام_مميز",
 }
+# الاسم القديم مستخدم في مسار الاختبار/المعرفة لاستبعاد النصوص الثابتة أيضاً.
+INTERACTIVE_PRODUCT_FAQ_CATEGORIES = LEGACY_PRODUCT_FAQ_CATEGORIES
 
 SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
 PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
@@ -4328,10 +4328,8 @@ def get_recent_interactive_context(customer_chat_id: int, limit: int = 16) -> tu
 
 
 def is_chatgpt_catalog_context(text: str) -> bool:
-    """يتعرف على طلب باقات ChatGPT من الكلمات المباشرة أو من استمرار السياق."""
-    normalized = " ".join(normalize_style_text(text))
-    direct_terms = {"chatgpt", "chat", "gpt", "جات", "تشات", "شات", "جيبيتي"}
-    return any(term in normalized for term in direct_terms)
+    """ChatGPT is recognized only through its live catalog name or aliases."""
+    return is_chatgpt_product(find_catalog_product_context(text))
 
 
 def find_catalog_product_context(text: str) -> dict | None:
@@ -4756,7 +4754,6 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             return "chatgpt_plans"
         if frame.intent in {"purchase", "plan_selection"} and frame.product:
             contextual_catalog_product = find_catalog_product_context(frame.product)
-            contextual_categories = set(keyword_match_categories(frame.product)) & INTERACTIVE_PRODUCT_FAQ_CATEGORIES
             if contextual_catalog_product and not is_chatgpt_product(contextual_catalog_product):
                 set_interactive_sale_state(
                     customer_chat_id,
@@ -4765,10 +4762,6 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
                     None,
                 )
                 return "catalog_product_plans"
-            if contextual_categories:
-                category = sorted(contextual_categories)[0]
-                set_interactive_sale_state(customer_chat_id, "product_context", None, None)
-                return f"faq:{category}"
         # نوع/مدة بدون منتج لا يكفيان لافتراض ChatGPT من الأرشيف.
         if frame.intent in {"purchase", "plan_selection"}:
             return "clarify_product"
@@ -4897,21 +4890,21 @@ async def classify_intent(text: str) -> tuple[list[str], bool]:
     يطابق قواعد FAQ والكلمات البديلة للمنتجات في الكتالوج فقط. إبقاء هذه
     الدالة async يحافظ على واجهة معالج الرسائل الحالية بدون تأخير أو شبكة.
     """
-    keyword_categories = keyword_match_categories(text)
-    # قواعد FAQ القديمة هي الرد الأساسي نفسه، بما فيها أسعار المنتجات
-    # الثابتة. الكتالوج يضيف فقط المنتجات الجديدة التي لا تغطيها هذه القواعد.
-    categories = list(keyword_categories)
+    # لا نرسل إجابات أو أسعار المنتجات القديمة الثابتة. حتى المنتج الموجود
+    # سابقاً في FAQ لا يظهر إلا إذا كان مفعّلاً بالكاتالوج وذُكرت إحدى
+    # كلماته المضافة من المالك هناك.
+    categories = [
+        category for category in keyword_match_categories(text)
+        if category not in LEGACY_PRODUCT_FAQ_CATEGORIES
+    ]
     # نلتقط التحية قصيرة حتى عندما لا ترد حرفياً ضمن قوائم FAQ، ثم نحافظ
     # عليها قبل الطلب في الرد النهائي.
     greeting_category = infer_greeting_category(text)
     if greeting_category and greeting_category not in categories:
         categories.insert(0, greeting_category)
-    if asks_shared_private_difference(text) and "فرق_شات" not in categories:
-        categories.append("فرق_شات")
-    if not any(category in INTERACTIVE_PRODUCT_FAQ_CATEGORIES for category in categories):
-        catalog_products = get_catalog_products()
-        matched_products = match_catalog_products(text, catalog_products)
-        categories.extend(catalog_category(product["id"]) for product in matched_products)
+    catalog_products = get_catalog_products()
+    matched_products = match_catalog_products(text, catalog_products)
+    categories.extend(catalog_category(product["id"]) for product in matched_products)
     return list(dict.fromkeys(categories)), False
 
 
