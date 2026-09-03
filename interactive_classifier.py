@@ -45,6 +45,14 @@ class GroundedAnswer:
     confidence: float = 0.0
 
 
+@dataclass(frozen=True)
+class ProductPurchaseDecision:
+    """Whether a product mention is an actual request to buy or view offers."""
+
+    purchase: bool = False
+    confidence: float = 0.0
+
+
 def normalize_classifier_text(text: str) -> str:
     """Normalize Arabic variants while preserving word order for prompt examples."""
     value = (text or "").lower().strip()
@@ -188,6 +196,22 @@ def parse_grounded_answer(raw: str) -> GroundedAnswer:
     except (TypeError, ValueError):
         confidence = 0.0
     return GroundedAnswer(True, answer, confidence)
+
+
+def parse_product_purchase_decision(raw: str) -> ProductPurchaseDecision:
+    """Parse a narrow product-purchase decision; malformed data is safely false."""
+    match = re.search(r"\{.*\}", raw or "", flags=re.DOTALL)
+    if not match:
+        return ProductPurchaseDecision()
+    try:
+        payload = json.loads(match.group(0))
+    except (TypeError, ValueError):
+        return ProductPurchaseDecision()
+    try:
+        confidence = max(0.0, min(1.0, float(payload.get("confidence") or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return ProductPurchaseDecision(payload.get("purchase") is True, confidence)
 
 
 def guard_interactive_action(

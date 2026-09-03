@@ -10,6 +10,7 @@ from interactive_classifier import (
     is_support_cancellation,
     parse_intent_frame,
     parse_grounded_answer,
+    parse_product_purchase_decision,
     should_enter_support_mode,
     should_switch_from_support,
     support_action_for_turn,
@@ -86,6 +87,19 @@ class StructuredIntentTests(unittest.TestCase):
             ),
             GroundedAnswer(),
         )
+
+    def test_purchase_decision_requires_explicit_true_and_valid_json(self):
+        self.assertTrue(
+            parse_product_purchase_decision(
+                '{"purchase":true,"confidence":0.93}'
+            ).purchase
+        )
+        self.assertFalse(
+            parse_product_purchase_decision(
+                '{"purchase":false,"confidence":0.99}'
+            ).purchase
+        )
+        self.assertFalse(parse_product_purchase_decision("اشترك").purchase)
 
 
 class ConversationInvariantTests(unittest.TestCase):
