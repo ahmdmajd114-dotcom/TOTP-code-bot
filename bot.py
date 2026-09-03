@@ -5946,18 +5946,26 @@ async def add_private_account(
 
 
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
-    """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وaccept."""
+    """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
 
-    # accept — رد على صورة دفع معينة من الزبون (بمحادثتك Business وياه)
-    # عشان تحولها لمحادثتك مع البوت، حتى لو تجاوزت حد 3 صور/6 ساعات
-    if text.strip().lower() == "accept":
+    # AC (وaccept للتوافق) — رد على صورة دفع معينة من الزبون بمحادثتك
+    # Business وياه. يحول الصورة للمراجعة حتى لو تجاوزت حد الصور، ثم
+    # يحذف الاختصار من شات الزبون كي لا يبقى ظاهراً.
+    if text.strip().lower() in {"ac", "accept"}:
         if bm is not None and bm.reply_to_message and bm.reply_to_message.photo:
             await handle_incoming_payment_photo(update, context, bm.reply_to_message, bypass_rate_limit=True)
-            await context.bot.send_message(chat_id=OWNER_USER_ID, text="✅ تم تحويل الصورة.")
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Converted payment photo but could not delete AC shortcut for %s", chat_id)
+            await context.bot.send_message(chat_id=OWNER_USER_ID, text="✅ تم تحويل الصورة وحذف اختصار AC.")
         else:
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
-                text="⚠️ لازم ترد على رسالة الصورة نفسها وتكتب accept.",
+                text="⚠️ لازم ترد على رسالة الصورة نفسها وتكتب AC.",
             )
         return True
 
