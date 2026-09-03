@@ -24,6 +24,7 @@ import base64
 import asyncio
 import logging
 import json
+from types import SimpleNamespace
 import pyotp
 import httpx
 import gspread
@@ -747,6 +748,7 @@ PHOTO_RATE_LIMIT_MAX = 1
 PHOTO_RATE_LIMIT_WINDOW_HOURS = 6
 _photo_timestamps: dict[int, list[datetime]] = {}
 _processed_business_photo_keys: set[tuple[int, int, bool]] = set()
+_latest_customer_business_photos: dict[int, dict] = {}
 
 
 def has_recent_photo_marker(chat_id: int, sender_type: str) -> bool:
@@ -5952,8 +5954,13 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # Business وياه. يحول الصورة للمراجعة حتى لو تجاوزت حد الصور، ثم
     # يحذف الاختصار من شات الزبون كي لا يبقى ظاهراً.
     if text.strip().lower() in {"ac", "accept"}:
-        if bm is not None and bm.reply_to_message and bm.reply_to_message.photo:
-            await handle_incoming_payment_photo(update, context, bm.reply_to_message, bypass_rate_limit=True)
+        selected_photo = (
+            bm.reply_to_message
+            if bm is not None and bm.reply_to_message and bm.reply_to_message.photo
+            else get_latest_customer_business_photo(chat_id)
+        )
+        if selected_photo is not None:
+            await handle_incoming_payment_photo(update, context, selected_photo, bypass_rate_limit=True)
             try:
                 await context.bot.delete_business_messages(
                     business_connection_id=bm.business_connection_id,
@@ -5965,7 +5972,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
-                text="⚠️ لازم ترد على رسالة الصورة نفسها وتكتب AC.",
+                text="⚠️ ما لكيت صورة حديثة من هذا العميل. دز AC داخل محادثة فيها صورة عميل.",
             )
         return True
 
@@ -6332,6 +6339,55 @@ async def handle_incoming_payment_photo(
         "duration_days": None,
     }
     archive_photo_rate_limit_marker(customer_chat_id, "customer")
+
+
+def remember_latest_customer_business_photo(bm) -> None:
+    """Persist the latest customer photo so AC can work without replying to it."""
+    record = {
+        "customer_chat_id": bm.chat.id,
+        "business_connection_id": bm.business_connection_id,
+        "photo_file_id": bm.photo[-1].file_id,
+        "customer_name": bm.chat.full_name or bm.chat.first_name or "غير معروف",
+        "customer_username": bm.chat.username,
+        "message_id": bm.message_id,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _latest_customer_business_photos[bm.chat.id] = record
+    try:
+        supabase.table("latest_customer_business_photos").upsert(
+            record, on_conflict="customer_chat_id"
+        ).execute()
+    except Exception:
+        # نخلي الاختصار يعمل ضمن نفس تشغيل البوت حتى لو لم يُشغّل SQL بعد.
+        logger.exception("Failed to persist latest customer business photo")
+
+
+def get_latest_customer_business_photo(chat_id: int):
+    """Return a minimal Business-message shape usable by the payment photo flow."""
+    record = _latest_customer_business_photos.get(chat_id)
+    if record is None:
+        try:
+            rows = supabase.table("latest_customer_business_photos").select(
+                "customer_chat_id, business_connection_id, photo_file_id, customer_name, customer_username, message_id"
+            ).eq("customer_chat_id", chat_id).limit(1).execute().data or []
+            record = rows[0] if rows else None
+        except Exception:
+            logger.exception("Failed to retrieve latest customer business photo")
+            record = None
+    if not record or not record.get("photo_file_id") or not record.get("business_connection_id"):
+        return None
+    chat = SimpleNamespace(
+        id=int(record["customer_chat_id"]),
+        full_name=record.get("customer_name") or "غير معروف",
+        first_name=record.get("customer_name") or "غير معروف",
+        username=record.get("customer_username"),
+    )
+    return SimpleNamespace(
+        chat=chat,
+        business_connection_id=record["business_connection_id"],
+        photo=[SimpleNamespace(file_id=record["photo_file_id"])],
+        message_id=record.get("message_id"),
+    )
 
 
 async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, photo) -> None:
@@ -9158,6 +9214,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # اختيار الإجراء. إصدار الكود يبقى محمياً بالربط والاشتراك والعداد.
     if bm.photo and not is_from_owner:
         cancel_pending_customer_text_batch(chat_id)
+        remember_latest_customer_business_photo(bm)
         photo_key = (chat_id, bm.message_id, False)
         if photo_key in _processed_business_photo_keys:
             logger.info("Ignoring duplicate business photo update: %s", photo_key)
