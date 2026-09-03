@@ -8716,6 +8716,29 @@ async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(report)
 
 
+async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعرض رقم الگروب ورقم الـTopic الذي كُتب داخله الأمر.
+
+    يُستخدم مرة واحدة عند إنشاء فرع جديد مثل «مساعدك الذكي»، حتى نضع
+    ``message_thread_id`` الصحيح في إعدادات البوت من دون تخمين.
+    """
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    message = update.message
+    if message is None or message.chat.type != "supergroup":
+        return
+    if message.message_thread_id is None:
+        await message.reply_text("هذا الأمر لازم ينكتب داخل فرع Topic، مو في الدردشة العامة.")
+        return
+    await message.reply_text(
+        "✅ بيانات هذا الفرع:\n"
+        f"اسم الگروب: {message.chat.title or '—'}\n"
+        f"معرّف الگروب: {message.chat_id}\n"
+        f"معرّف الـTopic: {message.message_thread_id}\n\n"
+        "انسخ رقم الـTopic فقط وأرسله إلي حتى نربطه بفرع مساعدك الذكي."
+    )
+
+
 def build_getcode_show_keyboard(account_id) -> InlineKeyboardMarkup:
     """زر 'عرض الكود' — يطلع لما الرسالة تعرض اسم الحساب بس."""
     return InlineKeyboardMarkup([[InlineKeyboardButton("👁 عرض الكود", callback_data=f"getcode_show_{account_id}")]])
@@ -9544,6 +9567,7 @@ def main() -> None:
 
     # أمر /getcode — يشتغل بس بفرع "تفاعل" بالقروب، يرسل رسالة منفصلة
     # لكل حساب TOTP مع زر لعرض الكود
+    app.add_handler(CommandHandler("topicid", cmd_topicid))
     app.add_handler(CommandHandler("getcode", cmd_getcode))
     app.add_handler(CommandHandler("getcodes", cmd_getcode))
 
