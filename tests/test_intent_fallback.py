@@ -69,7 +69,7 @@ class LiveContextPolicyTests(unittest.TestCase):
         self.assertEqual(contextual_thanks_reply(True), "تدللون، بالخدمة")
 
     def test_thanks_variants_survive_diacritics_spelling_and_emoji(self):
-        for message in ("شُكْرًا 🌷", "عاشت إيدكم", "عاشت ايديكم 🙏", "ما قصرتوا"):
+        for message in ("شُكْرًا 🌷", "أشكرك", "أشكركم 🌷", "عاشت إيدكم", "عاشت ايديكم 🙏", "ما قصرتوا"):
             with self.subTest(message=message):
                 self.assertTrue(has_thanks_signal(message))
 
