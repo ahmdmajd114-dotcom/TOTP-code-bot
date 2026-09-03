@@ -1527,6 +1527,45 @@ def _dedupe_campaign_recipients(rows: list[dict]) -> list[dict]:
     return list(recipients.values())
 
 
+def get_current_business_connection_id() -> str | None:
+    """Return the latest known connection for this one Business account.
+
+    The connection belongs to the owner's Telegram Business account, not to a
+    specific customer. Old contacts imported before Business was connected may
+    not have it stored individually, so this is a safe backfill fallback.
+    """
+    try:
+        contact_rows = supabase.table("customer_contacts").select(
+            "business_connection_id"
+        ).eq("platform", "telegram").not_.is_("business_connection_id", "null").order(
+            "last_seen_at", desc=True
+        ).limit(1).execute().data or []
+        if contact_rows and contact_rows[0].get("business_connection_id"):
+            return contact_rows[0]["business_connection_id"]
+
+        reminder_rows = supabase.table("subscription_reminders").select(
+            "business_connection_id"
+        ).not_.is_("business_connection_id", "null").order(
+            "created_at", desc=True
+        ).limit(1).execute().data or []
+        if reminder_rows and reminder_rows[0].get("business_connection_id"):
+            return reminder_rows[0]["business_connection_id"]
+    except Exception:
+        logger.exception("Failed to find current Business connection for campaign")
+    return None
+
+
+def apply_campaign_business_connection(recipients: list[dict]) -> list[dict]:
+    """Backfill old recipients with the current Business connection when known."""
+    fallback_connection = get_current_business_connection_id()
+    if not fallback_connection:
+        return recipients
+    for recipient in recipients:
+        if not recipient.get("business_connection_id"):
+            recipient["business_connection_id"] = fallback_connection
+    return recipients
+
+
 def get_campaign_recipients(audience_key: str) -> list[dict]:
     """Return a deduplicated, snapshot-ready recipient list for one audience."""
     now = datetime.now(timezone.utc)
@@ -1543,13 +1582,13 @@ def get_campaign_recipients(audience_key: str) -> list[dict]:
                     query = query.eq("subscription_type", "shared")
             else:
                 query = query.gte("started_at", (now - timedelta(days=30)).isoformat())
-            return _dedupe_campaign_recipients(query.execute().data or [])
+            return apply_campaign_business_connection(_dedupe_campaign_recipients(query.execute().data or []))
 
         if audience_key == "all_contacts":
             rows = supabase.table("customer_contacts").select(
                 "chat_id, business_connection_id, display_name"
             ).eq("platform", "telegram").not_.is_("chat_id", "null").execute().data or []
-            return _dedupe_campaign_recipients(rows)
+            return apply_campaign_business_connection(_dedupe_campaign_recipients(rows))
 
         if audience_key == "support_recent":
             sessions = supabase.table("conversation_sessions").select(
@@ -1561,10 +1600,10 @@ def get_campaign_recipients(audience_key: str) -> list[dict]:
                 "chat_id, business_connection_id, display_name"
             ).eq("platform", "telegram").not_.is_("chat_id", "null").execute().data or []
             by_chat = {int(row["chat_id"]): row for row in contact_rows if row.get("chat_id") is not None}
-            return _dedupe_campaign_recipients([
+            return apply_campaign_business_connection(_dedupe_campaign_recipients([
                 {**session, **(by_chat.get(int(session["customer_chat_id"])) or {})}
                 for session in sessions if session.get("customer_chat_id") is not None
-            ])
+            ]))
     except Exception:
         logger.exception("Failed to build campaign audience %s", audience_key)
     return []
