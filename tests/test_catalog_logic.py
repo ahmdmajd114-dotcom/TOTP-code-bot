@@ -3,6 +3,7 @@ import unittest
 from catalog_logic import (
     catalog_category,
     catalog_product_id,
+    find_owner_catalog_shortcut,
     format_customer_catalog_reply,
     match_catalog_products,
 )
@@ -10,6 +11,7 @@ from catalog_logic import (
 
 PRODUCTS = [
     {"id": "p1", "name": "Canva", "aliases": ["كانفا", "كنفا"], "is_active": True},
+    {"id": "chat", "name": "ChatGPT", "aliases": ["جات", "شات"], "is_active": True},
     {"id": "p2", "name": "قديم", "aliases": ["قديم"], "is_active": False},
 ]
 
@@ -25,6 +27,13 @@ class CatalogMatchingTests(unittest.TestCase):
 
     def test_catalog_category_round_trip(self):
         self.assertEqual(catalog_product_id(catalog_category("abc")), "abc")
+
+    def test_owner_can_use_one_letter_shortcut_for_chatgpt_only(self):
+        self.assertEqual(find_owner_catalog_shortcut("ج", PRODUCTS)["id"], "chat")
+
+    def test_owner_product_shortcut_requires_exact_name_or_alias(self):
+        self.assertEqual(find_owner_catalog_shortcut("كانفا", PRODUCTS)["id"], "p1")
+        self.assertIsNone(find_owner_catalog_shortcut("اريد كانفا", PRODUCTS))
 
 
 class CatalogReplyTests(unittest.TestCase):

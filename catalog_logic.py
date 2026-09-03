@@ -9,6 +9,10 @@ from intent_fallback import normalize_arabic_text
 
 
 CATALOG_CATEGORY_PREFIX = "catalog:"
+CHATGPT_OWNER_SHORTCUT = "ج"
+CHATGPT_PRODUCT_TERMS = {
+    "chatgpt", "chat", "gpt", "جات", "شات", "چات", "تشات", "جيبيتي", "شات جي بي تي",
+}
 
 
 def catalog_category(product_id: object) -> str:
@@ -44,6 +48,38 @@ def match_catalog_products(text: str, products: Iterable[Mapping[str, object]]) 
             matches.append((min(positions), product))
     matches.sort(key=lambda item: item[0])
     return [product for _, product in matches]
+
+
+def find_owner_catalog_shortcut(
+    text: str, products: Iterable[Mapping[str, object]]
+) -> Mapping[str, object] | None:
+    """Resolve an exact owner shortcut to one active catalog product.
+
+    The one-letter Arabic shortcut "ج" is reserved for the ChatGPT product.
+    Every other product must be written as its complete configured name or alias,
+    so normal owner messages never accidentally send an offer to a customer.
+    """
+    normalized = normalize_arabic_text(text)
+    active_products = [product for product in products if product.get("is_active")]
+
+    if normalized == CHATGPT_OWNER_SHORTCUT:
+        chatgpt_products = []
+        for product in active_products:
+            terms = [str(product.get("name") or "")]
+            terms.extend(str(alias) for alias in (product.get("aliases") or []))
+            normalized_terms = {normalize_arabic_text(term) for term in terms}
+            compact_terms = {term.replace(" ", "") for term in normalized_terms}
+            if normalized_terms & CHATGPT_PRODUCT_TERMS or compact_terms & {"chatgpt", "شاتجيبيتي"}:
+                chatgpt_products.append(product)
+        return chatgpt_products[0] if len(chatgpt_products) == 1 else None
+
+    matches = []
+    for product in active_products:
+        terms = [str(product.get("name") or "")]
+        terms.extend(str(alias) for alias in (product.get("aliases") or []))
+        if normalized in {normalize_arabic_text(term) for term in terms}:
+            matches.append(product)
+    return matches[0] if len(matches) == 1 else None
 
 
 def format_customer_catalog_reply(

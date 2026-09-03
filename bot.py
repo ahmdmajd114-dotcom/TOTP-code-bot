@@ -43,6 +43,7 @@ from telegram.ext import (
 from ai_provider import chat_completions_url, prepare_alibaba_payload
 from catalog_logic import (
     catalog_category,
+    find_owner_catalog_shortcut,
     catalog_product_id,
     format_customer_catalog_reply,
     match_catalog_products,
@@ -8873,6 +8874,40 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 # إرسال الكود نجح؛ لا نعيده إذا تعذر حذف رسالة الاختصار.
                 logger.warning("Sent code but could not delete owner shortcut for %s", chat_id)
+            return
+        # اختصارات المنتجات: «ج» يختار ChatGPT، وأي منتج آخر يحتاج اسمه
+        # أو أحد أسمائه البديلة كاملاً كما هو مسجل في مركز التحكم.
+        product = find_owner_catalog_shortcut(text, get_catalog_products())
+        if product:
+            product_reply = format_customer_catalog_reply(
+                product, get_catalog_plans(str(product["id"]))
+            )
+            if not product_reply:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ المنتج «{product['name']}» ما عنده باقات مفعّلة لإرسالها للزبون.",
+                )
+                return
+            try:
+                await context.bot.send_message(
+                    business_connection_id=bm.business_connection_id,
+                    chat_id=chat_id,
+                    text=product_reply,
+                )
+            except Exception:
+                logger.exception("Failed to send owner-requested catalog product to %s", chat_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ تعذر إرسال باقات «{product['name']}» للزبون ({chat_id}).",
+                )
+                return
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Sent catalog product but could not delete owner shortcut for %s", chat_id)
             return
         handled = await handle_owner_command(update, context, chat_id, text, bm=bm)
         if not handled:
