@@ -5663,6 +5663,15 @@ def has_fulfilled_service_context(chat_id: int) -> bool:
     if has_active_subscription(chat_id) or is_private_totp_account(chat_id):
         return True
     try:
+        # الزبائن القدامى قد يكون لديهم حساب مشترك مربوط بـ /link من قبل
+        # إضافة نظام الاشتراكات/الخزينة؛ الربط نفسه دليل أن الخدمة سُلّمت.
+        legacy_links = (
+            supabase.table("totp_links").select("account_id")
+            .eq("chat_id", chat_id).limit(1).execute().data or []
+        )
+        if legacy_links:
+            return True
+
         assignments = (
             supabase.table("chatgpt_account_assignments")
             .select("id")
