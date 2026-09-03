@@ -81,7 +81,26 @@ def prioritize_action_categories(categories: Iterable[str]) -> list[str]:
 
 def contextual_thanks_reply(service_fulfilled: bool) -> str:
     """A polite exit differs from thanks after actual fulfillment."""
-    return "تدللون، بالخدمة" if service_fulfilled else "اهلاً وسهلاً"
+    return "تدللون، بالخدمة" if service_fulfilled else "أهلاً وسهلاً"
+
+
+THANKS_PHRASES = (
+    "شكرا", "مشكور", "ممنون", "ممتن", "تسلم", "يسلمو",
+    "يعطيك العافيه", "عاشت ايدك", "عاشت ايدج", "عاشت ايدكم",
+    "عاشت ايديكم", "ما قصرت", "ما قصرتوا", "جزاك الله خير",
+    "بارك الله بيك", "thank you", "thanks", "thx",
+)
+
+
+def has_thanks_signal(text: str) -> bool:
+    """Recognize gratitude despite tashkeel, tatweel, repetition, or emoji."""
+    normalized = normalize_arabic_text(text)
+    return any(
+        re.search(
+            rf"(?<!\w){re.escape(normalize_arabic_text(phrase))}(?!\w)", normalized
+        )
+        for phrase in THANKS_PHRASES
+    )
 
 
 def feedback_reply_is_positive(text: str) -> bool:

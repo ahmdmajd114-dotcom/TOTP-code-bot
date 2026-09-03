@@ -3,6 +3,7 @@ import unittest
 from intent_fallback import (
     contextual_thanks_reply,
     feedback_reply_is_positive,
+    has_thanks_signal,
     infer_greeting_category,
     is_owner_payment_shortcut,
     normalize_arabic_text,
@@ -64,8 +65,13 @@ class LiveContextPolicyTests(unittest.TestCase):
         )
 
     def test_thanks_reply_depends_on_fulfilled_service(self):
-        self.assertEqual(contextual_thanks_reply(False), "اهلاً وسهلاً")
+        self.assertEqual(contextual_thanks_reply(False), "أهلاً وسهلاً")
         self.assertEqual(contextual_thanks_reply(True), "تدللون، بالخدمة")
+
+    def test_thanks_variants_survive_diacritics_spelling_and_emoji(self):
+        for message in ("شُكْرًا 🌷", "عاشت إيدكم", "عاشت ايديكم 🙏", "ما قصرتوا"):
+            with self.subTest(message=message):
+                self.assertTrue(has_thanks_signal(message))
 
 
 class FeedbackSatisfactionTests(unittest.TestCase):

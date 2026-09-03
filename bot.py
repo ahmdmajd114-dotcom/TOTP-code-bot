@@ -51,6 +51,7 @@ from catalog_logic import (
 from intent_fallback import (
     contextual_thanks_reply,
     feedback_reply_is_positive,
+    has_thanks_signal,
     infer_greeting_category,
     is_owner_payment_shortcut,
     normalize_arabic_text,
@@ -850,7 +851,7 @@ FAQ_RULES = [
             "سلام", "السلام عليكم", "سلام عليكم", "سلامو عليكم", "سلامة عليكم",
             "السلام عليكم ورحمة الله", "assalamu alaikum", "salam alaikum",
         ],
-        "وعليكم السلام ورحمة الله وبركاته اهلا وسهلا",
+        "وعليكم السلام ورحمة الله وبركاته، أهلاً وسهلاً",
     ),
     (
         "ترحيب",
@@ -859,7 +860,7 @@ FAQ_RULES = [
             "هلاو", "هلوو", "هلابيك", "هلا بيك", "صباح الخير", "مساء الخير", "شلونك",
             "شلونكم", "اهلين", "مرحب",
         ],
-        "اهلا وسهلا",
+        "أهلاً وسهلاً",
     ),
     (
         "شكر",
@@ -4974,6 +4975,10 @@ async def classify_intent(customer_chat_id: int, text: str) -> tuple[list[str], 
     greeting_category = infer_greeting_category(text)
     if greeting_category and greeting_category not in categories:
         categories.insert(0, greeting_category)
+    # الشكر قد يرد بصيغة فيها تنوين أو مدّ أو إيموجي أو «عاشت إيدكم»؛
+    # نثبته بشكل مستقل عن قائمة الكلمات القديمة.
+    if has_thanks_signal(text) and "شكر" not in categories:
+        categories.append("شكر")
     catalog_products = get_catalog_products()
     matched_products = match_catalog_products(text, catalog_products)
     if matched_products and await catalog_mention_is_purchase(
@@ -5404,8 +5409,8 @@ def has_fulfilled_service_context(chat_id: int) -> bool:
         if assignments:
             return True
 
-        # يغطي الخدمات الدائمية التي لا تملك تاريخ انتهاء، بالاعتماد على
-        # رسالة تسليم/تفعيل واضحة لا على مجرد عرض سعر أو استلام استفسار.
+        # يغطي الخدمات الدائمية التي لا تملك تاريخ انتهاء، والدفع المؤكد
+        # الذي يسبق التسليم. لا نعتبر مجرد عرض سعر أو استلام استفسار خدمة.
         rows = (
             supabase.table("conversation_archive")
             .select("sender_type, message_text")
@@ -5416,7 +5421,8 @@ def has_fulfilled_service_context(chat_id: int) -> bool:
         )
         fulfillment_markers = (
             "تم التفعيل", "تم تفعيل", "تم تجهيز طلبك", "جهزت طلبك",
-            "تم تسليم", "بيانات الحساب", "الكود:",
+            "تم تسليم", "بيانات الحساب", "الكود:", "تم تأكيد التحويل",
+            "تم حفظ الدفعة", "تم تسجيل الدفع", "تم استلام التحويل",
         )
         return any(
             row.get("sender_type") in {"owner", "bot"}
