@@ -4,6 +4,7 @@ from intent_fallback import (
     contextual_thanks_reply,
     feedback_reply_is_positive,
     infer_greeting_category,
+    is_owner_payment_shortcut,
     normalize_arabic_text,
     parse_faq_intent,
     prioritize_action_categories,
@@ -84,6 +85,15 @@ class FeedbackSatisfactionTests(unittest.TestCase):
 
     def test_empty_or_vague_reply_is_not_eligible_for_rating_link(self):
         self.assertFalse(feedback_reply_is_positive("المشكلة موجودة"))
+
+
+class OwnerPaymentShortcutTests(unittest.TestCase):
+    def test_exact_payment_shortcuts_are_recognized(self):
+        self.assertTrue(is_owner_payment_shortcut("دفع"))
+        self.assertTrue(is_owner_payment_shortcut("طُرُق الدفع"))
+
+    def test_regular_message_is_not_mistaken_for_a_shortcut(self):
+        self.assertFalse(is_owner_payment_shortcut("تقدر تدفع على زين كاش"))
 
 
 if __name__ == "__main__":

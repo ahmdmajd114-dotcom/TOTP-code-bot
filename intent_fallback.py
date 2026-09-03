@@ -121,3 +121,8 @@ def feedback_reply_is_positive(text: str) -> bool:
     # "كلش" alone: they occur in both praise and complaints.
     positive_words = ("ممتاز", "ممتعه", "مفيده", "راضي", "راضية", "تمام")
     return any(normalize_arabic_text(word) in normalized for word in positive_words)
+
+
+def is_owner_payment_shortcut(text: str) -> bool:
+    """Recognize the owner's exact in-chat shortcut for sending payment details."""
+    return normalize_arabic_text(text) in {"دفع", "طرق الدفع"}

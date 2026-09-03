@@ -51,6 +51,7 @@ from intent_fallback import (
     contextual_thanks_reply,
     feedback_reply_is_positive,
     infer_greeting_category,
+    is_owner_payment_shortcut,
     normalize_arabic_text,
     prioritize_action_categories,
 )
@@ -1477,6 +1478,18 @@ def get_payment_methods() -> list[dict]:
     except Exception:
         logger.exception("Failed to fetch payment methods")
         return []
+
+
+def format_customer_payment_methods(methods: list[dict]) -> str | None:
+    """Format only active, owner-configured payment methods for a customer."""
+    active_methods = [method for method in methods if method.get("is_active")]
+    if not active_methods:
+        return None
+    details = "\n\n".join(
+        f"{method['name']}\n{method['instructions']}"
+        for method in active_methods
+    )
+    return f"طرق الدفع\n\n{details}"
 
 
 def upsert_customer_contact(
@@ -8792,6 +8805,40 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         cancel_pending_customer_text_batch(chat_id)
+        # اختصار المالك: «دفع» أو «طرق الدفع» وحدها تستبدل برسالة فيها
+        # الطرق المفعلة حالياً من لوحة التحكم، فلا يحتاج ينسخها كل مرة.
+        if is_owner_payment_shortcut(text):
+            payment_text = format_customer_payment_methods(get_payment_methods())
+            if not payment_text:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text="⚠️ ماكو طرق دفع مفعّلة حالياً. فعّل أو أضف طريقة من زر «💳 طرق الدفع» بالبـوت.",
+                )
+                return
+            try:
+                await context.bot.send_message(
+                    business_connection_id=bm.business_connection_id,
+                    chat_id=chat_id,
+                    text=payment_text,
+                )
+            except Exception:
+                logger.exception("Failed to send owner-requested payment methods to %s", chat_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ تعذر إرسال طرق الدفع للزبون ({chat_id}).",
+                )
+                return
+            try:
+                # نخفي كلمة الاختصار من الزبون بعد نجاح إرسال التفاصيل.
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                # الإرسال نجح؛ فشل الحذف لا يجب أن يعيد إرسال الطرق أو
+                # يوهم المالك أن العملية كلها فشلت.
+                logger.warning("Sent payment methods but could not delete owner shortcut for %s", chat_id)
+            return
         # اختصار المالك: كلمة «كود» وحدها داخل محادثة زبون مربوط ترسل
         # الكود فوراً لذلك الزبون. أي صياغة أطول لا تدخل بهذا المسار.
         if text.strip() == "كود":
