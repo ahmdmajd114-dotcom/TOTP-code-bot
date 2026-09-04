@@ -6339,6 +6339,9 @@ async def handle_incoming_payment_photo(
         "pending_amount": 0,
         "awaiting_manual_amount": False,
         "awaiting_manual_product": False,
+        # الاسم المكتوب حرّاً ليس منتج كاتالوج، لذلك لا نطلب له مدة ولا
+        # ننشئ تنبيه انتهاء تلقائياً.
+        "manual_product": False,
         "subscription_type": None,
         "duration_months": None,
         "plan_id": None,
@@ -6516,7 +6519,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     # -------------------- اختيار منتج مباشر (سريع أو من القائمة) --------------------
     if data.startswith("pay_product_") and data not in ("pay_product_list", "pay_product_manual"):
         product = data[len("pay_product_"):]
-        state["product"] = product
+        state.update({"product": product, "manual_product": False})
         if product == "امبوس":
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
@@ -6657,14 +6660,17 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("لازم تختار منتج وطريقة دفع وحدة على الأقل قبل التثبيت.", show_alert=True)
             return
 
-        if state["product"] == CHATGPT_PRODUCT_NAME and not state.get("subscription_type"):
+        if (not state.get("manual_product")
+                and state["product"] == CHATGPT_PRODUCT_NAME
+                and not state.get("subscription_type")):
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر نوع ومدة الاشتراك حتى ينحفظ تنبيه نهايته:",
                 reply_markup=build_subscription_type_keyboard(),
             )
             return
 
-        if (state["product"] != CHATGPT_PRODUCT_NAME
+        if (not state.get("manual_product")
+                and state["product"] != CHATGPT_PRODUCT_NAME
                 and not state.get("duration_days")
                 and not state.get("reminder_disabled")):
             generic_plans = prepare_generic_subscription(state)
@@ -6679,7 +6685,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
         saved = append_payment_row(state)
         subscription_saved = False
-        if saved and (state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days") or state.get("reminder_disabled")):
+        if saved and not state.get("manual_product") and (
+            state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days") or state.get("reminder_disabled")
+        ):
             subscription_saved = save_subscription_reminder(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
@@ -6715,7 +6723,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         del _pending_payments[message_id]
 
         if saved:
-            if state.get("reminder_disabled"):
+            if state.get("manual_product"):
+                reminder_note = "\nℹ️ المنتج مكتوب يدوياً؛ لم يُنشأ له تنبيه انتهاء."
+            elif state.get("reminder_disabled"):
                 reminder_note = "\nℹ️ هذا المنتج دائم، ما يحتاج تنبيه انتهاء."
             else:
                 reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
@@ -6943,33 +6953,18 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
         await message.reply_text("الرجاء كتابة اسم منتج غير فارغ.")
         return True
 
-    state["product"] = product
-    state["awaiting_manual_product"] = False
-
-    if product == "امبوس":
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=OWNER_USER_ID,
-                message_id=replied_id,
-                caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
-                reply_markup=build_ambos_duration_keyboard(),
-            )
-        except Exception:
-            logger.exception("Failed to show Ambos duration options")
-        return True
-
-    generic_plans = prepare_generic_subscription(state)
-    if generic_plans:
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=OWNER_USER_ID,
-                message_id=replied_id,
-                caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
-                reply_markup=build_subscription_plan_keyboard(generic_plans),
-            )
-        except Exception:
-            logger.exception("Failed to show generic subscription plans")
-        return True
+    # اختيار «كتابة حرة» مقصود به بيع خارج الكاتالوج، حتى لو صادف أن الاسم
+    # مطابق لمنتج داخله. لا نربطه بباقة أو مدة ولا بتذكير انتهاء.
+    state.update({
+        "product": product,
+        "awaiting_manual_product": False,
+        "manual_product": True,
+        "plan_id": None,
+        "plan_name": None,
+        "plan_duration": None,
+        "duration_days": None,
+        "reminder_disabled": False,
+    })
 
     customer_chat_id = state.get("customer_chat_id")
     has_debt = (
