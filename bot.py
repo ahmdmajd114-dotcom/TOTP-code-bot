@@ -983,7 +983,9 @@ RESETCODE_PATTERN = re.compile(r"^/resetcode$", re.IGNORECASE)
 
 # كلمات مفتاحية لطلب الكود
 CODE_REQUEST_KEYWORDS = [
-    "كود", "رمز", "code", "otp", "الكود", "الرمز",
+    # لا نعامل الكلمات العامة مثل «رمز» أو أي متابعة سابقة كطلب كود.
+    # الكود يُرسل فقط بطلب صريح في الرسالة الحالية.
+    "كود", "الكود", "كود التحقق", "رمز التحقق", "رمز الدخول", "code", "otp",
 ]
 
 CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تلقائياً بعد هالمدة
@@ -5294,35 +5296,6 @@ async def infer_contextual_payment_request(chat_id: int, text: str) -> bool:
     return asks_payment_guidance(text)
 
 
-async def infer_contextual_code_request(chat_id: int, text: str) -> str | None:
-    """مطابقة ثابتة لمتابعة الكود؛ لا تعتمد على AI أو أرشيف المحادثة."""
-    state = _get_retry_state(chat_id)
-    if is_private_totp_account(chat_id):
-        return None
-    if state["attempt_count"] not in {1, 2, 3, 4, 5, 6, 7} and not state["awaiting_restart_confirmation"]:
-        return None
-    normalized = _normalize_greeting_text(text)
-    if state["awaiting_restart_confirmation"]:
-        last_attempt_at = state.get("last_attempt_at")
-        if last_attempt_at:
-            try:
-                elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_attempt_at)
-                if elapsed <= timedelta(minutes=1):
-                    return "restart_wait"
-            except (TypeError, ValueError):
-                pass
-        # بعد مرور دقيقة، أول رسالة من الزبون تعني أن التسجيل الجديد جاهز
-        # ونرسل الكود مباشرة، حتى لو كتب «تمام» أو «أوكي».
-        return "restart_done"
-    if any(term in normalized for term in ("شكرا", "شكراً", "تمام", "اوكي", "اوك")):
-        return None
-    if state["awaiting_restart_confirmation"] and any(term in normalized for term in ("سويت رست", "سويت ريست", "حذفت", "من البدايه", "من البداية")):
-        return "restart_done"
-    if any(term in normalized for term in ("ما اشتغل", "مايشتغل", "ما يشتغل", "ماصار", "ما صار", "مافتح", "ما فتح", "نزلي", "دزلي", "ثاني", "مره ثانيه", "مرة ثانية")):
-        return "retry"
-    return None
-
-
 def get_reply_for_category(category: str) -> str | None:
     """يرجع نص الرد الجاهز المطابق لفئة FAQ، أو None اذا مو فئة FAQ (كود/شكوى)."""
     for cat_name, _, reply in FAQ_RULES:
@@ -9465,19 +9438,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         categories.append("طرق الدفع")
         logger.info("Inferred contextual payment request for chat_id=%s", chat_id)
-    contextual_code_action = (
-        await infer_contextual_code_request(chat_id, text)
-        if not is_chatgpt_complaint
-        else None
-    )
-    restart_confirmed = contextual_code_action == "restart_done"
-    restart_wait = contextual_code_action == "restart_wait"
-    if contextual_code_action in {"retry", "restart_done"} and "طلب_كود" not in categories:
-        categories.append("طلب_كود")
-        logger.info("Inferred contextual code action=%s for chat_id=%s", contextual_code_action, chat_id)
-    if restart_wait:
-        # لا نجاوب على «تمام/أوكي/كود» خلال الدقيقة الأولى بعد طلب الريست.
-        categories = []
+    # لا نرسل كوداً من محاولة قديمة أو من أي استنتاج سياقي. فئة «طلب_كود»
+    # لا تُضاف إلا من كلمات CODE_REQUEST_KEYWORDS الموجودة في هذه الرسالة.
+    restart_confirmed = False
     # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
     # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
     # وبين «السلام عليكم، أريد منتجاً غير موجود».
