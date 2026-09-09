@@ -2359,25 +2359,28 @@ def build_expense_photo_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_product_keyboard() -> InlineKeyboardMarkup:
-    """أول شاشة بعد التأكيد — اختيار سريع لأكثر منتج مبيع + بقية المنتجات + إدخال حر."""
-    quick_pick = PAYMENT_PRODUCTS[0]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(quick_pick, callback_data=f"pay_product_{quick_pick}")],
-        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")],
-        [InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")],
-    ])
+def get_active_catalog_payment_products() -> list[dict]:
+    """مصدر منتجات شاشة إثبات الدفع هو كاتالوج لوحة التحكم فقط."""
+    return [product for product in get_catalog_products() if product.get("is_active")]
+
+
+def build_product_keyboard(*, show_back: bool = False) -> InlineKeyboardMarkup:
+    """اختيار المنتج بعد إثبات الدفع: المنتجات المفعّلة من الكاتالوج فقط."""
+    products = get_active_catalog_payment_products()
+    rows = [[InlineKeyboardButton(
+        product["name"], callback_data=f"pay_catalog_{product['id']}"
+    )] for product in products]
+    if not products:
+        rows.append([InlineKeyboardButton("⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="pay_noop")])
+    rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")])
+    if show_back:
+        rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_product")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_product_list_keyboard() -> InlineKeyboardMarkup:
-    """قائمة كل المنتجات ما عدا الاختيار السريع + إدخال حر + زر رجوع."""
-    rows = [
-        [InlineKeyboardButton(p, callback_data=f"pay_product_{p}")]
-        for p in PAYMENT_PRODUCTS[1:]
-    ]
-    rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")])
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_product")])
-    return InlineKeyboardMarkup(rows)
+    """توافق مع زر قديم؛ يعرض نفس منتجات الكاتالوج الحالية."""
+    return build_product_keyboard(show_back=True)
 
 
 def build_ambos_duration_keyboard() -> InlineKeyboardMarkup:
@@ -2416,6 +2419,23 @@ def catalog_product_for_payment_name(name: str) -> dict | None:
 def prepare_generic_subscription(state: dict) -> list[dict]:
     """يملأ الباقة تلقائياً إن كانت وحيدة، ويرجع الباقات التي تحتاج اختياراً."""
     product_name = state.get("product") or ""
+    # المنتج المختار من كاتالوج الدفع يلتزم بباقاته ومدده الحية، لا بمدد
+    # ثابتة قديمة تحمل الاسم نفسه.
+    selected_catalog_id = state.get("catalog_product_id")
+    if selected_catalog_id:
+        product = get_catalog_product(str(selected_catalog_id))
+        if not product or not product.get("is_active"):
+            return []
+        plans = [plan for plan in get_catalog_plans(str(selected_catalog_id)) if plan.get("is_active") and duration_to_days(plan.get("duration"))]
+        if len(plans) == 1:
+            plan = plans[0]
+            state.update({
+                "plan_id": plan["id"], "plan_name": plan["name"],
+                "plan_duration": plan.get("duration"),
+                "duration_days": duration_to_days(plan.get("duration")),
+            })
+            return []
+        return plans
     if product_name in FIXED_PRODUCT_DURATIONS:
         state["duration_days"] = FIXED_PRODUCT_DURATIONS[product_name]
         state["reminder_disabled"] = state["duration_days"] is None
@@ -2468,9 +2488,8 @@ def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repay
     """
     rows = []
     if not has_product:
-        rows.append([InlineKeyboardButton(PAYMENT_PRODUCTS[0], callback_data=f"pay_product_{PAYMENT_PRODUCTS[0]}")])
-        rows.append([InlineKeyboardButton("بقية المنتجات ▾", callback_data="pay_product_list")])
-        rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="pay_product_manual")])
+        # هذا يظهر فقط لو رجعنا لملخص بلا منتج؛ يبقى مطابقاً للكاتالوج.
+        return build_product_keyboard()
     else:
         rows.append([InlineKeyboardButton(PAYMENT_METHODS[0], callback_data=f"pay_method_{PAYMENT_METHODS[0]}")])
         rows.append([InlineKeyboardButton("بقية الطرق ▾", callback_data="pay_method_list")])
@@ -6342,6 +6361,7 @@ async def handle_incoming_payment_photo(
         # الاسم المكتوب حرّاً ليس منتج كاتالوج، لذلك لا نطلب له مدة ولا
         # ننشئ تنبيه انتهاء تلقائياً.
         "manual_product": False,
+        "catalog_product_id": None,
         "subscription_type": None,
         "duration_months": None,
         "plan_id": None,
@@ -6516,10 +6536,46 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    # منتج كاتالوج: لا نقبل إلا منتجاً ما زال مفعّلاً في «المنتجات والباقات».
+    if data.startswith("pay_catalog_"):
+        product_id = data[len("pay_catalog_"):]
+        product = get_catalog_product(product_id)
+        if not product or not product.get("is_active"):
+            await query.answer("هذا المنتج غير متاح حالياً في الكاتالوج.", show_alert=True)
+            return
+        state.update({
+            "product": product["name"],
+            "catalog_product_id": product_id,
+            "manual_product": False,
+            "plan_id": None,
+            "plan_name": None,
+            "plan_duration": None,
+            "duration_days": None,
+            "reminder_disabled": False,
+        })
+        generic_plans = prepare_generic_subscription(state)
+        if generic_plans:
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
+                reply_markup=build_subscription_plan_keyboard(generic_plans),
+            )
+            return
+        customer_chat_id = state.get("customer_chat_id")
+        has_debt = customer_chat_id is not None and find_unpaid_debt(customer_chat_id, product["name"]) is not None
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(
+                has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
+            ),
+        )
+        return
+
     # -------------------- اختيار منتج مباشر (سريع أو من القائمة) --------------------
     if data.startswith("pay_product_") and data not in ("pay_product_list", "pay_product_manual"):
         product = data[len("pay_product_"):]
-        state.update({"product": product, "manual_product": False})
+        # هذا مسار توافق لرسائل الأزرار القديمة فقط؛ لا تظهر منه منتجات
+        # جديدة بعد الآن لأن شاشة الدفع صارت تعتمد كاتالوج التحكم.
+        state.update({"product": product, "catalog_product_id": None, "manual_product": False})
         if product == "امبوس":
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
@@ -6959,6 +7015,7 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
         "product": product,
         "awaiting_manual_product": False,
         "manual_product": True,
+        "catalog_product_id": None,
         "plan_id": None,
         "plan_name": None,
         "plan_duration": None,
