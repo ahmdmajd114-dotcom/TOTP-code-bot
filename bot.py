@@ -1562,6 +1562,35 @@ def get_current_business_connection_id() -> str | None:
     return None
 
 
+def get_customer_business_connection_id(customer_chat_id: int) -> str | None:
+    """يرجع اتصال Business صالحاً للزبون، أو أحدث اتصال للحساب كبديل.
+
+    روابط /link القديمة قد لا تملك subscription_reminder، لذلك لا يجوز أن
+    نعتمد عليه وحده عند إرسال تنبيه إعادة تسجيل الدخول.
+    """
+    try:
+        contact_rows = (
+            supabase.table("customer_contacts").select("business_connection_id")
+            .eq("platform", "telegram").eq("chat_id", customer_chat_id)
+            .not_.is_("business_connection_id", "null").order("last_seen_at", desc=True)
+            .limit(1).execute().data or []
+        )
+        if contact_rows and contact_rows[0].get("business_connection_id"):
+            return contact_rows[0]["business_connection_id"]
+
+        reminder_rows = (
+            supabase.table("subscription_reminders").select("business_connection_id")
+            .eq("customer_chat_id", customer_chat_id)
+            .not_.is_("business_connection_id", "null").order("created_at", desc=True)
+            .limit(1).execute().data or []
+        )
+        if reminder_rows and reminder_rows[0].get("business_connection_id"):
+            return reminder_rows[0]["business_connection_id"]
+    except Exception:
+        logger.exception("Failed to find Business connection for customer %s", customer_chat_id)
+    return get_current_business_connection_id()
+
+
 def apply_campaign_business_connection(recipients: list[dict]) -> list[dict]:
     """Backfill old recipients with the current Business connection when known."""
     fallback_connection = get_current_business_connection_id()
@@ -1946,6 +1975,24 @@ def parse_payment_vault_amounts(payments_text: str) -> dict[str, int]:
     return amounts
 
 
+async def send_business_message_with_current_fallback(
+    context: ContextTypes.DEFAULT_TYPE, customer_chat_id: int, text: str, connection_id: str,
+) -> None:
+    """يرسل عبر اتصال الزبون، ثم يعيد المحاولة بأحدث اتصال إن كان قديماً."""
+    try:
+        await context.bot.send_message(
+            business_connection_id=connection_id, chat_id=customer_chat_id, text=text,
+        )
+    except Exception:
+        current_connection_id = get_current_business_connection_id()
+        if not current_connection_id or current_connection_id == connection_id:
+            raise
+        logger.warning("Retrying Business message to %s with current connection", customer_chat_id)
+        await context.bot.send_message(
+            business_connection_id=current_connection_id, chat_id=customer_chat_id, text=text,
+        )
+
+
 async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAULT_TYPE, account_id: str) -> tuple[int, int]:
     """ينبه المشتركين الفعّالين المرتبطين بحساب واحد بعد تسجيل الخروج الجماعي."""
     try:
@@ -1962,30 +2009,20 @@ async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAUL
 
     if not accounts:
         return 0, 0
-    account_name = accounts[0].get("email") or "حساب ChatGPT المشترك"
     customer_ids = sorted({row.get("customer_chat_id") for row in assignments if row.get("customer_chat_id") is not None})
     sent = failed = 0
-    now = datetime.now(timezone.utc).isoformat()
     for customer_id in customer_ids:
         try:
-            reminders = (
-                supabase.table("subscription_reminders")
-                .select("customer_chat_id, business_connection_id")
-                .eq("customer_chat_id", customer_id).eq("status", "active")
-                .eq("subscription_type", "shared").gt("expires_at", now)
-                .limit(1).execute().data or []
-            )
-            if not reminders:
-                continue
-            reminder = reminders[0]
             text = (
                 "السلام عليكم،\n\n"
                 "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله."
             )
-            send_kwargs = {"chat_id": customer_id, "text": text}
-            if reminder.get("business_connection_id"):
-                send_kwargs["business_connection_id"] = reminder["business_connection_id"]
-            await context.bot.send_message(**send_kwargs)
+            connection_id = get_customer_business_connection_id(int(customer_id))
+            if not connection_id:
+                raise RuntimeError("No Business connection available for customer")
+            await send_business_message_with_current_fallback(
+                context, int(customer_id), text, connection_id,
+            )
             sent += 1
         except Exception:
             failed += 1
@@ -1999,28 +2036,18 @@ async def send_legacy_shared_account_relogin_notifications(
     """نفس التنبيه للحسابات القديمة المرتبطة عبر totp_links."""
     customer_ids = get_customers_for_account(account_id)
     sent = failed = 0
-    now = datetime.now(timezone.utc).isoformat()
     for customer_id in sorted(set(customer_ids)):
         try:
-            reminders = (
-                supabase.table("subscription_reminders")
-                .select("customer_chat_id, business_connection_id")
-                .eq("customer_chat_id", customer_id).eq("status", "active")
-                .eq("subscription_type", "shared").gt("expires_at", now)
-                .limit(1).execute().data or []
+            connection_id = get_customer_business_connection_id(int(customer_id))
+            if not connection_id:
+                raise RuntimeError("No Business connection available for customer")
+            await send_business_message_with_current_fallback(
+                context,
+                int(customer_id),
+                "السلام عليكم،\n\n"
+                "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله.",
+                connection_id,
             )
-            if not reminders:
-                continue
-            send_kwargs = {
-                "chat_id": customer_id,
-                "text": (
-                    "السلام عليكم،\n\n"
-                    "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله."
-                ),
-            }
-            if reminders[0].get("business_connection_id"):
-                send_kwargs["business_connection_id"] = reminders[0]["business_connection_id"]
-            await context.bot.send_message(**send_kwargs)
             sent += 1
         except Exception:
             failed += 1
@@ -6112,6 +6139,16 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             logger.exception("Failed to send account-link notification to topic")
+        # أمر الربط يحتوي رمزاً داخلياً ولا نريد أن يبقى ظاهراً في محادثة
+        # العميل بعد نجاح الربط.
+        if bm is not None:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Linked customer but could not delete /link shortcut for %s", chat_id)
         return True
 
     # /resetcode  (يُرسل داخل محادثة الزبون نفسه — يصفر عداد محاولات الكود)
