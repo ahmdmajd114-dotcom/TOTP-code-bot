@@ -2434,6 +2434,12 @@ def duration_to_days(duration: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def is_permanent_duration(duration: str | None) -> bool:
+    """هل الباقة دائمة؟ الدائم له متابعة رضا بعد يوم، لا تاريخ انتهاء."""
+    normalized = normalize_arabic_text(duration or "")
+    return any(term in normalized for term in ("دائم", "دائمي", "مدى الحياه", "مدي الحياه"))
+
+
 def catalog_product_for_payment_name(name: str) -> dict | None:
     normalized_name = " ".join(normalize_style_text(name))
     for product in get_catalog_products():
@@ -2453,13 +2459,20 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
         product = get_catalog_product(str(selected_catalog_id))
         if not product or not product.get("is_active"):
             return []
-        plans = [plan for plan in get_catalog_plans(str(selected_catalog_id)) if plan.get("is_active") and duration_to_days(plan.get("duration"))]
+        plans = [
+            plan for plan in get_catalog_plans(str(selected_catalog_id))
+            if plan.get("is_active") and (
+                duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration"))
+            )
+        ]
         if len(plans) == 1:
             plan = plans[0]
             state.update({
                 "plan_id": plan["id"], "plan_name": plan["name"],
                 "plan_duration": plan.get("duration"),
                 "duration_days": duration_to_days(plan.get("duration")),
+                # يخزن تذكيراً بعد يوم لأخذ الرضا، وليس انتهاء اشتراك.
+                "reminder_disabled": is_permanent_duration(plan.get("duration")),
             })
             return []
         return plans
@@ -2472,13 +2485,19 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
     product = catalog_product_for_payment_name(state.get("product") or "")
     if not product or is_chatgpt_product(product):
         return []
-    plans = [plan for plan in get_catalog_plans(product["id"]) if plan.get("is_active") and duration_to_days(plan.get("duration"))]
+    plans = [
+        plan for plan in get_catalog_plans(product["id"])
+        if plan.get("is_active") and (
+            duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration"))
+        )
+    ]
     if len(plans) == 1:
         plan = plans[0]
         state.update({
             "plan_id": plan["id"], "plan_name": plan["name"],
             "plan_duration": plan.get("duration"),
             "duration_days": duration_to_days(plan.get("duration")),
+            "reminder_disabled": is_permanent_duration(plan.get("duration")),
         })
         return []
     return plans
@@ -5531,9 +5550,14 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
             }).eq("id", reminder["id"]).execute()
             source_text = "\n📲 المصدر: Instagram" if reminder.get("source") == "instagram" else ""
             sale_text = f"\nرقم العملية: {reminder.get('instagram_sale_id')}" if reminder.get("instagram_sale_id") else ""
+            owner_event = (
+                f"🔔 متابعة رضا بعد يوم لمنتج دائم {product_text} للزبون: {customer}\n"
+                if reminder.get("feedback_only")
+                else f"🔔 انتهى اشتراك {product_text} للزبون: {customer}\n"
+            )
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
-                text=(f"🔔 انتهى اشتراك {product_text} للزبون: {customer}\n"
+                text=(owner_event
                       + source_text + sale_text + "\n"
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
                       + ("⚠️ فشل إرسال رسالة المتابعة للزبون." if customer_send_error
@@ -6523,9 +6547,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             rows = supabase.table("catalog_plans").select("id, product_id, name, duration, is_active").eq("id", plan_id).limit(1).execute().data or []
         except Exception:
             rows = []
+        selected_product_id = state.get("catalog_product_id")
         selected_product = catalog_product_for_payment_name(state.get("product") or "")
-        if (not rows or not rows[0].get("is_active") or not duration_to_days(rows[0].get("duration"))
-                or (selected_product and rows[0].get("product_id") != selected_product.get("id"))):
+        if (not rows or not rows[0].get("is_active")
+                or not (duration_to_days(rows[0].get("duration")) or is_permanent_duration(rows[0].get("duration")))
+                or (selected_product_id and rows[0].get("product_id") != selected_product_id)
+                or (not selected_product_id and selected_product and rows[0].get("product_id") != selected_product.get("id"))):
             await query.answer("الباقة غير متاحة أو بلا مدة.", show_alert=True)
             return
         plan = rows[0]
@@ -6533,6 +6560,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             "plan_id": plan["id"], "plan_name": plan["name"],
             "plan_duration": plan.get("duration"),
             "duration_days": duration_to_days(plan.get("duration")),
+            "reminder_disabled": is_permanent_duration(plan.get("duration")),
         })
         data = "pay_finalize"
 
@@ -6812,7 +6840,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             if state.get("manual_product"):
                 reminder_note = "\nℹ️ المنتج مكتوب يدوياً؛ لم يُنشأ له تنبيه انتهاء."
             elif state.get("reminder_disabled"):
-                reminder_note = "\nℹ️ هذا المنتج دائم، ما يحتاج تنبيه انتهاء."
+                reminder_note = "\nℹ️ هذا المنتج دائم؛ راح تنرسل متابعة رضا بعد 24 ساعة بدون تنبيه انتهاء."
             else:
                 reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
             final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح." + reminder_note
