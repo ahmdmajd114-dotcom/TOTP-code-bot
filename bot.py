@@ -5796,6 +5796,16 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
 
     is_private_account = is_private_totp_account(chat_id)
 
+    # الربط وحده لا يكفي: بعد انتهاء المدة المسجلة يُمنع إرسال الكود.
+    # الاستثناء القصير بعد /link يبقي التفعيل الجديد ممكناً قبل اكتمال
+    # تسجيل التذكير، ولا يفتح صلاحية دائمة للحسابات المنتهية.
+    if (
+        not is_private_account
+        and not has_active_subscription(chat_id)
+        and not has_recent_manual_link_code_authorization(chat_id)
+    ):
+        return None, False
+
     result = get_secret_for_chat(chat_id)
     if result is None:
         # مو مربوط اصلاً — نفس السلوك القديم، تجاهل صامت
