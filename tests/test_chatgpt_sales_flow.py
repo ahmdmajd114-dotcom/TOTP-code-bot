@@ -105,7 +105,11 @@ class ChatGPTPlanChoiceTests(unittest.TestCase):
         self.assertEqual(decide_code_retry(2, False).action, "send_code")
         restart = decide_code_retry(3, False)
         self.assertEqual((restart.action, restart.attempt_count, restart.awaiting_restart), ("ask_restart", 4, True))
-        self.assertEqual(decide_code_retry(4, True).attempt_count, 5)
+        after_restart_notice = decide_code_retry(4, True)
+        self.assertEqual(
+            (after_restart_notice.action, after_restart_notice.attempt_count, after_restart_notice.awaiting_restart),
+            ("send_code", 5, False),
+        )
         self.assertEqual(decide_code_retry(5, False).action, "send_code")
         self.assertEqual(decide_code_retry(6, False).action, "send_code")
         self.assertEqual(decide_code_retry(7, False).action, "stop")

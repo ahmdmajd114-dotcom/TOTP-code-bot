@@ -5629,10 +5629,11 @@ def has_recent_manual_link_code_authorization(chat_id: int) -> bool:
 
 # ------------------------------------------------------------------
 # نظام تتبع محاولات الكود الفاشلة (code_retry_tracker بقاعدة Supabase)
-# التسلسل المتفق عليه لما الزبون يقول "ما صار" بشكل متكرر:
+# التسلسل المتفق عليه لطلبات الكود الصريحة:
 #   المحاولات 1، 2، 3 → كود جديد تلقائياً
 #   المحاولة 4         → رسالة "سوي ريستارت" بدون كود
-#   بعد تأكيد الريستارت → 3 أكواد جديدة (المحاولات 5، 6، 7)
+#   الطلب التالي للكود → كود جديد (المحاولة 5)، من دون إعادة رسالة الريست
+#   أو انتظار تخمين من رسالة الزبون بأنه أكمل الريستارت.
 #   بعد فشل الكود السابع → توقف، تنبيه للأونر مع أزرار التحكم
 # العداد يصفر تلقائياً بعد CODE_RETRY_RESET_HOURS ساعة من آخر محاولة.
 # ------------------------------------------------------------------
@@ -5782,7 +5783,7 @@ STOPPED_MESSAGE = (
 )
 
 
-def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple[str | None, bool]:
+def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     """
     يقرر شنو الرد المناسب لطلب كود، حسب حالة عداد المحاولات.
 
@@ -5795,30 +5796,12 @@ def process_code_request(chat_id: int, restart_confirmed: bool = False) -> tuple
 
     is_private_account = is_private_totp_account(chat_id)
 
-    # الحساب المشترك المنتهي لا يستلم كوداً عادةً. الاستثناء الوحيد هو
-    # نافذة قصيرة فتحها المالك بنفسه بعد /link، حتى يقدر الزبون الذي ربطه
-    # للتو يطلب «الرمز» أو «كود المصادقة» من دون انتظار تدخل يدوي.
-    if (
-        not is_private_account
-        and not has_active_subscription(chat_id)
-        and not has_recent_manual_link_code_authorization(chat_id)
-    ):
-        return None, False
-
     result = get_secret_for_chat(chat_id)
     if result is None:
         # مو مربوط اصلاً — نفس السلوك القديم، تجاهل صامت
         return None, False
 
     secret, label = result
-
-    if awaiting_restart:
-        if not restart_confirmed:
-            return RESTART_CONFIRMATION_MESSAGE, False
-        # بعد تأكيد الريست نبدأ مرحلة جديدة من ثلاثة أكواد.
-        code = generate_totp_code(secret)
-        _save_retry_state(chat_id, 5, False)
-        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
 
     decision = (
         decide_private_code_retry(attempt_count, awaiting_restart)
@@ -9529,7 +9512,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("Inferred contextual payment request for chat_id=%s", chat_id)
     # لا نرسل كوداً من محاولة قديمة أو من أي استنتاج سياقي. فئة «طلب_كود»
     # لا تُضاف إلا من كلمات CODE_REQUEST_KEYWORDS الموجودة في هذه الرسالة.
-    restart_confirmed = False
     # إذا كانت الرسالة تحية مرفقة بكلام آخر ولم ينتج عنها أي فئة قابلة
     # للإجابة، لا نرسل التحية وحدها. هذا هو الفرق بين «السلام عليكم» فقط
     # وبين «السلام عليكم، أريد منتجاً غير موجود».
@@ -9562,7 +9544,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if category == "طلب_كود":
             # طلب كود — الشرط الأساسي يضل الربط المسبق بـ /link، وبعده
             # عداد المحاولات (process_code_request) يقرر شنو الرد بالضبط
-            reply_text, stopped = process_code_request(chat_id, restart_confirmed=restart_confirmed)
+            reply_text, stopped = process_code_request(chat_id)
             if reply_text:
                 replies_to_send.append(reply_text)
             if stopped:
