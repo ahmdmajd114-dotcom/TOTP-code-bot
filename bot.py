@@ -202,7 +202,12 @@ _pending_customer_text_batches: dict[int, dict] = {}
 # النص المجمع الجاهز لإعادة إدخاله إلى المعالج من دون جدولة ثانية.
 _ready_customer_texts: dict[tuple[int, int], str] = {}
 _delayed_greeting_delivery_keys: set[tuple[int, int]] = set()
+# أي تدخل يدوي من الأونر يلغي الرد التلقائي للرسالة المقصودة فقط، لا المحادثة كلها.
+_suppressed_auto_reply_keys: set[tuple[int, int]] = set()
+_latest_customer_message_ids: dict[int, int] = {}
 _support_context_until: dict[int, datetime] = {}
+# وقت آخر رد من الأونر الذي أنهى تدخله في المشكلة الحالية.
+_support_context_resolved_at: dict[int, datetime] = {}
 # ربط المالك اليدوي يفتح نافذة قصيرة فقط لطلب OTP؛ لا يتحول إلى إذن
 # مفتوح للحسابات المشتركة المنتهية. تُسجَّل عند نجاح /link.
 _manual_link_code_authorizations: dict[int, datetime] = {}
@@ -3944,6 +3949,7 @@ def archive_message(
 
 def mark_live_support_context(chat_id: int) -> None:
     """يبقي الصمت التلقائي فعالاً حتى تمر 30 دقيقة بلا أي متابعة."""
+    _support_context_resolved_at.pop(chat_id, None)
     _support_context_until[chat_id] = datetime.now(timezone.utc) + timedelta(
         minutes=CONVERSATION_SESSION_GAP_MINUTES
     )
@@ -3952,6 +3958,10 @@ def mark_live_support_context(chat_id: int) -> None:
 def is_live_support_context_active(chat_id: int) -> bool:
     """هل تحتوي الجلسة الحية الحالية على مشكلة تستلزم تدخلاً بشرياً؟"""
     now = datetime.now(timezone.utc)
+    resolved_at = _support_context_resolved_at.get(chat_id)
+    if resolved_at and now - resolved_at < timedelta(minutes=CONVERSATION_SESSION_GAP_MINUTES):
+        return False
+    _support_context_resolved_at.pop(chat_id, None)
     memory_until = _support_context_until.get(chat_id)
     if memory_until and now < memory_until:
         # كل متابعة جديدة تعني أن فترة السكوت لم تبدأ بعد.
@@ -10333,6 +10343,9 @@ async def _send_delayed_initial_greeting(
             archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
             return
         await human_like_reply_sequence(context, chat_id, business_connection_id, message_id)
+        if (chat_id, message_id) in _suppressed_auto_reply_keys:
+            archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+            return
         await context.bot.send_message(
             business_connection_id=business_connection_id,
             chat_id=chat_id,
@@ -10357,6 +10370,27 @@ def cancel_pending_customer_text_batch(chat_id: int) -> None:
     task = pending.get("task") if pending else None
     if task and not task.done():
         task.cancel()
+
+
+def mark_owner_took_over_customer_chat(chat_id: int) -> None:
+    """يلغي الرد التلقائي للرسالة الأخيرة فقط عندما يسبق الأونر البوت."""
+    message_id = _latest_customer_message_ids.get(chat_id)
+    # أول رد منك يعني أن المشكلة التي سلّمتها للبشر انتهت؛ من الرسالة
+    # التالية يرجع البوت لخدمته المعتادة (كود، شكر، إلخ).
+    _support_context_until.pop(chat_id, None)
+    _support_context_resolved_at[chat_id] = datetime.now(timezone.utc)
+    if message_id is None:
+        return
+    _suppressed_auto_reply_keys.add((chat_id, message_id))
+    pending = _pending_customer_text_batches.get(chat_id)
+    if pending and any(part.get("message_id") == message_id for part in pending.get("parts", [])):
+        cancel_pending_customer_text_batch(chat_id)
+    pending_greeting = _pending_initial_greetings.get(chat_id)
+    if pending_greeting and pending_greeting.get("message_id") == message_id:
+        _pending_initial_greetings.pop(chat_id, None)
+        task = pending_greeting.get("task")
+        if task and not task.done():
+            task.cancel()
 
 
 def get_latest_archived_customer_text(chat_id: int) -> str:
@@ -10524,6 +10558,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             chat_id=chat_id,
             business_connection_id=bm.business_connection_id,
         )
+        if ready_customer_text is None:
+            _latest_customer_message_ids[chat_id] = bm.message_id
 
     # حماية محادثة متفق عليها: لا تمرر النص للذكاء الاصطناعي ولا تحفظه في
     # الأرشيف. نحذف فقط من المحادثة المحددة في Render، سواء كانت الرسالة
@@ -10637,7 +10673,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
-        cancel_pending_customer_text_batch(chat_id)
+        mark_owner_took_over_customer_chat(chat_id)
         # اختصارات يدوية س/ع: تتعرف على آخر رسالة زبون بلا حاجة للرد عليها.
         if text.strip() in {"س", "ع"}:
             await send_owner_conversation_shortcut(context, bm, text.strip())
@@ -10939,6 +10975,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await human_like_reply_sequence(
                 context, chat_id, bm.business_connection_id, bm.message_id
             )
+    # الكود مستثنى لأنه يطلع خلال ثانية؛ بقية الردود تتوقف إذا سبقك الأونر.
+    if not has_code_reply and (chat_id, bm.message_id) in _suppressed_auto_reply_keys:
+        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        return
     outgoing_replies = replies_to_send if has_code_reply else (
         ["\n\n".join(replies_to_send)]
         if has_greeting_and_action and len(replies_to_send) > 1
