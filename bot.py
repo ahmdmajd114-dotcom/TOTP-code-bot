@@ -75,6 +75,11 @@ from chatgpt_sales_flow import (
     classify_receipt_recency,
 )
 from modesty_guard import is_flirtatious_text, is_guarded_chat
+from telegram_personal_scheduler import (
+    cancel_scheduled_message as cancel_personal_scheduled_message,
+    is_configured as personal_scheduler_is_configured,
+    schedule_message as schedule_personal_message,
+)
 from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
 from interactive_classifier import (
     guard_interactive_action,
@@ -2224,6 +2229,7 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
                 supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq("account_id", account_id).eq("customer_chat_id", chat_id).eq("status", "active").execute()
             else:
                 supabase.table("totp_links").delete().eq("account_id", account_id).eq("chat_id", chat_id).execute()
+            await cancel_scheduled_subscription_feedback(chat_id)
             supabase.table("subscription_reminders").update({"status": "cancelled"}).eq("customer_chat_id", chat_id).eq("subscription_type", "shared").eq("status", "active").execute()
             context.user_data.pop("pending_cancel_customer", None)
             await query.edit_message_text(
@@ -2965,21 +2971,65 @@ def save_subscription_reminder(state: dict) -> bool:
             "customer_name": state["customer_name"],
             "customer_username": state.get("customer_username"),
             "product_name": state.get("product") or state.get("product_name") or "غير محدد",
-            "plan_name": state.get("plan_name"),
-            "plan_duration": state.get("plan_duration"),
-            "subscription_type": subscription_type or "general",
-            "duration_months": duration_months,
-            "duration_days": duration_days,
-            "feedback_only": feedback_only,
+            "plan_name": state.get("plan_name"), "plan_duration": state.get("plan_duration"),
+            "subscription_type": subscription_type or "general", "duration_months": duration_months,
+            "duration_days": duration_days, "feedback_only": feedback_only,
             "feedback_status": "scheduled" if feedback_only else "none",
-            "is_debt": bool(state.get("is_debt", False)),
-            "started_at": now.isoformat(),
+            "is_debt": bool(state.get("is_debt", False)), "started_at": now.isoformat(),
             "expires_at": (now + timedelta(days=duration_days)).isoformat(),
         }).execute()
         return True
     except Exception:
         logger.exception("Failed to save subscription reminder")
         return False
+
+
+SUBSCRIPTION_FEEDBACK_TEXT = (
+    "السلام عليكم.\n\n"
+    "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
+    "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
+)
+
+
+async def schedule_subscription_feedback(state: dict) -> None:
+    """يحجز المتابعة الآن من حساب الأونر، حتى لا يصطدم بقيد Business لاحقاً."""
+    if not personal_scheduler_is_configured():
+        return
+    chat_id = state.get("customer_chat_id")
+    duration_days = state.get("duration_days") or (30 * state.get("duration_months", 0))
+    if not chat_id or not duration_days:
+        return
+    try:
+        row = (supabase.table("subscription_reminders").select("id, expires_at")
+               .eq("customer_chat_id", chat_id).eq("status", "active")
+               .order("created_at", desc=True).limit(1).execute().data or [])
+        if not row:
+            return
+        expires_at = datetime.fromisoformat(row[0]["expires_at"].replace("Z", "+00:00"))
+        message_id = await schedule_personal_message(int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at)
+        supabase.table("subscription_reminders").update({
+            "scheduled_message_id": message_id,
+            "scheduled_message_status": "scheduled",
+        }).eq("id", row[0]["id"]).execute()
+    except Exception:
+        logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
+
+
+async def cancel_scheduled_subscription_feedback(customer_chat_id: int) -> None:
+    """يلغي كل رسائل المتابعة المجدولة للزبون قبل إلغاء/تعويض اشتراكه."""
+    try:
+        rows = (supabase.table("subscription_reminders")
+                .select("id, scheduled_message_id")
+                .eq("customer_chat_id", customer_chat_id).eq("status", "active")
+                .not_.is_("scheduled_message_id", "null").execute().data or [])
+        for row in rows:
+            if personal_scheduler_is_configured():
+                await cancel_personal_scheduled_message(customer_chat_id, int(row["scheduled_message_id"]))
+            supabase.table("subscription_reminders").update({
+                "scheduled_message_status": "cancelled",
+            }).eq("id", row["id"]).execute()
+    except Exception:
+        logger.exception("Failed to cancel scheduled feedback for customer %s", customer_chat_id)
 
 
 def save_personal_reminder(due_at: datetime, purpose: str) -> bool:
@@ -3697,7 +3747,7 @@ def parse_sheet_amount(value: object) -> int | None:
         return None
 
 
-def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
+async def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
     """يسجل التعويض، يخفض صافي الدفعة، ويلغي الخدمة/متابعة انتهائها."""
     chat_id = expense.get("customer_chat_id")
     row_number = expense.get("payment_row_number")
@@ -3726,6 +3776,7 @@ def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
         sheet.update_cell(row_number, SHEET_COL_TOTAL, original_total - amount)
         sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")
         # التعويض ينهي الخدمة الحالية: لا رسالة انتهاء لاحقاً ولا كود/حساب باقٍ.
+        await cancel_scheduled_subscription_feedback(chat_id)
         supabase.table("subscription_reminders").update({"status": "cancelled"}).eq(
             "customer_chat_id", chat_id
         ).eq("status", "active").execute()
@@ -7045,6 +7096,8 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days") or state.get("reminder_disabled")
         ):
             subscription_saved = save_subscription_reminder(state)
+            if subscription_saved:
+                await schedule_subscription_feedback(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
         if saved:
@@ -7186,12 +7239,15 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("⚠️ اختيار الباقة غير صحيح.")
         return
 
-    saved = save_subscription_reminder({
+    reminder_state = {
         **state,
         "subscription_type": subscription_type,
         "duration_months": duration_months,
         "is_debt": True,
-    })
+    }
+    saved = save_subscription_reminder(reminder_state)
+    if saved:
+        await schedule_subscription_feedback(reminder_state)
     if not saved:
         await query.edit_message_text("⚠️ تم الربط، بس فشل تسجيل اشتراك الدين. تأكد من تشغيل SQL الجديد.")
         return
@@ -7247,13 +7303,16 @@ async def handle_manual_subscription_input(update: Update, context: ContextTypes
     chat_id = int(parts[0])
     name = parts[1]
     username = parts[2] if len(parts) == 3 else ""
-    saved = save_subscription_reminder({
+    reminder_state = {
         "customer_chat_id": chat_id,
         "customer_name": name,
         "customer_username": username or None,
         "subscription_type": state["subscription_type"],
         "duration_months": state["duration_months"],
-    })
+    }
+    saved = save_subscription_reminder(reminder_state)
+    if saved:
+        await schedule_subscription_feedback(reminder_state)
     if saved:
         end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=30 * state["duration_months"])
         await message.reply_text(f"✅ تم تسجيل التنبيه. ينتهي: {end.strftime('%Y-%m-%d %H:%M')}")
@@ -7628,7 +7687,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         if expense.get("kind") != "customer_compensation":
             await query.answer("هذا التأكيد غير صالح.", show_alert=True)
             return
-        saved, result = apply_customer_compensation(expense)
+        saved, result = await apply_customer_compensation(expense)
         if saved:
             await send_expense_notification(context, {
                 **expense, "reason": f"تعويض زبون {expense['customer_chat_id']}: {expense.get('reason') or '—'}",

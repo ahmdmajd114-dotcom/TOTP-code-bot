@@ -62,6 +62,10 @@ alter table public.subscription_reminders
 alter table public.subscription_reminders
   add column if not exists instagram_account text;
 alter table public.subscription_reminders
+  add column if not exists scheduled_message_id integer;
+alter table public.subscription_reminders
+  add column if not exists scheduled_message_status text not null default 'none';
+alter table public.subscription_reminders
   alter column subscription_type set default 'general';
 
 -- النسخ القديمة كانت تمنع إلا private/shared وشهر/شهرين.
