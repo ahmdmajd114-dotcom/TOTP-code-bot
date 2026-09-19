@@ -35,6 +35,11 @@ create table if not exists public.catalog_plans (
 alter table public.catalog_plans
   add column if not exists show_in_catalog boolean not null default true;
 
+-- تحكم مستقل: الباقة قد تظهر بموقع MedBox، لكن لا يرسلها البوت للزبون
+-- تلقائياً عند سؤاله عن المنتج، أو العكس.
+alter table public.catalog_plans
+  add column if not exists show_to_customers boolean not null default true;
+
 create index if not exists catalog_plans_product_id_idx
   on public.catalog_plans(product_id);
 

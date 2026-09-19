@@ -89,7 +89,11 @@ def format_customer_catalog_reply(
     """Render only currently active catalog data; never fall back to fixed prices."""
     if not product.get("is_active"):
         return None
-    active_plans = [plan for plan in plans if plan.get("is_active")]
+    # الظهور للزبون منفصل عن حالة الباقة وعن عرضها في الموقع العام.
+    active_plans = [
+        plan for plan in plans
+        if plan.get("is_active") and plan.get("show_to_customers", True)
+    ]
     if not active_plans:
         return None
 

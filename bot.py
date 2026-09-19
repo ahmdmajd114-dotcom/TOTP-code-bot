@@ -1206,7 +1206,7 @@ def build_catalog_main_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
 
 def build_catalog_product_keyboard(product: dict, plans: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
-        f"{'✅' if plan['is_active'] else '⏸️'} {'🌐' if plan.get('show_in_catalog', True) else '🙈'} {plan['name']} — {plan['price']}",
+        f"{'✅' if plan['is_active'] else '⏸️'} {'🌐' if plan.get('show_in_catalog', True) else '🙈'} {'💬' if plan.get('show_to_customers', True) else '🔕'} {plan['name']} — {plan['price']}",
         callback_data=f"catalog_plan_{plan['id']}",
     )] for plan in plans]
     rows.append([InlineKeyboardButton("➕ إضافة باقة", callback_data=f"catalog_add_plan_{product['id']}")])
@@ -1233,7 +1233,8 @@ def format_catalog_product(product: dict, plans: list[dict]) -> str:
         plan_status = "مفعلة" if plan["is_active"] else "متوقفة"
         details = f" — {plan['duration']}" if plan.get("duration") else ""
         public_status = "ظاهر بالموقع" if plan.get("show_in_catalog", True) else "مخفي من الموقع"
-        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status}، {public_status})")
+        customer_status = "ظاهر للزبون" if plan.get("show_to_customers", True) else "مخفي عن الزبون"
+        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status}، {public_status}، {customer_status})")
     return "\n".join(lines)
 
 
@@ -1368,11 +1369,13 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
             return
         visibility = "ظاهرة في كاتالوج الموقع" if plan.get("show_in_catalog", True) else "مخفية من كاتالوج الموقع"
-        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}\nالموقع: {visibility}"
+        customer_visibility = "ظاهرة للزبون" if plan.get("show_to_customers", True) else "مخفية عن ردود الزبائن"
+        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}\nالموقع: {visibility}\nالزبون: {customer_visibility}"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تعديل السعر", callback_data=f"catalog_price_{plan_id}")],
             [InlineKeyboardButton("✏️ تعديل تفاصيل الباقة", callback_data=f"catalog_edit_plan_{plan_id}")],
             [InlineKeyboardButton("🙈 إخفاء من الموقع" if plan.get("show_in_catalog", True) else "🌐 إظهار في الموقع", callback_data=f"catalog_public_{plan_id}")],
+            [InlineKeyboardButton("🔕 إخفاء عن الزبون" if plan.get("show_to_customers", True) else "💬 إظهار للزبون", callback_data=f"catalog_customer_{plan_id}")],
             [InlineKeyboardButton("⏸️ إيقاف" if plan["is_active"] else "✅ تفعيل", callback_data=f"catalog_toggle_{plan_id}")],
             [InlineKeyboardButton("🗑️ حذف الباقة", callback_data=f"catalog_xdelc_{plan_id}")],
             [InlineKeyboardButton(BTN_BACK, callback_data=f"catalog_product_{plan['product_id']}")],
@@ -1404,6 +1407,23 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception("Failed to change catalog plan visibility")
             await query.edit_message_text("⚠️ فشل تحديث ظهور الباقة بالموقع. تأكد من تشغيل SQL الجديد.")
+        return
+
+    if data.startswith("catalog_customer_"):
+        plan_id = data[len("catalog_customer_"):]
+        try:
+            result = supabase.table("catalog_plans").select("id, show_to_customers").eq("id", plan_id).execute()
+            plan = result.data[0] if result.data else None
+            if not plan:
+                await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
+                return
+            supabase.table("catalog_plans").update({"show_to_customers": not plan.get("show_to_customers", True)}).eq("id", plan_id).execute()
+            await query.edit_message_text("✅ تم تحديث ظهور الباقة لردود الزبائن.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ رجوع للباقة", callback_data=f"catalog_plan_{plan_id}")],
+            ]))
+        except Exception:
+            logger.exception("Failed to change customer plan visibility")
+            await query.edit_message_text("⚠️ فشل تحديث ظهور الباقة للزبون. تأكد من تشغيل SQL الجديد.")
         return
 
     if data.startswith("catalog_edit_plan_"):
