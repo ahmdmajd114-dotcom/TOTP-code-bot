@@ -49,6 +49,7 @@ from catalog_logic import (
     catalog_product_id,
     format_customer_catalog_reply,
     match_catalog_products,
+    split_plan_display_names,
 )
 from intent_fallback import (
     contextual_thanks_reply,
@@ -1351,8 +1352,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "plan_data", "product_id": product_id}
         await query.edit_message_text(
             "اكتب الباقة بهذا الشكل:\n"
-            "اسم الباقة | السعر | عدد الأيام | وصف اختياري\n"
-            "مثال: شهر خاص | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم.",
+            "اسم الزبون (اسم الموقع) | السعر | عدد الأيام | وصف اختياري\n"
+            "مثال: شهر خاص (شهر خاص للطلاب) | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم.",
             reply_markup=None,
         )
         return
@@ -1443,7 +1444,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "product_id": plan["product_id"],
             "plan_id": plan_id,
         }
-        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
+        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل:\nاسم الزبون (اسم الموقع) | السعر | المدة | وصف اختياري", reply_markup=None)
         return
 
     if data.startswith("catalog_xdelc_"):
@@ -10759,7 +10760,7 @@ def build_public_catalog_html() -> str:
             plans = []
         plan_rows = "".join(
             "<div class=\"plan\">"
-            f"<div><strong>{escape(str(plan.get('name') or 'باقة'))}</strong>"
+            f"<div><strong>{escape(split_plan_display_names(plan.get('name'))[1] or 'باقة')}</strong>"
             f"<span>المدة: {escape(format_public_catalog_duration(plan.get('duration')))}</span></div>"
             f"<b>{escape(format_public_catalog_price(plan.get('price')))}</b>"
             "</div>"

@@ -15,6 +15,17 @@ CHATGPT_PRODUCT_TERMS = {
 }
 
 
+def split_plan_display_names(name: object) -> tuple[str, str]:
+    """Return (customer name, public-catalog name) from `customer (public)`."""
+    raw = str(name or "").strip()
+    match = re.fullmatch(r"(.+?)\s*[\(\[]\s*(.+?)\s*[\)\]]", raw)
+    if not match:
+        return raw, raw
+    customer_name = match.group(1).strip()
+    catalog_name = match.group(2).strip()
+    return customer_name or raw, catalog_name or customer_name or raw
+
+
 def catalog_category(product_id: object) -> str:
     return f"{CATALOG_CATEGORY_PREFIX}{product_id}"
 
@@ -99,7 +110,8 @@ def format_customer_catalog_reply(
 
     lines = [f"بلي موجود، عدنا باقات {product.get('name')} التالية:", ""]
     for plan in active_plans:
-        title = re.sub(r"^اشتراك\s+", "", str(plan.get("name") or "").strip()).strip()
+        customer_plan_name, _ = split_plan_display_names(plan.get("name"))
+        title = re.sub(r"^اشتراك\s+", "", customer_plan_name).strip()
         duration = str(plan.get("duration") or "").strip()
         normalized_title = normalize_arabic_text(title)
         account_type = "خاص" if "خاص" in normalized_title else "مشترك" if "مشترك" in normalized_title else ""
