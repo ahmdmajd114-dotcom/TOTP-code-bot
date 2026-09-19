@@ -554,6 +554,8 @@ def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int)
 def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
     """
     يدور عن أول دين غير مدفوع لنفس الزبون ونفس المنتج بصفحة الديون.
+    أسماء الكاتالوج وكلماتها البديلة تعامل كمنتج واحد: مثلاً «جات»
+    و«ChatGPT» لا يصيران دينين مختلفين.
     يرجع (رقم الصف 1-indexed لـ gspread، المبلغ المتبقي الحالي) لو لقى، أو None.
     """
     sheet = get_debts_worksheet()
@@ -574,7 +576,16 @@ def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
         row_chat_id = row[DEBT_COL_CHAT_ID - 1].strip()
         row_product = row[DEBT_COL_PRODUCT - 1].strip()
         row_status = row[DEBT_COL_STATUS - 1].strip()
-        if row_chat_id == chat_id_str and row_product == product and row_status == "غير مدفوع":
+        same_product = row_product == product
+        if not same_product:
+            row_catalog_product = catalog_product_for_payment_name(row_product)
+            requested_catalog_product = catalog_product_for_payment_name(product)
+            same_product = bool(
+                row_catalog_product
+                and requested_catalog_product
+                and row_catalog_product.get("id") == requested_catalog_product.get("id")
+            )
+        if row_chat_id == chat_id_str and same_product and row_status == "غير مدفوع":
             try:
                 remaining = int(float(row[DEBT_COL_AMOUNT - 1]))
             except (ValueError, IndexError):
@@ -3355,13 +3366,15 @@ def format_expense_summary(expense: dict) -> str:
 
 
 def build_debt_product_keyboard() -> InlineKeyboardMarkup:
-    """شاشة اختيار منتج الدين — منتج سريع + بقية المنتجات + إدخال حر."""
-    quick_pick = PAYMENT_PRODUCTS[0]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(quick_pick, callback_data=f"debt_product_{quick_pick}")],
-        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="debt_product_list")],
-        [InlineKeyboardButton("✏️ إدخال حر", callback_data="debt_product_manual")],
-    ])
+    """شاشة اختيار منتج الدين — نفس كاتالوج الدفع، بلا أسماء حرة."""
+    products = get_active_catalog_payment_products()
+    rows = [
+        [InlineKeyboardButton(product["name"], callback_data=f"debt_catalog_{product['id']}")]
+        for product in products
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="debt_noop")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_debt_main_keyboard() -> InlineKeyboardMarkup:
@@ -7185,6 +7198,21 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             "duration_days": duration_to_days(plan.get("duration")),
             "reminder_disabled": is_permanent_duration(plan.get("duration")),
         })
+        # إذا اختار الباقة قبل تحديد طريقة الدفع، نرجعه لملخص العملية
+        # بدل محاولة تثبيت ناقصة. هنا يظهر أيضاً زر تسديد الدين عند وجوده.
+        if not state["payments"]:
+            customer_chat_id = state.get("customer_chat_id")
+            has_debt = (
+                customer_chat_id is not None
+                and find_unpaid_debt(customer_chat_id, state["product"]) is not None
+            )
+            await query.edit_message_caption(
+                caption=format_payment_summary(state),
+                reply_markup=build_summary_keyboard(
+                    has_product=True, has_payment=False, show_debt_repayment=has_debt
+                ),
+            )
+            return
         data = "pay_finalize"
 
     if data.startswith("pay_ambos_duration_"):
@@ -7936,6 +7964,17 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     debt = _pending_debt
+
+    if data.startswith("debt_catalog_"):
+        product_id = data[len("debt_catalog_"):]
+        product = get_catalog_product(product_id)
+        if not product or not product.get("is_active"):
+            await query.answer("هذا المنتج غير متاح حالياً في الكاتالوج.", show_alert=True)
+            return
+        debt["product"] = product["name"]
+        debt["step"] = "amount"
+        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard())
+        return
 
     if data.startswith("debt_product_") and data not in ("debt_product_list", "debt_product_manual"):
         product = data[len("debt_product_"):]
