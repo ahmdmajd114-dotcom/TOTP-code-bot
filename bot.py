@@ -3383,6 +3383,33 @@ def build_debt_amount_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def start_debt_for_customer(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    customer_name: str,
+    customer_username: str | None,
+) -> None:
+    """يفتح فلو الدين للأونر، مع تعبئة زبون المحادثة الحالية تلقائياً."""
+    global _pending_debt
+    debt = {
+        "message_id": None,
+        "step": "product",
+        "chat_id": chat_id,
+        "customer_line": format_customer_line(customer_name, customer_username),
+        "product": None,
+        "amount": 0,
+        "awaiting_manual_product": False,
+        "awaiting_manual_amount": False,
+    }
+    sent = await context.bot.send_message(
+        chat_id=OWNER_USER_ID,
+        text=format_debt_summary(debt),
+        reply_markup=build_debt_product_keyboard(),
+    )
+    debt["message_id"] = sent.message_id
+    _pending_debt = debt
+
+
 def format_debt_summary(debt: dict) -> str:
     """يبني نص الملخص المعروض فوق أزرار تسجيل الدين."""
     lines = ["تسجيل دين"]
@@ -10163,6 +10190,28 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         cancel_pending_customer_text_batch(chat_id)
+        # اختصار الأونر «دين» داخل نفس محادثة الزبون يفتح بطاقة دين
+        # جاهزة باسمه؛ لا يحتاج ينسخ chat_id أو يخرج لمحادثة البوت.
+        if text.strip() == "دين":
+            try:
+                await start_debt_for_customer(
+                    context, chat_id, customer_name, customer_username,
+                )
+            except Exception:
+                logger.exception("Failed to start debt flow for customer %s", chat_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ تعذر فتح تسجيل الدين للزبون ({chat_id}).",
+                )
+                return
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Started debt flow but could not delete shortcut for %s", chat_id)
+            return
         # اختصار المالك: «دفع» أو «طرق الدفع» وحدها تستبدل برسالة فيها
         # الطرق المفعلة حالياً من لوحة التحكم، فلا يحتاج ينسخها كل مرة.
         if is_owner_payment_shortcut(text):
