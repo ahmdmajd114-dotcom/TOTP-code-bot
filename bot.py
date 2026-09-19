@@ -10312,6 +10312,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # كل نص من الزبون ينتظر نافذة قصيرة حتى تكتمل الأجزاء المتتابعة.
     # التحية المنفردة تستخدم نفس النظام لكن بانتظار دقيقة كاملة.
     if not is_from_owner and ready_customer_text is None:
+        # طلب الكود مستعجل ولا يحتاج تجميع أجزاء الرسالة: يتجاوز نافذة
+        # الـdebounce العامة حتى يكون الانتظار الكلي ثانية واحدة فقط.
+        if "طلب_كود" in keyword_match_categories(text):
+            cancel_pending_customer_text_batch(chat_id)
+            _ready_customer_texts[ready_key] = text
+            await on_business_message(update, context)
+            return
         queue_customer_text_batch(update, context, bm, text)
         return
 
