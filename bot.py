@@ -25,6 +25,7 @@ import asyncio
 import logging
 import json
 import time
+from html import escape
 from types import SimpleNamespace
 import pyotp
 import httpx
@@ -149,6 +150,7 @@ SHARED_CHATGPT_ACCOUNT_CAPACITY = 3  # الحد الثابت لكل حساب Cha
 # معرف المحادثة المسموح للفلتر أن يعمل عليها. يبقى في Render فقط، ولا يوضع
 # في الكود أو Git. الصفر يعني أن الفلتر متوقف بالكامل.
 MODESTY_GUARD_CHAT_ID = int(os.environ.get("MODESTY_GUARD_CHAT_ID", "0"))
+CATALOG_SUPPORT_URL = os.environ.get("CATALOG_SUPPORT_URL", "").strip()
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
@@ -10673,22 +10675,119 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
 
 
+def format_public_catalog_duration(duration: str | None) -> str:
+    """Format catalog duration for customers without exposing internal fields."""
+    value = str(duration or "").strip()
+    if not value:
+        return "حسب الباقة"
+    if is_permanent_duration(value):
+        return "دائم"
+    if re.fullmatch(r"[1-9]\d*", value):
+        return f"{value} يوم"
+    return value
+
+
+def build_public_catalog_html() -> str:
+    """Render the public MedBox catalog from the active control-panel catalog."""
+    try:
+        products = get_active_catalog_payment_products()
+    except Exception:
+        logger.exception("Failed to load public catalog")
+        products = []
+
+    cards: list[str] = []
+    support_href = escape(CATALOG_SUPPORT_URL, quote=True) if CATALOG_SUPPORT_URL else "#support"
+    for product in products:
+        try:
+            plans = [plan for plan in get_catalog_plans(str(product["id"])) if plan.get("is_active")]
+        except Exception:
+            logger.exception("Failed to load public plans for %s", product.get("id"))
+            plans = []
+        plan_rows = "".join(
+            "<div class=\"plan\">"
+            f"<div><strong>{escape(str(plan.get('name') or 'باقة'))}</strong>"
+            f"<span>المدة: {escape(format_public_catalog_duration(plan.get('duration')))}</span></div>"
+            f"<b>{int(plan.get('price') or 0):,} <small>د.ع</small></b>"
+            "</div>"
+            for plan in plans
+        ) or "<p class=\"empty\">لا توجد باقات متاحة حالياً.</p>"
+        cards.append(
+            "<article class=\"product-card\">"
+            f"<h2>{escape(str(product.get('name') or 'منتج'))}</h2>"
+            f"<div class=\"plans\">{plan_rows}</div>"
+            f"<a class=\"subscribe\" href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">اشترك عبر الدعم ←</a>"
+            "</article>"
+        )
+
+    catalog_content = "".join(cards) or (
+        "<div class=\"no-products\"><h2>قريباً</h2>"
+        "<p>نحدّث الباقات حالياً. تواصل ويانا للدعم والاشتراك.</p></div>"
+    )
+    support_note = (
+        "الدعم متوفر مباشرة عبر تيليجرام."
+        if CATALOG_SUPPORT_URL else
+        "رابط الدعم سيُضاف قريباً."
+    )
+    return f"""<!doctype html>
+<html lang=\"ar\" dir=\"rtl\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta name=\"theme-color\" content=\"#126f73\">
+  <title>MedBox Pro | متجر ميدبوكس</title>
+  <style>
+    :root {{ --teal:#126f73; --teal-dark:#0c5559; --navy:#132d3a; --cream:#f8f5ee; --line:#d9e5df; }}
+    * {{ box-sizing:border-box }} body {{ margin:0; color:var(--navy); background:linear-gradient(145deg,#f9f6ef,#edf5f2); font-family:Tahoma,Arial,sans-serif; }}
+    .wrap {{ width:min(1120px,calc(100% - 32px)); margin:auto; }}
+    header {{ padding:30px 0 54px; background:radial-gradient(circle at 80% 20%,#318f8d,transparent 34%),linear-gradient(120deg,var(--teal-dark),var(--teal)); color:white; }}
+    .brand {{ display:flex; align-items:center; gap:12px; direction:ltr; font-weight:800; font-size:26px; }}
+    .mark {{ position:relative; display:grid; place-items:center; width:48px; height:48px; border-radius:15px; background:#f5f2e9; color:var(--teal); font-size:38px; line-height:1; }}
+    .mark::after {{ content:''; position:absolute; width:8px; height:8px; border-radius:50%; top:8px; right:8px; background:var(--teal); }}
+    .hero {{ text-align:center; padding:55px 12px 2px; }} .hero h1 {{ margin:0; font-size:clamp(30px,5vw,52px); }} .hero p {{ max-width:590px; margin:16px auto 0; font-size:clamp(16px,2vw,19px); opacity:.94; line-height:1.9; }}
+    main {{ padding:38px 0 58px; }} .section-title {{ text-align:center; margin:0 0 24px; font-size:25px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }}
+    .product-card {{ border:1px solid var(--line); border-radius:22px; background:#fff; padding:23px; box-shadow:0 12px 28px #163c4110; display:flex; flex-direction:column; }}
+    .product-card h2 {{ margin:0 0 17px; color:var(--teal-dark); font-size:23px; }} .plans {{ border-top:1px solid #edf1ef; }}
+    .plan {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 0; border-bottom:1px solid #edf1ef; }}
+    .plan strong,.plan span {{ display:block; }} .plan span {{ color:#65767a; font-size:13px; margin-top:5px; }} .plan b {{ direction:rtl; white-space:nowrap; color:var(--navy); font-size:17px; }} .plan small {{ font-size:12px; color:#65767a; }}
+    .subscribe {{ display:block; margin-top:20px; padding:13px; border-radius:12px; background:var(--teal); color:white; text-align:center; text-decoration:none; font-weight:bold; transition:.18s; }} .subscribe:hover {{ background:var(--teal-dark); transform:translateY(-1px); }}
+    .empty {{ color:#69787b; margin:17px 0 3px; }} .no-products {{ text-align:center; background:#fff; padding:44px; border-radius:22px; border:1px solid var(--line); }}
+    footer {{ text-align:center; padding:29px 18px 36px; color:#627478; font-size:14px; }} footer a {{ display:inline-block; margin-top:12px; color:var(--teal-dark); font-weight:bold; }}
+    @media(max-width:520px) {{ .wrap {{ width:min(100% - 24px,1120px) }} header {{ padding-top:20px }} .hero {{ padding-top:42px }} .product-card {{ padding:19px }} }}
+  </style>
+</head>
+<body>
+  <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
+  <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2><section class=\"grid\">{catalog_content}</section></main>
+  <footer>© MedBox Pro<br>{escape(support_note)}<br><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a></footer>
+</body></html>"""
+
+
 def start_health_server() -> None:
-    """
-    سيرفر HTTP بسيط جداً بالخلفية، وظيفته الوحيدة الرد بـ 200 OK
-    على أي طلب. هذا يخلي Render يفتح بورت (متطلب أساسي عندهم)
-    ويخلي خدمات مثل cron-job.org تكدر توصله فتبقيه صاحي (keep-alive).
-    ما إله أي علاقة بمنطق البوت نفسه.
-    """
+    """HTTP health endpoint plus a public, live catalog page for Render."""
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import threading
 
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in {"/", "/catalog"}:
+                body = build_public_catalog_html().encode("utf-8")
+                content_type = "text/html; charset=utf-8"
+            elif path == "/health":
+                body = b"OK"
+                content_type = "text/plain; charset=utf-8"
+            else:
+                self.send_response(404)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Not found")
+                return
             self.send_response(200)
-            self.send_header("Content-type", "text/plain")
+            self.send_header("Content-type", content_type)
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(body)
 
         def log_message(self, format, *args):
             pass  # تجاهل لوغات HTTP الروتينية عشان ما تغرق لوغات البوت
