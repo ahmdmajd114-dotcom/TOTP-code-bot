@@ -3169,9 +3169,9 @@ def save_subscription_reminder(
 
 
 SUBSCRIPTION_FEEDBACK_TEXT = (
-    "السلام عليكم.\n\n"
-    "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
-    "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
+    "السلام عليكم\n\n"
+    "إن شاء الله كانت تجربتكم ويانا ممتعة\n\n"
+    "خو ما واجهتكم بهاي الفترة مشكلة؟"
 )
 
 
@@ -6202,11 +6202,7 @@ async def retry_expired_reminders_missing_chat(
         logger.exception("Failed to find expired reminders missing chat_id")
         return
 
-    feedback_text = (
-        "السلام عليكم.\n\n"
-        "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
-        "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
-    )
+    feedback_text = SUBSCRIPTION_FEEDBACK_TEXT
     for reminder in reminders:
         chat_id, connection_id = resolve_reminder_delivery_target(reminder)
         if chat_id is None or not connection_id:
