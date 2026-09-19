@@ -6220,31 +6220,35 @@ def has_active_subscription(chat_id: int) -> bool:
         return False
 
 
-def has_recorded_active_subscription_for_link(chat_id: int) -> bool:
-    """هل توجد باقة فعلية مسجلة لهذا العميل عند ربط حساب ChatGPT؟
+def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
+    """هل الدفع مثبت لهذا العميل عند ربط حساب ChatGPT؟
 
-    بعض السجلات القديمة كانت تُنشأ كتذكير فقط، بلا منتج أو باقة أو دفعة.
-    لا يجوز أن تعتبر هذه السجلات تسديداً وأن تمنع سؤال «هل هذا دين؟».
+    ``pending_delivery`` تعني أن الدفع تم لكن العد يبدأ عند /link؛ لذلك لا
+    يجوز أن يفتح سؤال الدين. وإذا تعذر حفظ تنبيه الباقة فقط، نرجع لسجل
+    الدفعات في الشيت: فشل التنبيه لا يلغي دفعة الزبون.
     """
     try:
         rows = (
             supabase.table("subscription_reminders")
             .select("product_name, plan_name")
             .eq("customer_chat_id", chat_id)
-            .eq("status", "active")
-            .gt("expires_at", datetime.now(timezone.utc).isoformat())
+            .in_("status", ["active", "pending_delivery"])
             .limit(20)
             .execute().data or []
         )
-        return any(
-            str(row.get("product_name") or "").strip()
-            or str(row.get("plan_name") or "").strip()
-            for row in rows
-        )
+        if any(is_chatgpt_product_name(row.get("product_name")) for row in rows):
+            return True
     except Exception:
-        # لا نمنع تسجيل الدين عند تعذّر التحقق؛ السؤال هو المسار الآمن هنا.
         logger.exception("Failed to check recorded subscription for account link %s", chat_id)
+
+    # شبكة أمان للدفعات التي حفظت في الشيت لكن لم يُنشأ لها تنبيه بسبب
+    # إعداد قاعدة بيانات قديم. نتحقق من أن السطر نفسه يخص ChatGPT فقط.
+    payment = get_latest_customer_payment(chat_id)
+    if payment is None:
         return False
+    _row_number, row = payment
+    product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
+    return is_chatgpt_product_name(product)
 
 
 def has_fulfilled_service_context(chat_id: int) -> bool:
@@ -6649,7 +6653,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # لا نستخدم has_active_subscription هنا: السجل القديم الناقص (بلا
         # منتج/باقة) لا يثبت دفعاً، ويجب أن يفتح سؤال الدين.
         # لا نعتمد على bm هنا: أحياناً يمر /link من مسار غير Business.
-        if not has_recorded_active_subscription_for_link(chat_id):
+        if not has_recorded_paid_subscription_for_link(chat_id):
             fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
             context.user_data["pending_link_debt"] = {
                 "customer_chat_id": chat_id,

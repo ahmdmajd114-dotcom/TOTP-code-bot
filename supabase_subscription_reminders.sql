@@ -76,6 +76,14 @@ alter table public.subscription_reminders
 alter table public.subscription_reminders
   alter column duration_months drop not null;
 
+-- دفع ChatGPT يُحفظ أولاً، ثم يتحول إلى active عند /link. القيد القديم
+-- كان يرفض pending_delivery، فيظهر كأنه فشل حفظ التنبيه رغم نجاح الدفعة.
+alter table public.subscription_reminders
+  drop constraint if exists subscription_reminders_status_check;
+alter table public.subscription_reminders
+  add constraint subscription_reminders_status_check
+  check (status in ('active', 'pending_delivery', 'expired', 'cancelled'));
+
 alter table public.subscription_reminders enable row level security;
 revoke all on table public.subscription_reminders from anon, authenticated;
 grant select, insert, update, delete on table public.subscription_reminders to service_role;
