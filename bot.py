@@ -3361,6 +3361,14 @@ def build_debt_product_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def build_debt_main_keyboard() -> InlineKeyboardMarkup:
+    """القائمة الأولى للدين من زر لوحة الأونر."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ تسجيل دين", callback_data="debt_menu_new")],
+        [InlineKeyboardButton("💵 تسديد دين", callback_data="debt_menu_repay")],
+    ])
+
+
 def build_debt_product_list_keyboard() -> InlineKeyboardMarkup:
     """قائمة كل المنتجات ما عدا الاختيار السريع + زر رجوع، لمنتج الدين."""
     rows = [
@@ -7870,12 +7878,35 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
         return
 
+    data = query.data
+    await query.answer()
+
+    if data == "debt_menu_new":
+        sent = await query.edit_message_text("أرسل chat_id تبع الزبون (رقم فقط):")
+        _pending_debt = {
+            "message_id": sent.message_id,
+            "step": "chat_id",
+            "chat_id": None,
+            "customer_line": None,
+            "product": None,
+            "amount": 0,
+            "awaiting_manual_product": False,
+            "awaiting_manual_amount": False,
+        }
+        return
+
+    if data == "debt_menu_repay":
+        await query.edit_message_text(
+            "💵 تسديد دين\n\n"
+            "سجّل دفعة الزبون من صورة التحويل كالمعتاد، وبعد اختيار المنتج وطريقة الدفع "
+            "اضغط زر «💳 تسديد دين» الذي يظهر لك قبل التثبيت."
+        )
+        return
+
     if _pending_debt is None or _pending_debt.get("message_id") != query.message.message_id:
         await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
         return
 
-    data = query.data
-    await query.answer()
     debt = _pending_debt
 
     if data.startswith("debt_product_") and data not in ("debt_product_list", "debt_product_manual"):
@@ -8565,17 +8596,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_DEBT:
-        sent = await message.reply_text("أرسل chat_id تبع الزبون (رقم فقط):")
-        _pending_debt = {
-            "message_id": sent.message_id,
-            "step": "chat_id",
-            "chat_id": None,
-            "customer_line": None,
-            "product": None,
-            "amount": 0,
-            "awaiting_manual_product": False,
-            "awaiting_manual_amount": False,
-        }
+        await message.reply_text("💳 الدين", reply_markup=build_debt_main_keyboard())
         return True
 
     if text == BTN_TEACH:
