@@ -10194,6 +10194,15 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # جاهزة باسمه؛ لا يحتاج ينسخ chat_id أو يخرج لمحادثة البوت.
         if text.strip() == "دين":
             try:
+                # نحذف الاختصار أولاً حتى لا يبقى ظاهراً للزبون ولو تأخر
+                # إرسال بطاقة التفاصيل ثواني قليلة.
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not immediately delete debt shortcut for %s", chat_id)
+            try:
                 await start_debt_for_customer(
                     context, chat_id, customer_name, customer_username,
                 )
@@ -10204,13 +10213,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text=f"⚠️ تعذر فتح تسجيل الدين للزبون ({chat_id}).",
                 )
                 return
-            try:
-                await context.bot.delete_business_messages(
-                    business_connection_id=bm.business_connection_id,
-                    message_ids=[bm.message_id],
-                )
-            except Exception:
-                logger.warning("Started debt flow but could not delete shortcut for %s", chat_id)
             return
         # اختصار المالك: «دفع» أو «طرق الدفع» وحدها تستبدل برسالة فيها
         # الطرق المفعلة حالياً من لوحة التحكم، فلا يحتاج ينسخها كل مرة.
