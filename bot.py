@@ -1614,6 +1614,38 @@ def find_telegram_contact_by_username(username: str | None) -> dict | None:
         return None
 
 
+def find_telegram_chat_id_in_payment_history(username: str | None) -> int | None:
+    """يعثر على chat_id قديم من سجل الدفعات عند فقدانه من جدول التنبيهات.
+
+    هذا مسار إصلاح للسجلات القديمة فقط. المطابقة تكون على اليوزر الكامل
+    بالضبط، لذلك لا نخمن الهوية من الاسم الظاهر للزبون.
+    """
+    handle = (username or "").strip().lstrip("@").lower()
+    if not handle:
+        return None
+    sheet = get_google_sheet()
+    if sheet is None:
+        return None
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to read payment history while recovering Telegram chat id")
+        return None
+    handle_pattern = re.compile(rf"(?<![a-z0-9_])@?{re.escape(handle)}(?![a-z0-9_])", re.IGNORECASE)
+    for row in reversed(rows[1:]):
+        if len(row) < SHEET_COL_CHAT_ID:
+            continue
+        customer_text = row[SHEET_COL_CUSTOMER - 1].strip()
+        chat_id_text = row[SHEET_COL_CHAT_ID - 1].strip()
+        if not handle_pattern.search(customer_text):
+            continue
+        try:
+            return int(chat_id_text)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def resolve_reminder_delivery_target(reminder: dict) -> tuple[int | None, str | None]:
     """يرجع وجهة Telegram للمتابعة ويصلح السجل القديم إذا وجد مطابقة مؤكدة."""
     raw_chat_id = reminder.get("customer_chat_id")
@@ -1647,6 +1679,21 @@ def resolve_reminder_delivery_target(reminder: dict) -> tuple[int | None, str | 
             }).eq("id", reminder["id"]).execute()
         except Exception:
             logger.exception("Failed to backfill chat id for reminder %s", reminder.get("id"))
+        return chat_id, connection_id
+
+    # بعض تفعيلات Telegram القديمة وصلتها الدفعة والـ chat_id للشيت، لكن
+    # لم يُحفظا داخل subscription_reminders. نستعيده من اليوزر المطابق
+    # بالضبط، لا من الاسم، حتى لا نرسل متابعة لشخص آخر.
+    chat_id = find_telegram_chat_id_in_payment_history(reminder.get("customer_username"))
+    if chat_id is not None:
+        connection_id = get_customer_business_connection_id(chat_id)
+        try:
+            supabase.table("subscription_reminders").update({
+                "customer_chat_id": chat_id,
+                "business_connection_id": connection_id,
+            }).eq("id", reminder["id"]).execute()
+        except Exception:
+            logger.exception("Failed to backfill payment-history chat id for reminder %s", reminder.get("id"))
         return chat_id, connection_id
     return None, None
 
@@ -2436,14 +2483,24 @@ def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_expense_photo_confirm_keyboard() -> InlineKeyboardMarkup:
-    """زرين يطلعون تحت صورة أرسلتها أنت (owner) — هل هذي إثبات مصروف؟"""
+def build_compensation_confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تأكيد التعويض وإنهاء الخدمة", callback_data="exp_comp_confirm")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="exp_cancel")],
+    ])
+
+
+def build_expense_photo_confirm_keyboard(can_compensate_customer: bool = False) -> InlineKeyboardMarkup:
+    """زرين يطلعون تحت صورة أرسلتها أنت (owner) — هل هذي إثبات مصروف؟"""
+    rows = [
         [
             InlineKeyboardButton("✅ مصروف", callback_data="expphoto_yes"),
             InlineKeyboardButton("❌ ليس مصروف", callback_data="expphoto_no"),
-        ]
-    ])
+        ],
+    ]
+    if can_compensate_customer:
+        rows.insert(0, [InlineKeyboardButton("💸 تعويض هذا الزبون", callback_data="expphoto_refund")])
+    return InlineKeyboardMarkup(rows)
 
 
 def get_active_catalog_payment_products() -> list[dict]:
@@ -3629,6 +3686,59 @@ def append_expense_row(amount: int, reason: str) -> bool:
     except Exception:
         logger.exception("Failed to append expense row to Google Sheet")
         return False
+
+
+def parse_sheet_amount(value: object) -> int | None:
+    """يتعامل مع مبلغ الشيت سواء كتب كرقم أو مع فواصل."""
+    digits = re.sub(r"[^\d]", "", str(value or ""))
+    try:
+        return int(digits) if digits else None
+    except ValueError:
+        return None
+
+
+def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
+    """يسجل التعويض، يخفض صافي الدفعة، ويلغي الخدمة/متابعة انتهائها."""
+    chat_id = expense.get("customer_chat_id")
+    row_number = expense.get("payment_row_number")
+    original_total = expense.get("original_total")
+    amount = expense.get("amount")
+    if not all(isinstance(value, int) for value in (chat_id, row_number, original_total, amount)):
+        return False, "بيانات التعويض غير مكتملة."
+    if amount <= 0 or amount > original_total:
+        return False, "مبلغ التعويض يجب أن يكون أكبر من صفر ولا يتجاوز الدفعة المسجلة."
+    sheet = get_google_sheet()
+    if sheet is None:
+        return False, "تعذر فتح شيت الدفعات؛ لم يُنفذ التعويض."
+    reason = f"تعويض للزبون {chat_id}: {expense.get('reason') or 'بدون سبب'}"
+    try:
+        # نتحقق من السطر ثانية قبل أي تعديل، حتى لا نطبق التعويض على دفعة تغيرت.
+        rows = sheet.get_all_values()
+        if row_number <= 1 or row_number > len(rows):
+            return False, "دفعة الزبون لم تعد موجودة."
+        row = rows[row_number - 1]
+        if len(row) < SHEET_COL_CHAT_ID or row[SHEET_COL_CHAT_ID - 1].strip() != str(chat_id):
+            return False, "دفعة الزبون تغيرت؛ أعد بدء التعويض."
+        if parse_sheet_amount(row[SHEET_COL_TOTAL - 1]) != original_total:
+            return False, "مبلغ الدفعة تغير؛ أعد بدء التعويض حتى لا ينخصم مرتين."
+        if not append_expense_row(amount, reason):
+            return False, "فشل حفظ التعويض في ورقة المصروفات."
+        sheet.update_cell(row_number, SHEET_COL_TOTAL, original_total - amount)
+        sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")
+        # التعويض ينهي الخدمة الحالية: لا رسالة انتهاء لاحقاً ولا كود/حساب باقٍ.
+        supabase.table("subscription_reminders").update({"status": "cancelled"}).eq(
+            "customer_chat_id", chat_id
+        ).eq("status", "active").execute()
+        supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq(
+            "customer_chat_id", chat_id
+        ).eq("status", "active").execute()
+        supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
+        if expense.get("vault") and not adjust_vault_balance(expense["vault"], -amount):
+            return False, "تم حفظ التعويض لكن تعذر خصمه من الخزنة؛ عدّل الخزنة يدوياً."
+        return True, f"تم تعويض {amount} وإلغاء الخدمة/متابعة الانتهاء. صافي الدفعة صار {original_total - amount}."
+    except Exception:
+        logger.exception("Failed to apply customer compensation")
+        return False, "حدث خطأ أثناء تنفيذ التعويض؛ راجع الشيت والخزنة قبل إعادة المحاولة."
 
 
 def get_vault_balances() -> dict[str, int] | None:
@@ -5647,7 +5757,7 @@ async def retry_expired_reminders_missing_chat(
             .eq("status", "expired").is_("customer_chat_id", "null")
             # هذه كانت الحالة الخاطئة في النسخ السابقة: وُضع السجل كأنه
             # ينتظر رداً رغم أن الرسالة لم تُرسل.
-            .eq("feedback_status", "awaiting_reply")
+            .in_("feedback_status", ["awaiting_reply", "delivery_missing_chat"])
             .execute().data or []
         )
     except Exception:
@@ -6612,18 +6722,26 @@ async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAU
 
     file_id = photo[-1].file_id  # أعلى دقة متوفرة
 
+    bm = update.business_message or update.edited_business_message
+    customer_chat_id = None
+    if bm is not None and bm.chat.id != OWNER_USER_ID:
+        customer_chat_id = bm.chat.id
     try:
         sent = await context.bot.send_photo(
             chat_id=OWNER_USER_ID,
             photo=file_id,
-            caption="هل هذي إثبات مصروف؟",
-            reply_markup=build_expense_photo_confirm_keyboard(),
+            caption=("هل هذي إثبات مصروف؟" if customer_chat_id is None
+                     else "هل هذي إثبات مصروف أو تعويض لهذا الزبون؟"),
+            reply_markup=build_expense_photo_confirm_keyboard(customer_chat_id is not None),
         )
     except Exception:
         logger.exception("Failed to forward owner expense photo")
         return
 
-    _pending_expense_photo_confirm[sent.message_id] = {"file_id": file_id}
+    _pending_expense_photo_confirm[sent.message_id] = {
+        "file_id": file_id,
+        "customer_chat_id": customer_chat_id,
+    }
     archive_photo_rate_limit_marker(OWNER_USER_ID, "owner")
 
 
@@ -7422,6 +7540,36 @@ async def handle_expense_photo_callback(update: Update, context: ContextTypes.DE
             logger.exception("Failed to delete non-expense owner photo")
         return
 
+    if data == "expphoto_refund":
+        chat_id = pending.get("customer_chat_id")
+        payment = get_latest_customer_payment(chat_id) if chat_id is not None else None
+        if payment is None:
+            await query.edit_message_caption(
+                caption="⚠️ ما لكيت دفعة فعّالة لهذا الزبون، لذلك ما انطبق أي تعويض.",
+                reply_markup=None,
+            )
+            return
+        row_number, row = payment
+        original_total = parse_sheet_amount(row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None)
+        if not original_total:
+            await query.edit_message_caption(
+                caption="⚠️ مبلغ الدفعة غير صالح، ما انطبق أي تعويض.", reply_markup=None,
+            )
+            return
+        _pending_expense = {
+            "message_id": message_id, "amount": 0, "vault": None, "reason": None,
+            "photo_file_id": pending["file_id"], "awaiting_manual_amount": False,
+            "awaiting_manual_reason": False, "kind": "customer_compensation",
+            "customer_chat_id": chat_id, "payment_row_number": row_number,
+            "original_total": original_total,
+        }
+        await query.edit_message_caption(
+            caption=(f"💸 تعويض زبون\nالزبون: {chat_id}\nالدفعة الحالية: {original_total}\n\n"
+                     "اختَر مبلغ التعويض. عند الإكمال ستنتهي خدمته وتُلغى متابعة الانتهاء."),
+            reply_markup=build_expense_amount_keyboard(),
+        )
+        return
+
     # expphoto_yes — نبدأ فلو تسجيل مصروف عادي، بس نعدل caption الصورة
     # نفسها بدل ما نرسل رسالة نصية منفصلة
     _pending_expense = {
@@ -7471,6 +7619,24 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     expense = _pending_expense
 
+    if data == "exp_cancel":
+        await edit_expense_message(query, expense, "تم إلغاء العملية بدون أي تغيير.", None)
+        _pending_expense = None
+        return
+
+    if data == "exp_comp_confirm":
+        if expense.get("kind") != "customer_compensation":
+            await query.answer("هذا التأكيد غير صالح.", show_alert=True)
+            return
+        saved, result = apply_customer_compensation(expense)
+        if saved:
+            await send_expense_notification(context, {
+                **expense, "reason": f"تعويض زبون {expense['customer_chat_id']}: {expense.get('reason') or '—'}",
+            })
+        await edit_expense_message(query, expense, f"💸 تعويض زبون\n\n{'✅' if saved else '⚠️'} {result}", None)
+        _pending_expense = None
+        return
+
     if data == "exp_amount_add_small":
         expense["amount"] = expense.get("amount", 0) + PAYMENT_AMOUNT_STEP_SMALL
         await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_amount_keyboard())
@@ -7495,6 +7661,9 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         if not expense.get("amount"):
             await query.answer("لازم تحدد مبلغ أكبر من صفر أول.", show_alert=True)
             return
+        if expense.get("kind") == "customer_compensation" and expense["amount"] > expense["original_total"]:
+            await query.answer("مبلغ التعويض أكبر من الدفعة المسجلة.", show_alert=True)
+            return
         await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_vault_keyboard())
         return
 
@@ -7507,6 +7676,15 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("exp_reason_") and data not in ("exp_reason_list", "exp_reason_manual"):
         reason = data[len("exp_reason_"):]
         expense["reason"] = reason
+        if expense.get("kind") == "customer_compensation":
+            await edit_expense_message(
+                query, expense,
+                (f"💸 تأكيد التعويض\nالزبون: {expense['customer_chat_id']}\n"
+                 f"المبلغ: {expense['amount']}\nالخزنة: {expense.get('vault') or '—'}\n"
+                 f"السبب: {reason}\n\nسيُنقص صافي الدفعة وتُلغى الخدمة والمتابعة."),
+                build_compensation_confirmation_keyboard(),
+            )
+            return
         saved = append_expense_row(expense["amount"], reason)
         if saved and expense.get("vault"):
             adjust_vault_balance(expense["vault"], -expense["amount"])
@@ -7825,6 +8003,18 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
 
         expense["reason"] = reason
         expense["awaiting_manual_reason"] = False
+        if expense.get("kind") == "customer_compensation":
+            try:
+                await edit_expense_message_by_bot(
+                    context, expense,
+                    (f"💸 تأكيد التعويض\nالزبون: {expense['customer_chat_id']}\n"
+                     f"المبلغ: {expense['amount']}\nالخزنة: {expense.get('vault') or '—'}\n"
+                     f"السبب: {reason}\n\nسيُنقص صافي الدفعة وتُلغى الخدمة والمتابعة."),
+                    build_compensation_confirmation_keyboard(),
+                )
+            except Exception:
+                logger.exception("Failed to show compensation confirmation after manual reason")
+            return True
         saved = append_expense_row(expense["amount"], reason)
         if saved and expense.get("vault"):
             adjust_vault_balance(expense["vault"], -expense["amount"])
@@ -9246,6 +9436,32 @@ def is_greeting_only_message(text: str) -> bool:
     return normalized in greeting_phrases
 
 
+def catalog_category_has_active_customer_offer(category: str) -> bool:
+    """هل هذا المنتج قابل فعلاً للإرسال للزبون الآن؟"""
+    product_id = catalog_product_id(category)
+    if not product_id:
+        return False
+    product = get_catalog_product(product_id)
+    if not product or not product.get("is_active"):
+        return False
+    return bool(format_customer_catalog_reply(product, get_catalog_plans(product_id)))
+
+
+def is_greeting_with_only_unavailable_catalog_request(categories: list[str]) -> bool:
+    """لا نرد بالتحية إذا كان الطلب الوحيد على باقة/منتج متوقف.
+
+    بهذه الحالة صاحب المحادثة هو من يختار الرد، بدل ما تبدو التحية كأنها
+    تأكيد أن المنتج متاح.
+    """
+    catalog_categories = [category for category in categories if catalog_product_id(category)]
+    if not catalog_categories:
+        return False
+    if any(catalog_category_has_active_customer_offer(category) for category in catalog_categories):
+        return False
+    allowed_non_reply_categories = {"سلام", "ترحيب", "شكر", *catalog_categories}
+    return all(category in allowed_non_reply_categories for category in categories)
+
+
 def seconds_until_customer_replies_allowed(now: datetime | None = None) -> float:
     """يرجع ثواني الانتظار إذا كانت الساعة ضمن فترة الهدوء، وإلا صفر."""
     baghdad = timezone(timedelta(hours=3))
@@ -9682,6 +9898,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         and categories
         and set(categories).issubset({"سلام", "ترحيب"})
     ):
+        categories = []
+    # «السلام عليكم، أريد جات» لا تستحق رد سلام إذا كانت باقات جات كلها
+    # موقوفة (أو المنتج نفسه متوقف). لا نريد أن تبدو التحية كأن البوت قبل
+    # الطلب؛ نترك المحادثة كاملة للأونر في هذه الحالة.
+    if is_greeting_with_only_unavailable_catalog_request(categories):
         categories = []
     # نحافظ على تحية واحدة قبل الطلب الحقيقي؛ الشكر العرضي وحده يُحذف.
     # رد السلام واجب ولا يجوز أن تسقطه أولوية المنتج.
