@@ -10428,9 +10428,10 @@ def main() -> None:
     else:
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
-        # مرة عند التشغيل ثم يومياً: يحجز المتابعات التي فاتت قبل إضافة
-        # ميزة الجدولة، مع اعتماد وقت /link المحفوظ.
-        app.job_queue.run_repeating(backfill_linked_chatgpt_schedules, interval=24 * 60 * 60, first=30)
+        # مرة عند التشغيل ثم كل 15 دقيقة إلى أن تنتهي الربطات القديمة.
+        # بعدها لا يفعل شيئاً إلا إن ظهرت ربطات بلا جدول، وهذا يسمح بالتعافي
+        # من حد Telegram المؤقت من دون ترك الزبائن بلا متابعة ليوم كامل.
+        app.job_queue.run_repeating(backfill_linked_chatgpt_schedules, interval=15 * 60, first=30)
 
     # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
     # Telegram Business، وهي أساس عمل البوت
