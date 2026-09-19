@@ -2837,6 +2837,15 @@ def build_link_debt_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def build_link_delivery_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
+    """يحدد الأونر معنى تسليم حساب ChatGPT قبل إنشاء أو تفعيل أي مدة."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 اشتراك جديد", callback_data=f"linkdelivery_new_{customer_chat_id}")],
+        [InlineKeyboardButton("💸 تعويض", callback_data=f"linkdelivery_comp_{customer_chat_id}")],
+        [InlineKeyboardButton("💳 دين", callback_data=f"linkdelivery_debt_{customer_chat_id}")],
+    ])
+
+
 def get_active_link_debt_catalog_plans() -> list[tuple[dict, dict]]:
     """باقات ChatGPT الفعالة ذات المدة، من كاتالوج الأونر فقط."""
     options = []
@@ -3166,31 +3175,33 @@ SUBSCRIPTION_FEEDBACK_TEXT = (
 )
 
 
-async def schedule_subscription_feedback(state: dict) -> None:
+async def schedule_subscription_feedback(state: dict) -> bool:
     """يحجز المتابعة الآن من حساب الأونر، حتى لا يصطدم بقيد Business لاحقاً."""
     if not personal_scheduler_is_configured():
-        return
+        return False
     chat_id = state.get("customer_chat_id")
     duration_days = (
         1 if state.get("reminder_disabled")
         else state.get("duration_days") or (30 * state.get("duration_months", 0))
     )
     if not chat_id or not duration_days:
-        return
+        return False
     try:
         row = (supabase.table("subscription_reminders").select("id, expires_at")
                .eq("customer_chat_id", chat_id).eq("status", "active")
                .order("created_at", desc=True).limit(1).execute().data or [])
         if not row:
-            return
+            return False
         expires_at = datetime.fromisoformat(row[0]["expires_at"].replace("Z", "+00:00"))
         message_id = await schedule_personal_message(int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at)
         supabase.table("subscription_reminders").update({
             "scheduled_message_id": message_id,
             "scheduled_message_status": "scheduled",
         }).eq("id", row[0]["id"]).execute()
+        return True
     except Exception:
         logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
+        return False
 
 
 async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6828,16 +6839,6 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         ).execute()
         authorize_recently_linked_customer_code(chat_id)
 
-        # دفع ChatGPT لا يبدأ منه العد. يبدأ الآن، عند إرسال الحساب فعلياً
-        # بهذا الـ /link، ثم تُحجز رسالة المتابعة لتاريخ انتهائه الجديد.
-        activated_subscription = activate_pending_chatgpt_subscription_on_delivery(chat_id)
-        if activated_subscription is None:
-            # إصلاح تلقائي لدفعة سابقة نجحت بالشيت لكن رفضها قيد قاعدة
-            # البيانات القديم قبل أن يحفظ سطر التنبيه.
-            activated_subscription = recover_paid_chatgpt_subscription_on_delivery(chat_id)
-        if activated_subscription:
-            await schedule_subscription_feedback(activated_subscription)
-
         # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
         # بطلب الكود تلقائياً. الحسابات المشتركة تبقى على مسارها المعتاد.
         state = get_interactive_sale_state(chat_id)
@@ -6856,28 +6857,21 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
             text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
-                  f"chat_id للتنبيه اليدوي: {chat_id}"),
+                  "حدد نوع التسليم حتى تنحسب المدة صح:"),
+            reply_markup=build_link_delivery_keyboard(chat_id),
         )
-        # إذا كان دافع مسبقاً وباقته مسجلة، الربط يكفي ولا نسألك عن الدين.
-        # لا نستخدم has_active_subscription هنا: السجل القديم الناقص (بلا
-        # منتج/باقة) لا يثبت دفعاً، ويجب أن يفتح سؤال الدين.
-        # لا نعتمد على bm هنا: أحياناً يمر /link من مسار غير Business.
-        if not has_recorded_paid_subscription_for_link(chat_id):
-            fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
-            context.user_data["pending_link_debt"] = {
-                "customer_chat_id": chat_id,
-                "customer_name": (
-                    bm.chat.full_name or bm.chat.first_name or "غير معروف"
-                    if bm is not None else fallback_name
-                ),
-                "customer_username": bm.chat.username if bm is not None else fallback_username,
-                "account_label": label or link_code,
-            }
-            await context.bot.send_message(
-                chat_id=OWNER_USER_ID,
-                text="هل هذا الزبون دين؟",
-                reply_markup=build_link_debt_keyboard(chat_id),
-            )
+        # لا نبدأ العداد هنا: الأونر يحدد أولاً هل هذا اشتراك جديد،
+        # تعويض، أو دين. هذا يمنع تحويل التعويض إلى مدة قديمة بالخطأ.
+        fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
+        context.user_data["pending_link_delivery"] = {
+            "customer_chat_id": chat_id,
+            "customer_name": (
+                bm.chat.full_name or bm.chat.first_name or "غير معروف"
+                if bm is not None else fallback_name
+            ),
+            "customer_username": bm.chat.username if bm is not None else fallback_username,
+            "account_label": label or link_code,
+        }
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
             customer_username_for_topic = bm.chat.username if bm is not None else None
@@ -7690,7 +7684,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يكمل سؤال الدين الذي يظهر مباشرة بعد /link."""
+    """يكمل تحديد نوع تسليم حساب ChatGPT، ثم مسار الدين عند الحاجة."""
     query = update.callback_query
     if query is None or query.from_user.id != OWNER_USER_ID:
         return
@@ -7698,11 +7692,14 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
     data = query.data or ""
     debt_match = re.fullmatch(r"linkdebt_(yes|no)(?:_(-?\d+))?", data)
     plan_match = re.fullmatch(r"linkplan_(.+)_(-?\d+)", data)
-    if not debt_match and not plan_match:
+    delivery_match = re.fullmatch(r"linkdelivery_(new|comp|debt)_(-?\d+)", data)
+    if not debt_match and not plan_match and not delivery_match:
         return
 
-    stored_state = context.user_data.get("pending_link_debt") or {}
-    chat_id_text = (debt_match or plan_match).group(2)
+    stored_state = context.user_data.get(
+        "pending_link_delivery" if delivery_match else "pending_link_debt"
+    ) or {}
+    chat_id_text = (delivery_match or debt_match or plan_match).group(2)
     try:
         customer_chat_id = int(chat_id_text) if chat_id_text else int(stored_state["customer_chat_id"])
     except (KeyError, TypeError, ValueError):
@@ -7717,6 +7714,43 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         "customer_name": stored_state.get("customer_name") if same_pending_customer else customer_name,
         "customer_username": stored_state.get("customer_username") if same_pending_customer else customer_username,
     }
+
+    if delivery_match:
+        choice = delivery_match.group(1)
+        if choice == "debt":
+            context.user_data.pop("pending_link_delivery", None)
+            context.user_data["pending_link_debt"] = state
+            await query.edit_message_text("هل هذا الزبون دين؟", reply_markup=build_link_debt_keyboard(customer_chat_id))
+            return
+        if choice == "comp":
+            context.user_data.pop("pending_link_delivery", None)
+            context.user_data["pending_link_compensation"] = state
+            await query.edit_message_text(
+                "💸 هذا تعويض. اكتب مدة التعويض بالأيام فقط، مثلاً: 30\n"
+                "ينحفظ له تنبيه مستقل من وقت تسليم الحساب، ولا نلمس التذكيرات القديمة.",
+                reply_markup=None,
+            )
+            return
+
+        # اشتراك جديد: نفعّل الدفعة المسجلة سابقاً فقط عند التسليم الفعلي.
+        activated = activate_pending_chatgpt_subscription_on_delivery(customer_chat_id)
+        if activated is None:
+            activated = recover_paid_chatgpt_subscription_on_delivery(customer_chat_id)
+        if activated is None:
+            await query.edit_message_text(
+                "⚠️ ما لكيت دفعة ChatGPT غير مفعلة لهذا الزبون. "
+                "سجّل الدفع أولاً، أو اختَر «تعويض» إذا هي مدة تعويض."
+            )
+            return
+        scheduled = await schedule_subscription_feedback(activated)
+        context.user_data.pop("pending_link_delivery", None)
+        end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
+        schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+        await query.edit_message_text(
+            f"✅ تم تفعيل الاشتراك الجديد لمدة {activated['duration_days']} يوم.\n"
+            f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
+        )
+        return
 
     if debt_match and debt_match.group(1) == "no":
         context.user_data.pop("pending_link_debt", None)
@@ -7781,6 +7815,40 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         f"الكود متاح للزبون من هسه.\n"
         + ("🔔 متابعة الرضا راح تنرسل " + duration_text if is_permanent else f"ينتهي الاشتراك: {duration_text}")
     )
+
+
+async def handle_link_compensation_duration_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يسجل تعويض ChatGPT بمدة يكتبها الأونر من دون الحاجة للرد على الرسالة."""
+    message = update.message
+    state = context.user_data.get("pending_link_compensation")
+    if state is None or message is None or not message.text:
+        return False
+    duration_days = duration_to_days(message.text.strip())
+    if duration_days is None or duration_days <= 0:
+        await message.reply_text("اكتب مدة التعويض بالأيام، مثلاً: 30")
+        return True
+    reminder_state = {
+        **state,
+        "product": CHATGPT_PRODUCT_NAME,
+        "plan_name": "تعويض",
+        "plan_duration": f"{duration_days} يوم",
+        "duration_days": duration_days,
+        "subscription_type": "shared",
+        "reminder_disabled": False,
+    }
+    saved = save_subscription_reminder(reminder_state)
+    if not saved:
+        await message.reply_text("⚠️ تم الربط، لكن فشل حفظ مدة التعويض.")
+        return True
+    scheduled = await schedule_subscription_feedback(reminder_state)
+    context.user_data.pop("pending_link_compensation", None)
+    end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=duration_days)
+    schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+    await message.reply_text(
+        f"✅ تم تسجيل تعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
+        f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
+    )
+    return True
 
 
 async def handle_manual_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9454,6 +9522,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
         return
     if await handle_manual_subscription_input(update, context):
         return
+    if await handle_link_compensation_duration_input(update, context):
+        return
     if await handle_personal_reminder_input(update, context):
         return
     if await handle_manual_product_entry(update, context):
@@ -10969,7 +11039,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_personal_reminder_callback, pattern=r"^personal_reminder_ack_"))
 
     # سؤال الدين والباقته بعد ربط زبون بحساب /link.
-    app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan)_"))
+    app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan|delivery)_"))
 
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
