@@ -10725,6 +10725,19 @@ def format_public_catalog_duration(duration: str | None) -> str:
     return value
 
 
+def format_public_catalog_price(price: object) -> str:
+    """Compact Iraqi-dinar price for the public customer catalog."""
+    try:
+        amount = int(price or 0)
+    except (TypeError, ValueError):
+        return str(price or "—")
+    if amount >= 1000:
+        thousands = amount / 1000
+        shown = str(int(thousands)) if thousands.is_integer() else f"{thousands:g}"
+        return f"{shown} الف د.ع"
+    return f"{amount} د.ع"
+
+
 def build_public_catalog_html() -> str:
     """Render the public MedBox catalog from the active control-panel catalog."""
     try:
@@ -10748,7 +10761,7 @@ def build_public_catalog_html() -> str:
             "<div class=\"plan\">"
             f"<div><strong>{escape(str(plan.get('name') or 'باقة'))}</strong>"
             f"<span>المدة: {escape(format_public_catalog_duration(plan.get('duration')))}</span></div>"
-            f"<b>{int(plan.get('price') or 0):,} <small>د.ع</small></b>"
+            f"<b>{escape(format_public_catalog_price(plan.get('price')))}</b>"
             "</div>"
             for plan in plans
         ) or "<p class=\"empty\">لا توجد باقات متاحة حالياً.</p>"
