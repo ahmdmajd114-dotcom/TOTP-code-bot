@@ -2996,7 +2996,10 @@ async def schedule_subscription_feedback(state: dict) -> None:
     if not personal_scheduler_is_configured():
         return
     chat_id = state.get("customer_chat_id")
-    duration_days = state.get("duration_days") or (30 * state.get("duration_months", 0))
+    duration_days = (
+        1 if state.get("reminder_disabled")
+        else state.get("duration_days") or (30 * state.get("duration_months", 0))
+    )
     if not chat_id or not duration_days:
         return
     try:
