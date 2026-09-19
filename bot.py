@@ -6251,6 +6251,53 @@ def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
     return is_chatgpt_product_name(product)
 
 
+def recover_paid_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
+    """يعيد إنشاء تنبيه باقة فات حفظه بعد دفعة ChatGPT ناجحة.
+
+    لا نخمن الباقة: نسترجعها فقط حين يطابق مجموع الدفعة باقة ChatGPT فعالة
+    واحدة في الكاتالوج. الاستدعاء يحصل بعد /link، لذلك يبدأ العد من التسليم.
+    """
+    payment = get_latest_customer_payment(chat_id)
+    if payment is None:
+        return None
+    _row_number, row = payment
+    product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
+    if not is_chatgpt_product_name(product):
+        return None
+    total = parse_sheet_amount(row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None)
+    if total <= 0:
+        return None
+
+    candidates: list[tuple[dict, dict, int, bool]] = []
+    for catalog_product in get_catalog_products():
+        if not catalog_product.get("is_active") or not is_chatgpt_product(catalog_product):
+            continue
+        for plan in get_catalog_plans(catalog_product["id"]):
+            if not plan.get("is_active") or int(plan.get("price") or 0) != total:
+                continue
+            permanent = is_permanent_duration(plan.get("duration"))
+            duration_days = 1 if permanent else duration_to_days(plan.get("duration"))
+            if duration_days:
+                candidates.append((catalog_product, plan, duration_days, permanent))
+    if len(candidates) != 1:
+        return None
+
+    catalog_product, plan, duration_days, permanent = candidates[0]
+    customer_name, customer_username = get_telegram_customer_identity(chat_id)
+    state = {
+        "customer_chat_id": chat_id,
+        "customer_name": customer_name,
+        "customer_username": customer_username,
+        "product": catalog_product["name"],
+        "plan_id": plan["id"],
+        "plan_name": plan["name"],
+        "plan_duration": plan.get("duration"),
+        "duration_days": duration_days,
+        "reminder_disabled": permanent,
+    }
+    return state if save_subscription_reminder(state) else None
+
+
 def has_fulfilled_service_context(chat_id: int) -> bool:
     """هل استلم الزبون خدمة فعلية؟ تُستخدم فقط لاختيار صيغة رد الشكر."""
     if has_active_subscription(chat_id) or is_private_totp_account(chat_id):
@@ -6626,6 +6673,10 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # دفع ChatGPT لا يبدأ منه العد. يبدأ الآن، عند إرسال الحساب فعلياً
         # بهذا الـ /link، ثم تُحجز رسالة المتابعة لتاريخ انتهائه الجديد.
         activated_subscription = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+        if activated_subscription is None:
+            # إصلاح تلقائي لدفعة سابقة نجحت بالشيت لكن رفضها قيد قاعدة
+            # البيانات القديم قبل أن يحفظ سطر التنبيه.
+            activated_subscription = recover_paid_chatgpt_subscription_on_delivery(chat_id)
         if activated_subscription:
             await schedule_subscription_feedback(activated_subscription)
 
