@@ -6074,6 +6074,33 @@ def has_active_subscription(chat_id: int) -> bool:
         return False
 
 
+def has_recorded_active_subscription_for_link(chat_id: int) -> bool:
+    """هل توجد باقة فعلية مسجلة لهذا العميل عند ربط حساب ChatGPT؟
+
+    بعض السجلات القديمة كانت تُنشأ كتذكير فقط، بلا منتج أو باقة أو دفعة.
+    لا يجوز أن تعتبر هذه السجلات تسديداً وأن تمنع سؤال «هل هذا دين؟».
+    """
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("product_name, plan_name")
+            .eq("customer_chat_id", chat_id)
+            .eq("status", "active")
+            .gt("expires_at", datetime.now(timezone.utc).isoformat())
+            .limit(20)
+            .execute().data or []
+        )
+        return any(
+            str(row.get("product_name") or "").strip()
+            or str(row.get("plan_name") or "").strip()
+            for row in rows
+        )
+    except Exception:
+        # لا نمنع تسجيل الدين عند تعذّر التحقق؛ السؤال هو المسار الآمن هنا.
+        logger.exception("Failed to check recorded subscription for account link %s", chat_id)
+        return False
+
+
 def has_fulfilled_service_context(chat_id: int) -> bool:
     """هل استلم الزبون خدمة فعلية؟ تُستخدم فقط لاختيار صيغة رد الشكر."""
     if has_active_subscription(chat_id) or is_private_totp_account(chat_id):
@@ -6467,9 +6494,10 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                   f"chat_id للتنبيه اليدوي: {chat_id}"),
         )
         # إذا كان دافع مسبقاً وباقته مسجلة، الربط يكفي ولا نسألك عن الدين.
-        # سؤال الدين مخصص فقط للزبون الذي لا يملك اشتراكاً فعّالاً مسجلاً.
+        # لا نستخدم has_active_subscription هنا: السجل القديم الناقص (بلا
+        # منتج/باقة) لا يثبت دفعاً، ويجب أن يفتح سؤال الدين.
         # لا نعتمد على bm هنا: أحياناً يمر /link من مسار غير Business.
-        if not has_active_subscription(chat_id):
+        if not has_recorded_active_subscription_for_link(chat_id):
             fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
             context.user_data["pending_link_debt"] = {
                 "customer_chat_id": chat_id,
