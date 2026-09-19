@@ -10359,6 +10359,52 @@ def cancel_pending_customer_text_batch(chat_id: int) -> None:
         task.cancel()
 
 
+def get_latest_archived_customer_text(chat_id: int) -> str:
+    """آخر كلام نصي للزبون، حتى تعمل اختصارات س/ع بلا Reply يدوي."""
+    try:
+        rows = (
+            supabase.table("conversation_archive")
+            .select("message_text")
+            .eq("customer_chat_id", chat_id).eq("sender_type", "customer")
+            .not_.is_("message_text", "null")
+            .order("created_at", desc=True).limit(1).execute().data or []
+        )
+        return str(rows[0].get("message_text") or "") if rows else ""
+    except Exception:
+        logger.exception("Failed to read latest customer text for %s", chat_id)
+        return ""
+
+
+async def send_owner_conversation_shortcut(context, bm, shortcut: str) -> bool:
+    """يرسل اختصاري س للتحية وع للشكر، ثم يحذف حرف الاختصار من المحادثة."""
+    chat_id = bm.chat.id
+    if shortcut == "س":
+        greeting = infer_greeting_category(get_latest_archived_customer_text(chat_id))
+        reply = "وعليكم السلام ورحمة الله وبركاته" if greeting == "سلام" else "أهلاً وسهلاً"
+    elif shortcut == "ع":
+        reply = contextual_thanks_reply(has_fulfilled_service_context(chat_id))
+    else:
+        return False
+    try:
+        await context.bot.send_message(
+            business_connection_id=bm.business_connection_id,
+            chat_id=chat_id,
+            text=reply,
+        )
+        await context.bot.delete_business_messages(
+            business_connection_id=bm.business_connection_id,
+            message_ids=[bm.message_id],
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to send owner shortcut %s for %s", shortcut, chat_id)
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=f"⚠️ تعذر تنفيذ اختصار «{shortcut}» للزبون ({chat_id}).",
+        )
+        return True
+
+
 async def _deliver_customer_text_batch(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -10377,11 +10423,23 @@ async def _deliver_customer_text_batch(
             return
         greeting_only = is_greeting_only_message(combined_text)
         # من 12:30 إلى 07:00 ما نرسل أي رد تلقائي، لا تحية ولا كود ولا
-        # باقات. نجمع كلام الزبون ونستأنف نفس المعالجة عند السابعة.
+        # باقات. عند السابعة تبقى الرسائل لك حتى ترد عليها بنفسك؛ البوت
+        # يرجع يرد فقط على الرسائل الجديدة بعد ذلك.
         quiet_wait = seconds_until_customer_replies_allowed()
         if quiet_wait:
             logger.info("Holding customer reply until 07:00 Baghdad for chat_id=%s", chat_id)
             await asyncio.sleep(quiet_wait)
+            _pending_customer_text_batches.pop(chat_id, None)
+            bm = update.business_message or update.edited_business_message
+            if bm:
+                archive_message(
+                    chat_id,
+                    bm.chat.full_name or bm.chat.first_name or "غير معروف",
+                    bm.chat.username,
+                    sender_type="customer",
+                    message_text=combined_text,
+                )
+            return
         _pending_customer_text_batches.pop(chat_id, None)
         ready_key = (chat_id, message_id)
         _ready_customer_texts[ready_key] = combined_text
@@ -10580,6 +10638,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         cancel_pending_customer_text_batch(chat_id)
+        # اختصارات يدوية س/ع: تتعرف على آخر رسالة زبون بلا حاجة للرد عليها.
+        if text.strip() in {"س", "ع"}:
+            await send_owner_conversation_shortcut(context, bm, text.strip())
+            return
         # اختصار الأونر «دين» داخل نفس محادثة الزبون يفتح بطاقة دين
         # جاهزة باسمه؛ لا يحتاج ينسخ chat_id أو يخرج لمحادثة البوت.
         if text.strip() == "دين":
