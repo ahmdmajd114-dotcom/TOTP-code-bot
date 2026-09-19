@@ -1531,11 +1531,11 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
         elif state["step"] == "plan_data":
             parts = [part.strip() for part in text.split("|", 3)]
             duration = parts[2] if len(parts) > 2 else ""
-            valid_duration = bool(re.fullmatch(r"[1-9]\d*", duration)) or is_permanent_duration(duration)
+            valid_duration = duration_to_days(duration) is not None or is_permanent_duration(duration)
             if len(parts) < 3 or not parts[0] or not parts[1].isdigit() or not valid_duration:
                 await message.reply_text(
-                    "الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | عدد الأيام | وصف\n"
-                    "مثال: شهر خاص | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم."
+                    "الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | المدة | وصف\n"
+                    "أمثلة للمدة: 30، 30 يوم، شهر، سنة، أو دائم."
                 )
                 return True
             payload = {"product_id": state["product_id"], "name": parts[0], "price": int(parts[1]), "duration": duration, "description": parts[3] if len(parts) > 3 else None}
@@ -2638,16 +2638,18 @@ def build_ambos_duration_keyboard() -> InlineKeyboardMarkup:
 
 
 def duration_to_days(duration: str | None) -> int | None:
-    """يحوّل مدة الكاتالوج إلى أيام؛ الإدخال الجديد رقم إنكليزي فقط."""
-    raw = str(duration or "").strip()
+    """يحوّل مدّة الكاتالوج المكتوبة بالأرقام أو الكلمات الشائعة إلى أيام."""
+    raw = str(duration or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
     if re.fullmatch(r"[1-9]\d*", raw):
         return int(raw)
 
-    # توافق مؤقت مع الباقات القديمة التي كانت تحفظ "شهر" أو "30 يوم".
-    text = normalize_style_text(duration or "")
+    text = normalize_style_text(raw)
     joined = " ".join(text)
-    if any(word in text for word in {"سنه", "سنة", "عام", "سنه"}):
+    if any(word in text for word in {"سنه", "عام", "سنه"}):
         return 365
+    if "اسبوع" in text or "اسابيع" in text:
+        match = re.search(r"(\d+)", joined)
+        return int(match.group(1)) * 7 if match else 7
     match = re.search(r"(\d+)\s*(?:شهر|اشهر|أشهر)", joined)
     if match:
         return int(match.group(1)) * 30
@@ -2656,13 +2658,29 @@ def duration_to_days(duration: str | None) -> int | None:
     if "شهر" in text:
         return 30
     match = re.search(r"(\d+)\s*(?:يوم|ايام|أيام)", joined)
-    return int(match.group(1)) if match else None
+    if match:
+        return int(match.group(1))
+    if "يومين" in text:
+        return 2
+    # ألفاظ عراقية/عربية شائعة لمدد قصيرة بلا أرقام إنكليزية.
+    day_words = {
+        "واحد": 1, "واحده": 1, "ثنين": 2, "اثنين": 2,
+        "ثلاثه": 3, "ثلاث": 3, "اربعه": 4, "خمس": 5,
+        "سته": 6, "سبعه": 7, "ثمانيه": 8, "تسعه": 9,
+        "عشره": 10, "ثلاثين": 30,
+    }
+    if "يوم" in text or "ايام" in text:
+        for word, days in day_words.items():
+            if word in text:
+                return days
+        return 1
+    return None
 
 
 def is_permanent_duration(duration: str | None) -> bool:
     """هل الباقة دائمة؟ الدائم له متابعة رضا بعد يوم، لا تاريخ انتهاء."""
     normalized = normalize_arabic_text(duration or "")
-    return any(term in normalized for term in ("دائم", "دائمي", "مدى الحياه", "مدي الحياه"))
+    return any(term in normalized for term in ("دائم", "دائمي", "دائمه", "دايمه", "مدى الحياه", "مدي الحياه"))
 
 
 def catalog_product_for_payment_name(name: str) -> dict | None:
