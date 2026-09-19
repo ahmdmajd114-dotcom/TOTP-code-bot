@@ -3095,6 +3095,67 @@ async def schedule_subscription_feedback(state: dict) -> None:
         logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
 
 
+async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يصلح ربطات ChatGPT القديمة التي سبقت ميزة الجدولة.
+
+    نأخذ ``linked_at`` من رابط الحساب نفسه، لا وقت الدفع، ولا نلمس إلا أحدث
+    اشتراك فعّال لكل زبون لم تُحجز له رسالة من قبل.
+    """
+    if not personal_scheduler_is_configured():
+        return
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select(
+                "id, customer_chat_id, product_name, duration_days, feedback_only, "
+                "scheduled_message_status, created_at"
+            )
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .limit(1000)
+            .execute().data or []
+        )
+        processed_chat_ids: set[int] = set()
+        now = datetime.now(timezone.utc)
+        for reminder in rows:
+            chat_id = reminder.get("customer_chat_id")
+            if (
+                not chat_id
+                or int(chat_id) in processed_chat_ids
+                or not is_chatgpt_product_name(reminder.get("product_name"))
+            ):
+                continue
+            processed_chat_ids.add(int(chat_id))
+            if reminder.get("scheduled_message_status") not in {None, "none", "failed"}:
+                continue
+            duration_days = 1 if reminder.get("feedback_only") else int(reminder.get("duration_days") or 0)
+            if duration_days <= 0:
+                continue
+            links = (
+                supabase.table("totp_links").select("linked_at")
+                .eq("chat_id", int(chat_id)).limit(1).execute().data or []
+            )
+            if not links or not links[0].get("linked_at"):
+                continue
+            linked_at = datetime.fromisoformat(str(links[0]["linked_at"]).replace("Z", "+00:00"))
+            expires_at = linked_at + timedelta(days=duration_days)
+            if expires_at <= now:
+                continue
+            supabase.table("subscription_reminders").update({
+                "started_at": linked_at.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }).eq("id", reminder["id"]).execute()
+            message_id = await schedule_personal_message(
+                int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at,
+            )
+            supabase.table("subscription_reminders").update({
+                "scheduled_message_id": message_id,
+                "scheduled_message_status": "scheduled",
+            }).eq("id", reminder["id"]).execute()
+    except Exception:
+        logger.exception("Failed to backfill scheduled ChatGPT feedback")
+
+
 def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
     """يبدأ عدّ اشتراك ChatGPT عند إرسال الحساب فعلياً عبر /link."""
     try:
@@ -10341,6 +10402,9 @@ def main() -> None:
     else:
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
+        # مرة عند التشغيل ثم يومياً: يحجز المتابعات التي فاتت قبل إضافة
+        # ميزة الجدولة، مع اعتماد وقت /link المحفوظ.
+        app.job_queue.run_repeating(backfill_linked_chatgpt_schedules, interval=24 * 60 * 60, first=30)
 
     # تحديثات business_message — رسائل الزبائن (نص وصور) عن طريق
     # Telegram Business، وهي أساس عمل البوت
