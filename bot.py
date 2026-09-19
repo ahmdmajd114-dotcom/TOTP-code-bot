@@ -134,7 +134,7 @@ CUSTOMER_MESSAGE_DEBOUNCE_SECONDS = float(os.environ.get("CUSTOMER_MESSAGE_DEBOU
 # التحية وحدها لا تُرسل خلال فترة الهدوء الليلية؛ الطلب الواضح داخل نفس
 # الرسالة يبقى فورياً، وكذلك أي متابعة تصل قبل إرسال التحية المؤجلة.
 QUIET_HOURS_START = (0, 30)
-QUIET_HOURS_END = (9, 0)
+QUIET_HOURS_END = (7, 0)
 
 # أرقام الفروع (Topics) داخل قروب الإشعارات — كل فرع مخصص لنوع إشعار
 TOPIC_NOTIFICATIONS = 6   # الردود العامة، الشكاوى، مشاكل الكود
@@ -10324,7 +10324,7 @@ async def _send_delayed_initial_greeting(
         await asyncio.sleep(INITIAL_GREETING_WAIT_SECONDS)
         quiet_wait = seconds_until_customer_replies_allowed()
         if quiet_wait:
-            logger.info("Holding greeting until 09:00 Baghdad for chat_id=%s", chat_id)
+            logger.info("Holding greeting until 07:00 Baghdad for chat_id=%s", chat_id)
             await asyncio.sleep(quiet_wait)
         reply = get_exact_test_faq_reply(text)
         if not reply:
@@ -10376,11 +10376,12 @@ async def _deliver_customer_text_batch(
         if not combined_text:
             return
         greeting_only = is_greeting_only_message(combined_text)
-        if greeting_only:
-            quiet_wait = seconds_until_customer_replies_allowed()
-            if quiet_wait:
-                logger.info("Holding greeting until 09:00 Baghdad for chat_id=%s", chat_id)
-                await asyncio.sleep(quiet_wait)
+        # من 12:30 إلى 07:00 ما نرسل أي رد تلقائي، لا تحية ولا كود ولا
+        # باقات. نجمع كلام الزبون ونستأنف نفس المعالجة عند السابعة.
+        quiet_wait = seconds_until_customer_replies_allowed()
+        if quiet_wait:
+            logger.info("Holding customer reply until 07:00 Baghdad for chat_id=%s", chat_id)
+            await asyncio.sleep(quiet_wait)
         _pending_customer_text_batches.pop(chat_id, None)
         ready_key = (chat_id, message_id)
         _ready_customer_texts[ready_key] = combined_text
@@ -10541,6 +10542,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # كل نص من الزبون ينتظر نافذة قصيرة حتى تكتمل الأجزاء المتتابعة.
     # التحية المنفردة تستخدم نفس النظام لكن بانتظار دقيقة كاملة.
     if not is_from_owner and ready_customer_text is None:
+        # وقت التوقف يحجب جميع الردود، حتى طلب الكود السريع.
+        if seconds_until_customer_replies_allowed():
+            queue_customer_text_batch(update, context, bm, text)
+            return
         # طلب الكود مستعجل ولا يحتاج تجميع أجزاء الرسالة: يتجاوز نافذة
         # الـdebounce العامة حتى يكون الانتظار الكلي ثانية واحدة فقط.
         if "طلب_كود" in keyword_match_categories(text):
