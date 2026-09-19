@@ -1245,7 +1245,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "catalog_add_product":
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "product_data"}
         await query.edit_message_text(
-            "اكتب المنتج بهذا الشكل كـرد على هذي الرسالة:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
+            "اكتب المنتج بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
             reply_markup=None,
         )
         return
@@ -1261,7 +1261,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "product_id": product_id,
         }
         await query.edit_message_text(
-            "اكتب الاسم والكلمات الجديدة بهذا الشكل كـرد على هذي الرسالة:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
+            "اكتب الاسم والكلمات الجديدة بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
             reply_markup=None,
         )
         return
@@ -1331,7 +1331,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         product_id = data[len("catalog_add_plan_"):]
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "plan_data", "product_id": product_id}
         await query.edit_message_text(
-            "اكتب الباقة بهذا الشكل كـرد على هذي الرسالة:\n"
+            "اكتب الباقة بهذا الشكل:\n"
             "اسم الباقة | السعر | عدد الأيام | وصف اختياري\n"
             "مثال: شهر خاص | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم.",
             reply_markup=None,
@@ -1366,7 +1366,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "step": "plan_price",
             "plan_id": data[len("catalog_price_"):],
         }
-        await query.edit_message_text("اكتب السعر الجديد رقم فقط كـرد على هذي الرسالة:", reply_markup=None)
+        await query.edit_message_text("اكتب السعر الجديد رقم فقط:", reply_markup=None)
         return
 
     if data.startswith("catalog_edit_plan_"):
@@ -1386,7 +1386,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "product_id": plan["product_id"],
             "plan_id": plan_id,
         }
-        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل كـرد على هذي الرسالة:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
+        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
         return
 
     if data.startswith("catalog_xdelc_"):
@@ -1446,9 +1446,10 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     message = update.message
     state = context.user_data.get("pending_catalog_input")
-    if not message or not message.text or state is None or not message.reply_to_message:
+    if not message or not message.text or state is None:
         return False
-    if message.reply_to_message.message_id != state["message_id"]:
+    # الرد اختياري: لو كتب الأونر رسالة عادية نأخذها كإدخال للخطوة المفتوحة.
+    if message.reply_to_message and message.reply_to_message.message_id != state["message_id"]:
         return False
 
     text = message.text.strip()
@@ -2397,7 +2398,9 @@ async def handle_shared_account_input(update: Update, context: ContextTypes.DEFA
 async def handle_cancel_customer_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     state = context.user_data.get("pending_cancel_customer")
     message = update.message
-    if not state or not message or not message.text or not message.reply_to_message:
+    if not state or not message or not message.text:
+        return False
+    if message.reply_to_message and message.reply_to_message.message_id != state["message_id"]:
         return False
     try:
         chat_id = int(message.text.strip())
@@ -7461,6 +7464,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             "customer_username": state.get("customer_username"),
             "customer_chat_id": state.get("customer_chat_id"),
             "product": state["product"],
+            # بعد تثبيت جات، أي إيميل/«خاص» تكتبه مباشرة يدخل لهذه العملية؛
+            # ما يحتاج يصير Reply على رسالة الملخص.
+            "awaiting_chatgpt_account": is_chatgpt_payment_state(state),
         }
         del _pending_payments[message_id]
 
@@ -7731,6 +7737,30 @@ async def handle_personal_reminder_input(update: Update, context: ContextTypes.D
     return True
 
 
+def get_pending_payment_manual_input(message, waiting_key: str):
+    """Return the payment waiting for a manual value.
+
+    Replying to the payment photo remains supported, but is no longer required.
+    Without a reply, the newest payment currently waiting for this exact value is
+    used; this keeps normal typing convenient while avoiding unrelated payments.
+    """
+    if message.reply_to_message:
+        message_id = message.reply_to_message.message_id
+        state = _pending_payments.get(message_id)
+        if state and state.get(waiting_key):
+            return message_id, state
+        return None, None
+
+    candidates = [
+        (message_id, state)
+        for message_id, state in _pending_payments.items()
+        if state.get(waiting_key)
+    ]
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda item: item[0])
+
+
 async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     يلتقط رسالة نصية جاية منك (owner) بمحادثتك الخاصة مع البوت وقت ما
@@ -7738,12 +7768,11 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
     يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
     """
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
 
-    replied_id = message.reply_to_message.message_id
-    state = _pending_payments.get(replied_id)
-    if state is None or not state.get("awaiting_manual_product"):
+    replied_id, state = get_pending_payment_manual_input(message, "awaiting_manual_product")
+    if state is None:
         return False
 
     product = message.text.strip()
@@ -7792,12 +7821,11 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
     يرجع True لو عالج الرسالة، False لو ما فيه عملية منتظرة إدخال يدوي.
     """
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
 
-    replied_id = message.reply_to_message.message_id
-    state = _pending_payments.get(replied_id)
-    if state is None or not state.get("awaiting_manual_amount"):
+    replied_id, state = get_pending_payment_manual_input(message, "awaiting_manual_amount")
+    if state is None:
         return False
 
     try:
@@ -8371,12 +8399,21 @@ async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEF
     الرسالة (حتى لو رفضها لسبب ما)، False لو ما تنطبق الشروط إطلاقاً.
     """
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
 
-    replied_id = message.reply_to_message.message_id
-    completed = _completed_payments.get(replied_id)
-    if completed is None:
+    if message.reply_to_message:
+        replied_id = message.reply_to_message.message_id
+        completed = _completed_payments.get(replied_id)
+    else:
+        pending = [
+            (message_id, payment)
+            for message_id, payment in _completed_payments.items()
+            if payment.get("product") == CHATGPT_PRODUCT_NAME
+            and payment.get("awaiting_chatgpt_account")
+        ]
+        replied_id, completed = max(pending, key=lambda item: item[0]) if pending else (None, None)
+    if completed is None or not completed.get("awaiting_chatgpt_account"):
         return False
 
     if completed.get("product") != CHATGPT_PRODUCT_NAME:
@@ -8403,6 +8440,7 @@ async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEF
     )
 
     if saved:
+        completed["awaiting_chatgpt_account"] = False
         await message.reply_text("✅ تم تسجيل معلومة الحساب بالشيت.")
     else:
         await message.reply_text("⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً.")
@@ -8433,9 +8471,11 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
     global _pending_expense
 
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
-    if _pending_expense is None or _pending_expense.get("message_id") != message.reply_to_message.message_id:
+    if _pending_expense is None:
+        return False
+    if message.reply_to_message and _pending_expense.get("message_id") != message.reply_to_message.message_id:
         return False
 
     expense = _pending_expense
@@ -8627,9 +8667,11 @@ async def handle_debt_chat_id_entry(update: Update, context: ContextTypes.DEFAUL
     global _pending_debt
 
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
-    if _pending_debt is None or _pending_debt.get("message_id") != message.reply_to_message.message_id:
+    if _pending_debt is None:
+        return False
+    if message.reply_to_message and _pending_debt.get("message_id") != message.reply_to_message.message_id:
         return False
     if _pending_debt["step"] != "chat_id":
         return False
@@ -8675,9 +8717,11 @@ async def handle_debt_manual_entry(update: Update, context: ContextTypes.DEFAULT
     global _pending_debt
 
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
-    if _pending_debt is None or _pending_debt.get("message_id") != message.reply_to_message.message_id:
+    if _pending_debt is None:
+        return False
+    if message.reply_to_message and _pending_debt.get("message_id") != message.reply_to_message.message_id:
         return False
 
     debt = _pending_debt
@@ -8788,9 +8832,11 @@ async def handle_stats_manual_period_entry(update: Update, context: ContextTypes
     global _pending_stats_period
 
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
-    if _pending_stats_period is None or _pending_stats_period.get("message_id") != message.reply_to_message.message_id:
+    if _pending_stats_period is None:
+        return False
+    if message.reply_to_message and _pending_stats_period.get("message_id") != message.reply_to_message.message_id:
         return False
 
     period_key = message.text.strip()
@@ -8826,9 +8872,11 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
     global _pending_vault_edit
 
     message = update.message
-    if not message or not message.text or not message.reply_to_message:
+    if not message or not message.text:
         return False
-    if _pending_vault_edit is None or _pending_vault_edit.get("message_id") != message.reply_to_message.message_id:
+    if _pending_vault_edit is None:
+        return False
+    if message.reply_to_message and _pending_vault_edit.get("message_id") != message.reply_to_message.message_id:
         return False
 
     vault_name = _pending_vault_edit["vault_name"]
