@@ -49,6 +49,19 @@ async def schedule_message(chat_id: int, text: str, when: datetime) -> int:
         await client.disconnect()
 
 
+async def send_message(chat_id: int, text: str) -> int:
+    """يرسل رسالة فورية من حساب Telegram الشخصي، كبديل عن Business."""
+    client = _client()
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram personal session is not authorized")
+        message = await client.send_message(chat_id, text)
+        return int(message.id)
+    finally:
+        await client.disconnect()
+
+
 async def cancel_scheduled_message(chat_id: int, message_id: int) -> None:
     """Delete a previously scheduled message before Telegram sends it."""
     client = _client()

@@ -78,6 +78,7 @@ from modesty_guard import is_flirtatious_text, is_guarded_chat
 from telegram_personal_scheduler import (
     cancel_scheduled_message as cancel_personal_scheduled_message,
     is_configured as personal_scheduler_is_configured,
+    send_message as send_personal_message,
     schedule_message as schedule_personal_message,
 )
 from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
@@ -2121,6 +2122,21 @@ async def send_business_message_with_current_fallback(
         )
 
 
+async def send_relogin_notice(context: ContextTypes.DEFAULT_TYPE, customer_chat_id: int, text: str) -> None:
+    """يرسل تنبيه تسجيل الدخول عبر Business، ثم الحساب الشخصي عند انتهاء الاتصال."""
+    try:
+        connection_id = get_customer_business_connection_id(customer_chat_id)
+        if not connection_id:
+            raise RuntimeError("No Business connection available for customer")
+        await send_business_message_with_current_fallback(context, customer_chat_id, text, connection_id)
+        return
+    except Exception:
+        if not personal_scheduler_is_configured():
+            raise
+        logger.warning("Business relogin notice failed for %s; trying personal Telegram", customer_chat_id)
+    await send_personal_message(customer_chat_id, text)
+
+
 async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAULT_TYPE, account_id: str) -> tuple[int, int]:
     """ينبه المشتركين الفعّالين المرتبطين بحساب واحد بعد تسجيل الخروج الجماعي."""
     try:
@@ -2145,12 +2161,7 @@ async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAUL
                 "السلام عليكم،\n\n"
                 "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله."
             )
-            connection_id = get_customer_business_connection_id(int(customer_id))
-            if not connection_id:
-                raise RuntimeError("No Business connection available for customer")
-            await send_business_message_with_current_fallback(
-                context, int(customer_id), text, connection_id,
-            )
+            await send_relogin_notice(context, int(customer_id), text)
             sent += 1
         except Exception:
             failed += 1
@@ -2166,15 +2177,11 @@ async def send_legacy_shared_account_relogin_notifications(
     sent = failed = 0
     for customer_id in sorted(set(customer_ids)):
         try:
-            connection_id = get_customer_business_connection_id(int(customer_id))
-            if not connection_id:
-                raise RuntimeError("No Business connection available for customer")
-            await send_business_message_with_current_fallback(
+            await send_relogin_notice(
                 context,
                 int(customer_id),
                 "السلام عليكم،\n\n"
                 "صار أكو تسريب بالحساب ومدتكم محفوظة، بس أرجع سجّل لو سمحت واطلب كود حتى يندز مباشرة إن شاء الله.",
-                connection_id,
             )
             sent += 1
         except Exception:
@@ -2717,29 +2724,54 @@ def build_link_debt_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def get_active_link_debt_catalog_plans() -> list[tuple[dict, dict]]:
+    """باقات ChatGPT الفعالة ذات المدة، من كاتالوج الأونر فقط."""
+    options = []
+    for product in get_catalog_products():
+        if not product.get("is_active") or not is_chatgpt_product(product):
+            continue
+        for plan in get_catalog_plans(str(product["id"])):
+            duration = plan.get("duration")
+            if plan.get("is_active") and (
+                duration_to_days(duration) or is_permanent_duration(duration)
+            ):
+                options.append((product, plan))
+    return options
+
+
 def build_link_debt_plan_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
+    """لا يعرض إلا الباقات الفعالة التي أضافها الأونر للـChatGPT."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("خاص شهر", callback_data=f"linkplan_private_1_{customer_chat_id}"),
-            InlineKeyboardButton("مشترك شهر", callback_data=f"linkplan_shared_1_{customer_chat_id}"),
-        ],
-        [
-            InlineKeyboardButton("خاص شهرين", callback_data=f"linkplan_private_2_{customer_chat_id}"),
-            InlineKeyboardButton("مشترك شهرين", callback_data=f"linkplan_shared_2_{customer_chat_id}"),
-        ],
+        [InlineKeyboardButton(
+            f"{product['name']} — {plan['name']} ({plan.get('duration') or 'دائم'})",
+            callback_data=f"linkplan_{plan['id']}_{customer_chat_id}",
+        )]
+        for product, plan in get_active_link_debt_catalog_plans()
     ])
+
+
+def get_active_manual_subscription_catalog_plans() -> list[tuple[dict, dict]]:
+    """كل الباقات الفعالة ذات المدة، دون أي خيارات ثابتة في الكود."""
+    options = []
+    for product in get_catalog_products():
+        if not product.get("is_active"):
+            continue
+        for plan in get_catalog_plans(str(product["id"])):
+            duration = plan.get("duration")
+            if plan.get("is_active") and (
+                duration_to_days(duration) or is_permanent_duration(duration)
+            ):
+                options.append((product, plan))
+    return options
 
 
 def build_manual_subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("خاص شهر", callback_data="subrem_private_1"),
-            InlineKeyboardButton("مشترك شهر", callback_data="subrem_shared_1"),
-        ],
-        [
-            InlineKeyboardButton("خاص شهرين", callback_data="subrem_private_2"),
-            InlineKeyboardButton("مشترك شهرين", callback_data="subrem_shared_2"),
-        ],
+        [InlineKeyboardButton(
+            f"{product['name']} — {plan['name']} ({plan.get('duration') or 'دائم'})",
+            callback_data=f"subrem_plan_{plan['id']}",
+        )]
+        for product, plan in get_active_manual_subscription_catalog_plans()
     ])
 
 
@@ -7240,12 +7272,12 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     data = query.data or ""
     debt_match = re.fullmatch(r"linkdebt_(yes|no)(?:_(-?\d+))?", data)
-    plan_match = re.fullmatch(r"linkplan_(private|shared)_(1|2)(?:_(-?\d+))?", data)
+    plan_match = re.fullmatch(r"linkplan_(.+)_(-?\d+)", data)
     if not debt_match and not plan_match:
         return
 
     stored_state = context.user_data.get("pending_link_debt") or {}
-    chat_id_text = (debt_match or plan_match).group(2 if debt_match else 3)
+    chat_id_text = (debt_match or plan_match).group(2)
     try:
         customer_chat_id = int(chat_id_text) if chat_id_text else int(stored_state["customer_chat_id"])
     except (KeyError, TypeError, ValueError):
@@ -7266,19 +7298,48 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("تمام، تم الربط بدون تسجيل دين.")
         return
     if debt_match and debt_match.group(1) == "yes":
+        if not get_active_link_debt_catalog_plans():
+            await query.edit_message_text(
+                "⚠️ ماكو باقات ChatGPT مفعّلة ويا مدة في المنتجات والباقات. "
+                "فعّل أو أضف الباقة أولاً، وبعدها أعد /link."
+            )
+            return
         await query.edit_message_text(
-            "تمام، هذا دين. اختَر نوع ومدة الاشتراك؛ من الآن يبدأ الحساب ويسمح له بطلب الكود.",
+            "تمام، هذا دين. اختَر الباقة من الباقات المفعّلة بالكاتالوج؛ "
+            "من الآن يبدأ الحساب ويسمح له بطلب الكود.",
             reply_markup=build_link_debt_plan_keyboard(customer_chat_id),
         )
         return
 
-    subscription_type = plan_match.group(1)
-    duration_months = int(plan_match.group(2))
+    plan_id = plan_match.group(1)
+    try:
+        rows = (
+            supabase.table("catalog_plans")
+            .select("id, product_id, name, duration, is_active")
+            .eq("id", plan_id).limit(1).execute().data or []
+        )
+        plan = rows[0] if rows else None
+        product = get_catalog_product(str(plan["product_id"])) if plan else None
+    except Exception:
+        logger.exception("Failed to read catalog plan for link debt")
+        plan = product = None
+    if (not plan or not product or not plan.get("is_active") or not product.get("is_active")
+            or not is_chatgpt_product(product)
+            or not (duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration")))):
+        await query.edit_message_text("⚠️ هذه الباقة لم تعد مفعّلة أو لا تملك مدة. أعد /link واختر باقة مفعّلة.")
+        return
+
+    duration_days = duration_to_days(plan.get("duration"))
+    is_permanent = is_permanent_duration(plan.get("duration"))
 
     reminder_state = {
         **state,
-        "subscription_type": subscription_type,
-        "duration_months": duration_months,
+        "product": product["name"],
+        "plan_id": plan["id"],
+        "plan_name": plan["name"],
+        "plan_duration": plan.get("duration"),
+        "duration_days": duration_days,
+        "reminder_disabled": is_permanent,
         "is_debt": True,
     }
     saved = save_subscription_reminder(reminder_state)
@@ -7288,13 +7349,12 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("⚠️ تم الربط، بس فشل تسجيل اشتراك الدين. تأكد من تشغيل SQL الجديد.")
         return
     context.user_data.pop("pending_link_debt", None)
-    type_text = "خاص" if subscription_type == "private" else "مشترك"
-    duration_text = "شهر" if duration_months == 1 else "شهرين"
-    end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=30 * duration_months)
+    end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=1 if is_permanent else duration_days)
+    duration_text = "بعد 24 ساعة (باقة دائمة)" if is_permanent else end.strftime("%Y-%m-%d %H:%M")
     await query.edit_message_text(
-        f"✅ تم تسجيل دين: {type_text} {duration_text}\n"
+        f"✅ تم تسجيل دين: {product['name']} — {plan['name']}\n"
         f"الكود متاح للزبون من هسه.\n"
-        f"ينتهي الاشتراك: {end.strftime('%Y-%m-%d %H:%M')}"
+        + ("🔔 متابعة الرضا راح تنرسل " + duration_text if is_permanent else f"ينتهي الاشتراك: {duration_text}")
     )
 
 
@@ -7304,23 +7364,32 @@ async def handle_manual_subscription_callback(update: Update, context: ContextTy
     if query is None or query.from_user.id != OWNER_USER_ID:
         return
     try:
-        _, subscription_type, duration_text = query.data.split("_", 2)
-        duration_months = int(duration_text)
-    except (AttributeError, ValueError, TypeError):
-        await query.answer("اختيار غير صحيح.", show_alert=True)
-        return
-    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
+        plan_id = (query.data or "").removeprefix("subrem_plan_")
+        rows = (
+            supabase.table("catalog_plans")
+            .select("id, product_id, name, duration, is_active")
+            .eq("id", plan_id).limit(1).execute().data or []
+        )
+        plan = rows[0] if rows else None
+        product = get_catalog_product(str(plan["product_id"])) if plan else None
+    except Exception:
+        logger.exception("Failed to read manual subscription catalog plan")
+        plan = product = None
+    if (not plan or not product or not plan.get("is_active") or not product.get("is_active")
+            or not (duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration")))):
         await query.answer("اختيار غير صحيح.", show_alert=True)
         return
     context.user_data["pending_manual_subscription"] = {
-        "subscription_type": subscription_type,
-        "duration_months": duration_months,
+        "product": product["name"],
+        "plan_id": plan["id"],
+        "plan_name": plan["name"],
+        "plan_duration": plan.get("duration"),
+        "duration_days": duration_to_days(plan.get("duration")),
+        "reminder_disabled": is_permanent_duration(plan.get("duration")),
     }
     await query.answer()
-    type_text = "خاص" if subscription_type == "private" else "مشترك"
-    duration_text = "شهر" if duration_months == 1 else "شهرين"
     await query.edit_message_text(
-        f"اختيارك: {type_text} {duration_text}\n\n"
+        f"اختيارك: {product['name']} — {plan['name']}\n\n"
         "اكتب هكذا حتى ينقطع الكود عند الانتهاء:\n"
         "chat_id | اسم الزبون | @username (اختياري)"
     )
@@ -7343,15 +7412,17 @@ async def handle_manual_subscription_input(update: Update, context: ContextTypes
         "customer_chat_id": chat_id,
         "customer_name": name,
         "customer_username": username or None,
-        "subscription_type": state["subscription_type"],
-        "duration_months": state["duration_months"],
+        **state,
     }
     saved = save_subscription_reminder(reminder_state)
     if saved:
         await schedule_subscription_feedback(reminder_state)
     if saved:
-        end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=30 * state["duration_months"])
-        await message.reply_text(f"✅ تم تسجيل التنبيه. ينتهي: {end.strftime('%Y-%m-%d %H:%M')}")
+        if state.get("reminder_disabled"):
+            await message.reply_text("✅ تم تسجيل الباقة الدائمة. رسالة رضا راح تنرسل بعد 24 ساعة.")
+        else:
+            end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=state["duration_days"])
+            await message.reply_text(f"✅ تم تسجيل التنبيه. ينتهي: {end.strftime('%Y-%m-%d %H:%M')}")
         context.user_data.pop("pending_manual_subscription", None)
     else:
         await message.reply_text("⚠️ فشل الحفظ. تأكد من تشغيل ملف Supabase الجديد.")
