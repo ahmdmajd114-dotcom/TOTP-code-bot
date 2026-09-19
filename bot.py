@@ -1872,6 +1872,22 @@ def upsert_customer_contact(
         return False
 
 
+def get_telegram_customer_identity(chat_id: int) -> tuple[str, str | None]:
+    """يجلب اسم الزبون للعمليات التي لا تصل عبر Business message."""
+    try:
+        rows = (
+            supabase.table("customer_contacts")
+            .select("display_name, username")
+            .eq("platform", "telegram").eq("chat_id", chat_id)
+            .order("last_seen_at", desc=True).limit(1).execute().data or []
+        )
+        if rows:
+            return rows[0].get("display_name") or "غير معروف", rows[0].get("username")
+    except Exception:
+        logger.exception("Failed to read Telegram customer identity for %s", chat_id)
+    return "غير معروف", None
+
+
 def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"{'✅' if row['is_active'] else '⏸️'} {row['name']}", callback_data=f"pm_{row['id']}")] for row in methods]
     rows.append([InlineKeyboardButton("➕ إضافة طريقة دفع", callback_data="pm_add")])
@@ -2693,22 +2709,23 @@ def build_subscription_plan_keyboard(plans: list[dict]) -> InlineKeyboardMarkup:
     ])
 
 
-def build_link_debt_keyboard() -> InlineKeyboardMarkup:
+def build_link_debt_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
+    """سؤال الدين يحمل chat_id داخل الزر حتى لا يضيع بعد إعادة تشغيل البوت."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ نعم، دين", callback_data="linkdebt_yes"),
-        InlineKeyboardButton("❌ لا، مو دين", callback_data="linkdebt_no"),
+        InlineKeyboardButton("✅ نعم، دين", callback_data=f"linkdebt_yes_{customer_chat_id}"),
+        InlineKeyboardButton("❌ لا، مو دين", callback_data=f"linkdebt_no_{customer_chat_id}"),
     ]])
 
 
-def build_link_debt_plan_keyboard() -> InlineKeyboardMarkup:
+def build_link_debt_plan_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("خاص شهر", callback_data="linkplan_private_1"),
-            InlineKeyboardButton("مشترك شهر", callback_data="linkplan_shared_1"),
+            InlineKeyboardButton("خاص شهر", callback_data=f"linkplan_private_1_{customer_chat_id}"),
+            InlineKeyboardButton("مشترك شهر", callback_data=f"linkplan_shared_1_{customer_chat_id}"),
         ],
         [
-            InlineKeyboardButton("خاص شهرين", callback_data="linkplan_private_2"),
-            InlineKeyboardButton("مشترك شهرين", callback_data="linkplan_shared_2"),
+            InlineKeyboardButton("خاص شهرين", callback_data=f"linkplan_private_2_{customer_chat_id}"),
+            InlineKeyboardButton("مشترك شهرين", callback_data=f"linkplan_shared_2_{customer_chat_id}"),
         ],
     ])
 
@@ -6419,17 +6436,22 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         # إذا كان دافع مسبقاً وباقته مسجلة، الربط يكفي ولا نسألك عن الدين.
         # سؤال الدين مخصص فقط للزبون الذي لا يملك اشتراكاً فعّالاً مسجلاً.
-        if bm is not None and not has_active_subscription(chat_id):
+        # لا نعتمد على bm هنا: أحياناً يمر /link من مسار غير Business.
+        if not has_active_subscription(chat_id):
+            fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
             context.user_data["pending_link_debt"] = {
                 "customer_chat_id": chat_id,
-                "customer_name": bm.chat.full_name or bm.chat.first_name or "غير معروف",
-                "customer_username": bm.chat.username,
+                "customer_name": (
+                    bm.chat.full_name or bm.chat.first_name or "غير معروف"
+                    if bm is not None else fallback_name
+                ),
+                "customer_username": bm.chat.username if bm is not None else fallback_username,
                 "account_label": label or link_code,
             }
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text="هل هذا الزبون دين؟",
-                reply_markup=build_link_debt_keyboard(),
+                reply_markup=build_link_debt_keyboard(chat_id),
             )
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
@@ -7215,32 +7237,43 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     if query is None or query.from_user.id != OWNER_USER_ID:
         return
-    state = context.user_data.get("pending_link_debt")
-    if state is None:
-        await query.answer("انتهت صلاحية هذا السؤال.", show_alert=True)
-        return
     await query.answer()
-    if query.data == "linkdebt_no":
+    data = query.data or ""
+    debt_match = re.fullmatch(r"linkdebt_(yes|no)(?:_(-?\d+))?", data)
+    plan_match = re.fullmatch(r"linkplan_(private|shared)_(1|2)(?:_(-?\d+))?", data)
+    if not debt_match and not plan_match:
+        return
+
+    stored_state = context.user_data.get("pending_link_debt") or {}
+    chat_id_text = (debt_match or plan_match).group(2 if debt_match else 3)
+    try:
+        customer_chat_id = int(chat_id_text) if chat_id_text else int(stored_state["customer_chat_id"])
+    except (KeyError, TypeError, ValueError):
+        await query.edit_message_text("⚠️ انتهت صلاحية هذا السؤال. أعد /link للحساب حتى يظهر السؤال من جديد.")
+        return
+
+    customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
+    same_pending_customer = str(stored_state.get("customer_chat_id")) == str(customer_chat_id)
+    state = {
+        **stored_state,
+        "customer_chat_id": customer_chat_id,
+        "customer_name": stored_state.get("customer_name") if same_pending_customer else customer_name,
+        "customer_username": stored_state.get("customer_username") if same_pending_customer else customer_username,
+    }
+
+    if debt_match and debt_match.group(1) == "no":
         context.user_data.pop("pending_link_debt", None)
         await query.edit_message_text("تمام، تم الربط بدون تسجيل دين.")
         return
-    if query.data == "linkdebt_yes":
+    if debt_match and debt_match.group(1) == "yes":
         await query.edit_message_text(
             "تمام، هذا دين. اختَر نوع ومدة الاشتراك؛ من الآن يبدأ الحساب ويسمح له بطلب الكود.",
-            reply_markup=build_link_debt_plan_keyboard(),
+            reply_markup=build_link_debt_plan_keyboard(customer_chat_id),
         )
         return
-    if not query.data.startswith("linkplan_"):
-        return
-    try:
-        _, subscription_type, duration_text = query.data.split("_", 2)
-        duration_months = int(duration_text)
-    except (ValueError, TypeError):
-        await query.edit_message_text("⚠️ اختيار الباقة غير صحيح.")
-        return
-    if subscription_type not in {"private", "shared"} or duration_months not in {1, 2}:
-        await query.edit_message_text("⚠️ اختيار الباقة غير صحيح.")
-        return
+
+    subscription_type = plan_match.group(1)
+    duration_months = int(plan_match.group(2))
 
     reminder_state = {
         **state,
