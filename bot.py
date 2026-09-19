@@ -10798,7 +10798,7 @@ def build_public_catalog_html() -> str:
     .brand {{ display:flex; align-items:center; gap:12px; direction:ltr; font-weight:800; font-size:26px; }}
     .mark {{ position:relative; display:grid; place-items:center; width:48px; height:48px; border-radius:15px; background:#f5f2e9; color:var(--teal); font-size:38px; line-height:1; }}
     .mark::after {{ content:''; position:absolute; width:8px; height:8px; border-radius:50%; top:8px; right:8px; background:var(--teal); }}
-    .hero {{ text-align:center; padding:55px 12px 2px; }} .hero h1 {{ margin:0; font-size:clamp(30px,5vw,52px); }} .hero p {{ max-width:590px; margin:16px auto 0; font-size:clamp(16px,2vw,19px); opacity:.94; line-height:1.9; }}
+    .hero {{ text-align:center; padding:55px 12px 2px; }} .hero h1 {{ margin:0; font-size:clamp(30px,5vw,52px); }} .school-welcome {{ margin:17px auto 0; color:#fff7dd; font-size:clamp(16px,2vw,20px); font-weight:bold; line-height:1.8; }} .hero p {{ max-width:590px; margin:16px auto 0; font-size:clamp(16px,2vw,19px); opacity:.94; line-height:1.9; }}
     main {{ padding:38px 0 58px; }} .section-title {{ text-align:center; margin:0 0 24px; font-size:25px; }}
     .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }}
     .product-card {{ border:1px solid var(--line); border-radius:22px; background:#fff; padding:23px; box-shadow:0 12px 28px #163c4110; display:flex; flex-direction:column; }}
@@ -10812,7 +10812,7 @@ def build_public_catalog_html() -> str:
   </style>
 </head>
 <body>
-  <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
+  <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><div class=\"school-welcome\">نرحّب بكم بالعام الدراسي الجديد، ونتمنى لكم عاماً دراسياً مثمراً وسعيداً.</div><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
   <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2><section class=\"grid\">{catalog_content}</section></main>
   <footer>© MedBox Pro<br>{escape(support_note)}<br><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a></footer>
 </body></html>"""
