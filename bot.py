@@ -24,6 +24,7 @@ import base64
 import asyncio
 import logging
 import json
+import time
 from types import SimpleNamespace
 import pyotp
 import httpx
@@ -1006,8 +1007,8 @@ RESETCODE_PATTERN = re.compile(r"^/resetcode$", re.IGNORECASE)
 # كلمات مفتاحية لطلب الكود
 CODE_REQUEST_KEYWORDS = [
     # لا نعامل الكلمات العامة مثل «رمز» أو أي متابعة سابقة كطلب كود.
-    # الكود يُرسل فقط بطلب صريح في الرسالة الحالية.
-    "كود", "الكود", "كود التحقق", "رمز التحقق", "رمز الدخول", "code", "otp",
+    # الكود يُرسل فقط بطلب صريح بالكلمات المتفق عليها.
+    "كود", "الكود", "code",
 ]
 
 CODE_RETRY_RESET_HOURS = 12  # يصفر عداد محاولات الكود تلقائياً بعد هالمدة
@@ -6166,6 +6167,41 @@ def generate_totp_code(secret: str) -> str:
     return totp.now()
 
 
+CODE_REPLY_MARKER = "__SEND_FRESH_TOTP_CODE__"
+
+
+async def generate_fresh_totp_code_for_chat(chat_id: int) -> str | None:
+    """Generate a code at the beginning of a fresh 30-second TOTP window."""
+    elapsed = time.time() % 30
+    # لو دخلنا بالفعل بأول ثانية من الدورة، لا نؤخره دورة كاملة.
+    if elapsed > 1:
+        await asyncio.sleep((30 - elapsed) + 0.12)
+    result = get_secret_for_chat(chat_id)
+    if result is None:
+        return None
+    secret, _ = result
+    return generate_totp_code(secret)
+
+
+async def human_like_code_reply_sequence(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    business_connection_id: str,
+    message_id: int,
+) -> None:
+    """Code timing: 3 seconds to read the request, then 5 seconds typing."""
+    await asyncio.sleep(3)
+    try:
+        await context.bot.read_business_message(
+            business_connection_id=business_connection_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except Exception:
+        logger.exception("Failed to mark code request as read")
+    await _show_typing(context, chat_id, business_connection_id, 5)
+
+
 def authorize_recently_linked_customer_code(chat_id: int) -> None:
     """Permit OTP requests briefly after an owner manually links the account."""
     _manual_link_code_authorizations[chat_id] = (
@@ -6455,9 +6491,10 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
         else decide_code_retry(attempt_count, awaiting_restart)
     )
     if decision.action == "send_code":
-        code = generate_totp_code(secret)
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
-        return f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا", False
+        # التوليد نفسه يتأجل لآخر لحظة قبل الإرسال بعد انتهاء التأخير
+        # البشري، حتى يصل الكود ببداية عمره الكامل تقريباً.
+        return CODE_REPLY_MARKER, False
     if decision.action == "ask_restart":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         return RESTART_MESSAGE, False
@@ -6487,9 +6524,11 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
     if result is None:
         await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
         return
-    secret, _ = result
-    code = generate_totp_code(secret)
-    send_kwargs = {"chat_id": chat_id, "text": f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا"}
+    code = await generate_fresh_totp_code_for_chat(chat_id)
+    if not code:
+        await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
+        return
+    send_kwargs = {"chat_id": chat_id, "text": code}
     try:
         reminder = (supabase.table("subscription_reminders")
             .select("business_connection_id")
@@ -6878,9 +6917,17 @@ async def handle_customer_photo(
     reply_text, stopped = process_code_request(chat_id)
     image_summary = f"[صورة شاشة تحقق]\n{description}"
     if reply_text:
-        await human_like_reply_sequence(
-            context, chat_id, bm.business_connection_id, bm.message_id
-        )
+        if reply_text == CODE_REPLY_MARKER:
+            await human_like_code_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
+            )
+            reply_text = await generate_fresh_totp_code_for_chat(chat_id)
+            if not reply_text:
+                return
+        else:
+            await human_like_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
+            )
         await context.bot.send_message(
             business_connection_id=bm.business_connection_id,
             chat_id=chat_id,
@@ -9083,7 +9130,12 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         # المستخدم بالبوت الحقيقي يطبق قواعد إعادة المحاولة أيضاً.
         reply, stopped = process_code_request(customer_chat_id)
         if reply:
-            set_interactive_sale_state(customer_chat_id, "code_sent")
+            if reply == CODE_REPLY_MARKER:
+                reply = await generate_fresh_totp_code_for_chat(customer_chat_id)
+            if not reply:
+                reply = render_test_response("handoff", user_text, customer_chat_id)
+            else:
+                set_interactive_sale_state(customer_chat_id, "code_sent")
         else:
             reply = render_test_response("handoff", user_text, customer_chat_id)
             if stopped:
@@ -10366,13 +10418,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text=f"⚠️ ماكو حساب مرتبط بهذا الزبون ({chat_id}).",
                 )
                 return
-            secret, _ = linked_account
-            code = generate_totp_code(secret)
+            await human_like_code_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
+            )
+            code = await generate_fresh_totp_code_for_chat(chat_id)
+            if not code:
+                return
             try:
                 await context.bot.send_message(
                     business_connection_id=bm.business_connection_id,
                     chat_id=chat_id,
-                    text=f"الكود: {code}\nصالح لمدة 30 ثانية تقريبا",
+                    text=code,
                 )
             except Exception:
                 logger.exception("Failed to send owner-requested code to %s", chat_id)
@@ -10473,6 +10529,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # نحافظ على تحية واحدة قبل الطلب الحقيقي؛ الشكر العرضي وحده يُحذف.
     # رد السلام واجب ولا يجوز أن تسقطه أولوية المنتج.
     categories = prioritize_action_categories(categories)
+    # طلب الكود رد مستقل دائماً: الزبون يستلم أرقاماً فقط، ولا تندمج معه
+    # تحية أو باقات أو أي شرح آخر بنفس الرسالة.
+    if "طلب_كود" in categories:
+        categories = ["طلب_كود"]
     has_greeting_and_action = (
         any(category in {"سلام", "ترحيب"} for category in categories)
         and any(category not in {"سلام", "ترحيب", "شكر"} for category in categories)
@@ -10577,23 +10637,37 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
 
+    has_code_reply = CODE_REPLY_MARKER in replies_to_send
     if not was_delayed_greeting:
-        await human_like_reply_sequence(
-            context, chat_id, bm.business_connection_id, bm.message_id
-        )
-    outgoing_replies = (
+        if has_code_reply:
+            await human_like_code_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
+            )
+        else:
+            await human_like_reply_sequence(
+                context, chat_id, bm.business_connection_id, bm.message_id
+            )
+    outgoing_replies = replies_to_send if has_code_reply else (
         ["\n\n".join(replies_to_send)]
         if has_greeting_and_action and len(replies_to_send) > 1
         else replies_to_send
     )
+    sent_replies: list[str] = []
     for reply_text in outgoing_replies:
+        if reply_text == CODE_REPLY_MARKER:
+            reply_text = await generate_fresh_totp_code_for_chat(chat_id)
+            if not reply_text:
+                continue
         await context.bot.send_message(
             business_connection_id=bm.business_connection_id,
             chat_id=chat_id,
             text=reply_text,
         )
-    logger.info(f"Sent {len(outgoing_replies)} reply(ies) to chat_id={chat_id}")
-    combined_reply = "\n---\n".join(outgoing_replies)
+        sent_replies.append(reply_text)
+    if not sent_replies:
+        return
+    logger.info(f"Sent {len(sent_replies)} reply(ies) to chat_id={chat_id}")
+    combined_reply = "\n---\n".join(sent_replies)
     archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
     archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=combined_reply)
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
