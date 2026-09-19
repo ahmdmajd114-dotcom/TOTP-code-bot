@@ -80,6 +80,7 @@ from telegram_personal_scheduler import (
     is_configured as personal_scheduler_is_configured,
     send_message as send_personal_message,
     schedule_message as schedule_personal_message,
+    schedule_messages as schedule_personal_messages,
 )
 from instagram_sales import commission_for, format_iqd, normalize_chat_type, parse_amount
 from interactive_classifier import (
@@ -3116,6 +3117,7 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
             .execute().data or []
         )
         processed_chat_ids: set[int] = set()
+        pending_schedules: list[tuple[dict, int, datetime]] = []
         now = datetime.now(timezone.utc)
         for reminder in rows:
             chat_id = reminder.get("customer_chat_id")
@@ -3146,15 +3148,28 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
                     "started_at": linked_at.isoformat(),
                     "expires_at": expires_at.isoformat(),
                 }).eq("id", reminder["id"]).execute()
-                message_id = await schedule_personal_message(
-                    int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at,
-                )
-                supabase.table("subscription_reminders").update({
-                    "scheduled_message_id": message_id,
-                    "scheduled_message_status": "scheduled",
-                }).eq("id", reminder["id"]).execute()
+                pending_schedules.append((reminder, int(chat_id), expires_at))
             except Exception:
                 logger.exception("Failed to backfill scheduled feedback for customer %s", chat_id)
+                supabase.table("subscription_reminders").update({
+                    "scheduled_message_status": "failed",
+                }).eq("id", reminder["id"]).execute()
+
+        if not pending_schedules:
+            return
+        results = await schedule_personal_messages([
+            (chat_id, SUBSCRIPTION_FEEDBACK_TEXT, expires_at)
+            for _reminder, chat_id, expires_at in pending_schedules
+        ])
+        for reminder, chat_id, _expires_at in pending_schedules:
+            result = results.get(chat_id)
+            if isinstance(result, int):
+                supabase.table("subscription_reminders").update({
+                    "scheduled_message_id": result,
+                    "scheduled_message_status": "scheduled",
+                }).eq("id", reminder["id"]).execute()
+            else:
+                logger.error("Failed to backfill scheduled feedback for customer %s: %s", chat_id, result)
                 supabase.table("subscription_reminders").update({
                     "scheduled_message_status": "failed",
                 }).eq("id", reminder["id"]).execute()

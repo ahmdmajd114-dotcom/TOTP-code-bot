@@ -61,6 +61,34 @@ async def schedule_message(chat_id: int, text: str, when: datetime) -> int:
         await client.disconnect()
 
 
+async def schedule_messages(
+    messages: list[tuple[int, str, datetime]],
+) -> dict[int, int | Exception]:
+    """Reserve several messages with one Telegram session.
+
+    Loading dialogs for every legacy customer can trigger Telegram flood waits.
+    The startup backfill uses this function so it loads the owner's dialog list
+    once, then resolves and schedules each customer independently.
+    """
+    client = _client()
+    results: dict[int, int | Exception] = {}
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            raise RuntimeError("Personal Telegram session is no longer authorized")
+        await client.get_dialogs(limit=None)
+        for chat_id, text, when in messages:
+            try:
+                entity = await client.get_input_entity(chat_id)
+                message = await client.send_message(entity, text, schedule=when)
+                results[chat_id] = int(message.id)
+            except Exception as exc:  # Continue with the rest of the customers.
+                results[chat_id] = exc
+    finally:
+        await client.disconnect()
+    return results
+
+
 async def send_message(chat_id: int, text: str) -> int:
     """يرسل رسالة فورية من حساب Telegram الشخصي، كبديل عن Business."""
     client = _client()
