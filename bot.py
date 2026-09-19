@@ -371,14 +371,18 @@ def append_instagram_sale(sale: dict) -> bool:
 
 
 def save_instagram_subscription_reminder(sale: dict, state: dict) -> bool:
-    """Schedule an Instagram expiry reminder; Instagram has no Telegram chat id."""
+    """Schedule an Instagram expiry reminder, linked to Telegram only when known."""
     duration_months = state.get("duration_months")
     if sale.get("product") != CHATGPT_PRODUCT_NAME or duration_months not in {1, 2}:
         return True
     now = datetime.now(timezone.utc)
+    telegram_contact = find_telegram_contact_by_username(sale.get("instagram_account"))
+    telegram_chat_id = telegram_contact.get("chat_id") if telegram_contact else None
+    business_connection_id = telegram_contact.get("business_connection_id") if telegram_contact else None
     try:
         supabase.table("subscription_reminders").insert({
-            "customer_chat_id": None,
+            "customer_chat_id": telegram_chat_id,
+            "business_connection_id": business_connection_id,
             "customer_name": sale["instagram_account"],
             "customer_username": sale["instagram_account"],
             "subscription_type": "instagram",
@@ -1589,6 +1593,62 @@ def get_customer_business_connection_id(customer_chat_id: int) -> str | None:
     except Exception:
         logger.exception("Failed to find Business connection for customer %s", customer_chat_id)
     return get_current_business_connection_id()
+
+
+def find_telegram_contact_by_username(username: str | None) -> dict | None:
+    """يجد محادثة Telegram محفوظة ليوزر معروف، من دون التخمين بالاسم."""
+    handle = (username or "").strip().lstrip("@")
+    if not handle:
+        return None
+    try:
+        rows = (
+            supabase.table("customer_contacts")
+            .select("chat_id, business_connection_id, username")
+            .eq("platform", "telegram").eq("username", handle)
+            .not_.is_("chat_id", "null").order("last_seen_at", desc=True)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+    except Exception:
+        logger.exception("Failed to find Telegram contact for username %s", handle)
+        return None
+
+
+def resolve_reminder_delivery_target(reminder: dict) -> tuple[int | None, str | None]:
+    """يرجع وجهة Telegram للمتابعة ويصلح السجل القديم إذا وجد مطابقة مؤكدة."""
+    raw_chat_id = reminder.get("customer_chat_id")
+    if raw_chat_id is not None:
+        try:
+            chat_id = int(raw_chat_id)
+        except (TypeError, ValueError):
+            chat_id = None
+        if chat_id is not None:
+            return chat_id, reminder.get("business_connection_id") or get_customer_business_connection_id(chat_id)
+
+    # يوزر إنستغرام لا يساوي Telegram بالضرورة، لذلك نربط فقط إذا وجد
+    # نفس اليوزر مسجلاً مسبقاً ضمن جهة اتصال Telegram.
+    candidates = (
+        reminder.get("customer_username"), reminder.get("instagram_account"),
+        reminder.get("customer_name"),
+    )
+    for username in candidates:
+        contact = find_telegram_contact_by_username(username)
+        if not contact:
+            continue
+        try:
+            chat_id = int(contact["chat_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        connection_id = contact.get("business_connection_id") or get_customer_business_connection_id(chat_id)
+        try:
+            supabase.table("subscription_reminders").update({
+                "customer_chat_id": chat_id,
+                "business_connection_id": connection_id,
+            }).eq("id", reminder["id"]).execute()
+        except Exception:
+            logger.exception("Failed to backfill chat id for reminder %s", reminder.get("id"))
+        return chat_id, connection_id
+    return None, None
 
 
 def apply_campaign_business_connection(recipients: list[dict]) -> list[dict]:
@@ -5497,6 +5557,7 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
 async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """يرسل رسالة Feedback للزبون مرة واحدة عند انتهاء أي اشتراك."""
     now = datetime.now(timezone.utc)
+    await retry_expired_reminders_missing_chat(context, now)
     try:
         reminders = (
             supabase.table("subscription_reminders")
@@ -5532,21 +5593,28 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
             )
 
-            chat_id = reminder.get("customer_chat_id")
+            chat_id, connection_id = resolve_reminder_delivery_target(reminder)
             customer_send_error = False
+            delivery_missing_chat = chat_id is None
             reply_markup = None
-            if chat_id is not None:
+            if chat_id is not None and connection_id:
                 try:
-                    send_kwargs = {"chat_id": chat_id, "text": feedback_text, "reply_markup": reply_markup}
-                    if reminder.get("business_connection_id"):
-                        send_kwargs["business_connection_id"] = reminder["business_connection_id"]
-                    await context.bot.send_message(**send_kwargs)
+                    await send_business_message_with_current_fallback(
+                        context, chat_id, feedback_text, connection_id,
+                    )
                 except Exception:
                     customer_send_error = True
                     logger.exception("Failed to send expiry feedback to customer %s", chat_id)
+            elif chat_id is not None:
+                customer_send_error = True
+                logger.warning("No Business connection available for expiry feedback to %s", chat_id)
             supabase.table("subscription_reminders").update({
-                "feedback_status": "awaiting_reply",
-                "feedback_requested_at": now.isoformat(),
+                # لا ننتظر رداً ما لم تصل رسالة المتابعة فعلاً.
+                "feedback_status": (
+                    "awaiting_reply" if chat_id is not None and not customer_send_error
+                    else "delivery_missing_chat" if delivery_missing_chat else "delivery_failed"
+                ),
+                "feedback_requested_at": now.isoformat() if chat_id is not None and not customer_send_error else None,
             }).eq("id", reminder["id"]).execute()
             source_text = "\n📲 المصدر: Instagram" if reminder.get("source") == "instagram" else ""
             sale_text = f"\nرقم العملية: {reminder.get('instagram_sale_id')}" if reminder.get("instagram_sale_id") else ""
@@ -5562,10 +5630,66 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
                       + ("⚠️ فشل إرسال رسالة المتابعة للزبون." if customer_send_error
                          else "✅ أُرسلت رسالة المتابعة وننتظر رده." if chat_id is not None
-                         else "⚠️ ماكو chat_id لإرسال رسالة المتابعة.")),
+                         else "⚠️ ماكو chat_id له في Telegram؛ لا يمكن مراسلته بيوزر إنستغرام وحده.")),
             )
         except Exception:
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
+
+
+async def retry_expired_reminders_missing_chat(
+    context: ContextTypes.DEFAULT_TYPE, now: datetime,
+) -> None:
+    """يعيد محاولة السجلات القديمة التي انتهت قبل حفظ chat_id لها."""
+    try:
+        reminders = (
+            supabase.table("subscription_reminders")
+            .select("id, customer_chat_id, business_connection_id, customer_name, customer_username, instagram_account")
+            .eq("status", "expired").is_("customer_chat_id", "null")
+            # هذه كانت الحالة الخاطئة في النسخ السابقة: وُضع السجل كأنه
+            # ينتظر رداً رغم أن الرسالة لم تُرسل.
+            .eq("feedback_status", "awaiting_reply")
+            .execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to find expired reminders missing chat_id")
+        return
+
+    feedback_text = (
+        "السلام عليكم.\n\n"
+        "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
+        "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
+    )
+    for reminder in reminders:
+        chat_id, connection_id = resolve_reminder_delivery_target(reminder)
+        if chat_id is None or not connection_id:
+            # السجل يبقى محفوظاً، لكن لا ندّعي أن المتابعة أُرسلت.
+            try:
+                supabase.table("subscription_reminders").update({
+                    "feedback_status": "delivery_missing_chat",
+                }).eq("id", reminder["id"]).execute()
+            except Exception:
+                logger.exception("Failed to mark reminder %s as missing Telegram chat", reminder.get("id"))
+            continue
+        try:
+            await send_business_message_with_current_fallback(
+                context, chat_id, feedback_text, connection_id,
+            )
+            supabase.table("subscription_reminders").update({
+                "feedback_status": "awaiting_reply",
+                "feedback_requested_at": now.isoformat(),
+            }).eq("id", reminder["id"]).execute()
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=f"✅ أُرسلت متابعة رضا متأخرة للزبون: {reminder.get('customer_name') or chat_id}",
+            )
+        except Exception:
+            logger.exception("Failed to resend expired feedback to customer %s", chat_id)
+            try:
+                supabase.table("subscription_reminders").update({
+                    "feedback_status": "delivery_failed",
+                }).eq("id", reminder["id"]).execute()
+            except Exception:
+                logger.exception("Failed to mark reminder %s as failed", reminder.get("id"))
 
 
 async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text: str) -> bool:
