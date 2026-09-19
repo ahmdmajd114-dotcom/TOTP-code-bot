@@ -1168,7 +1168,7 @@ def instagram_sale_prompt(state: dict) -> str:
 
 def get_catalog_products() -> list[dict]:
     try:
-        return (supabase.table("catalog_products").select("id, name, aliases, is_active").order("name").execute().data or [])
+        return (supabase.table("catalog_products").select("*").order("name").execute().data or [])
     except Exception:
         logger.exception("Failed to fetch catalog products")
         return []
@@ -1176,7 +1176,7 @@ def get_catalog_products() -> list[dict]:
 
 def get_catalog_product(product_id: str) -> dict | None:
     try:
-        result = supabase.table("catalog_products").select("id, name, aliases, is_active").eq("id", product_id).execute()
+        result = supabase.table("catalog_products").select("*").eq("id", product_id).execute()
         return result.data[0] if result.data else None
     except Exception:
         logger.exception("Failed to fetch catalog product")
@@ -1187,7 +1187,7 @@ def get_catalog_plans(product_id: str) -> list[dict]:
     try:
         return (
             supabase.table("catalog_plans")
-            .select("id, name, price, duration, description, is_active")
+            .select("*")
             .eq("product_id", product_id).order("price").execute().data or []
         )
     except Exception:
@@ -1206,7 +1206,7 @@ def build_catalog_main_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
 
 def build_catalog_product_keyboard(product: dict, plans: list[dict]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
-        f"{'✅' if plan['is_active'] else '⏸️'} {plan['name']} — {plan['price']}",
+        f"{'✅' if plan['is_active'] else '⏸️'} {'🌐' if plan.get('show_in_catalog', True) else '🙈'} {plan['name']} — {plan['price']}",
         callback_data=f"catalog_plan_{plan['id']}",
     )] for plan in plans]
     rows.append([InlineKeyboardButton("➕ إضافة باقة", callback_data=f"catalog_add_plan_{product['id']}")])
@@ -1225,12 +1225,15 @@ def format_catalog_product(product: dict, plans: list[dict]) -> str:
     aliases = product.get("aliases") or []
     if aliases:
         lines.insert(2, f"كلمات التعرف: {', '.join(aliases)}")
+    if product.get("description"):
+        lines.insert(3, f"وصف المنتج: {product['description']}")
     if not plans:
         lines.append("ماكو باقات بعد.")
     for plan in plans:
         plan_status = "مفعلة" if plan["is_active"] else "متوقفة"
         details = f" — {plan['duration']}" if plan.get("duration") else ""
-        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status})")
+        public_status = "ظاهر بالموقع" if plan.get("show_in_catalog", True) else "مخفي من الموقع"
+        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status}، {public_status})")
     return "\n".join(lines)
 
 
@@ -1260,7 +1263,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "catalog_add_product":
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "product_data"}
         await query.edit_message_text(
-            "اكتب المنتج بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
+            "اكتب المنتج بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة | وصف المنتج\n\nمثال: ChatGPT | تشات، جات، chat | مساعد ذكي للدراسة والعمل",
             reply_markup=None,
         )
         return
@@ -1276,7 +1279,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "product_id": product_id,
         }
         await query.edit_message_text(
-            "اكتب الاسم والكلمات الجديدة بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة\n\nمثال: ChatGPT | تشات، جات، chat",
+            "اكتب الاسم والكلمات والوصف بهذا الشكل:\nاسم المنتج | كلمات يتعرف عليها البوت مفصولة بفاصلة | وصف المنتج\n\nمثال: ChatGPT | تشات، جات، chat | مساعد ذكي للدراسة والعمل",
             reply_markup=None,
         )
         return
@@ -1356,7 +1359,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_plan_"):
         plan_id = data[len("catalog_plan_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id, name, price, duration, description, is_active").eq("id", plan_id).execute()
+            result = supabase.table("catalog_plans").select("*").eq("id", plan_id).execute()
             plan = result.data[0] if result.data else None
         except Exception:
             logger.exception("Failed to fetch catalog plan")
@@ -1364,10 +1367,12 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         if plan is None:
             await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
             return
-        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}"
+        visibility = "ظاهرة في كاتالوج الموقع" if plan.get("show_in_catalog", True) else "مخفية من كاتالوج الموقع"
+        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}\nالموقع: {visibility}"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تعديل السعر", callback_data=f"catalog_price_{plan_id}")],
             [InlineKeyboardButton("✏️ تعديل تفاصيل الباقة", callback_data=f"catalog_edit_plan_{plan_id}")],
+            [InlineKeyboardButton("🙈 إخفاء من الموقع" if plan.get("show_in_catalog", True) else "🌐 إظهار في الموقع", callback_data=f"catalog_public_{plan_id}")],
             [InlineKeyboardButton("⏸️ إيقاف" if plan["is_active"] else "✅ تفعيل", callback_data=f"catalog_toggle_{plan_id}")],
             [InlineKeyboardButton("🗑️ حذف الباقة", callback_data=f"catalog_xdelc_{plan_id}")],
             [InlineKeyboardButton(BTN_BACK, callback_data=f"catalog_product_{plan['product_id']}")],
@@ -1382,6 +1387,23 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "plan_id": data[len("catalog_price_"):],
         }
         await query.edit_message_text("اكتب السعر الجديد رقم فقط:", reply_markup=None)
+        return
+
+    if data.startswith("catalog_public_"):
+        plan_id = data[len("catalog_public_"):]
+        try:
+            result = supabase.table("catalog_plans").select("id, product_id, show_in_catalog").eq("id", plan_id).execute()
+            plan = result.data[0] if result.data else None
+            if not plan:
+                await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
+                return
+            supabase.table("catalog_plans").update({"show_in_catalog": not plan.get("show_in_catalog", True)}).eq("id", plan_id).execute()
+            await query.edit_message_text("✅ تم تحديث ظهور الباقة بالموقع.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ رجوع للباقة", callback_data=f"catalog_plan_{plan_id}")],
+            ]))
+        except Exception:
+            logger.exception("Failed to change catalog plan visibility")
+            await query.edit_message_text("⚠️ فشل تحديث ظهور الباقة بالموقع. تأكد من تشغيل SQL الجديد.")
         return
 
     if data.startswith("catalog_edit_plan_"):
@@ -1470,16 +1492,18 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
     text = message.text.strip()
     try:
         if state["step"] == "product_data":
-            name, _, aliases_text = text.partition("|")
-            name = name.strip()
+            parts = [part.strip() for part in text.split("|", 2)]
+            name = parts[0]
+            aliases_text = parts[1] if len(parts) > 1 else ""
+            description = parts[2] if len(parts) > 2 else ""
             aliases = [item.strip() for item in aliases_text.replace("،", ",").split(",") if item.strip()]
             if not name:
                 await message.reply_text("اكتب اسم المنتج أولاً.")
                 return True
-            payload = {"name": name, "aliases": aliases}
+            payload = {"name": name, "aliases": aliases, "description": description or None}
             if state.get("product_id"):
                 supabase.table("catalog_products").update(payload).eq("id", state["product_id"]).execute()
-                await message.reply_text("✅ تم تعديل المنتج والكلمات.")
+                await message.reply_text("✅ تم تعديل المنتج والكلمات والوصف.")
             else:
                 supabase.table("catalog_products").insert(payload).execute()
                 await message.reply_text("✅ تم إضافة المنتج.")
@@ -10693,7 +10717,10 @@ def build_public_catalog_html() -> str:
     support_href = escape(CATALOG_SUPPORT_URL, quote=True) if CATALOG_SUPPORT_URL else "#support"
     for product in products:
         try:
-            plans = [plan for plan in get_catalog_plans(str(product["id"])) if plan.get("is_active")]
+            plans = [
+                plan for plan in get_catalog_plans(str(product["id"]))
+                if plan.get("is_active") and plan.get("show_in_catalog", True)
+            ]
         except Exception:
             logger.exception("Failed to load public plans for %s", product.get("id"))
             plans = []
@@ -10705,13 +10732,14 @@ def build_public_catalog_html() -> str:
             "</div>"
             for plan in plans
         ) or "<p class=\"empty\">لا توجد باقات متاحة حالياً.</p>"
-        cards.append(
-            "<article class=\"product-card\">"
-            f"<h2>{escape(str(product.get('name') or 'منتج'))}</h2>"
-            f"<div class=\"plans\">{plan_rows}</div>"
-            f"<a class=\"subscribe\" href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">اشترك عبر الدعم ←</a>"
-            "</article>"
-        )
+        cards.append("".join([
+            "<article class=\"product-card\">",
+            f"<h2>{escape(str(product.get('name') or 'منتج'))}</h2>",
+            f"<p class=\"product-description\">{escape(str(product['description']))}</p>" if product.get("description") else "",
+            f"<div class=\"plans\">{plan_rows}</div>",
+            f"<a class=\"subscribe\" href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">اشترك عبر الدعم ←</a>",
+            "</article>",
+        ]))
 
     catalog_content = "".join(cards) or (
         "<div class=\"no-products\"><h2>قريباً</h2>"
@@ -10741,7 +10769,7 @@ def build_public_catalog_html() -> str:
     main {{ padding:38px 0 58px; }} .section-title {{ text-align:center; margin:0 0 24px; font-size:25px; }}
     .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }}
     .product-card {{ border:1px solid var(--line); border-radius:22px; background:#fff; padding:23px; box-shadow:0 12px 28px #163c4110; display:flex; flex-direction:column; }}
-    .product-card h2 {{ margin:0 0 17px; color:var(--teal-dark); font-size:23px; }} .plans {{ border-top:1px solid #edf1ef; }}
+    .product-card h2 {{ margin:0 0 9px; color:var(--teal-dark); font-size:23px; }} .product-description {{ min-height:24px; margin:0 0 17px; color:#617478; line-height:1.7; font-size:14px; }} .plans {{ border-top:1px solid #edf1ef; }}
     .plan {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 0; border-bottom:1px solid #edf1ef; }}
     .plan strong,.plan span {{ display:block; }} .plan span {{ color:#65767a; font-size:13px; margin-top:5px; }} .plan b {{ direction:rtl; white-space:nowrap; color:var(--navy); font-size:17px; }} .plan small {{ font-size:12px; color:#65767a; }}
     .subscribe {{ display:block; margin-top:20px; padding:13px; border-radius:12px; background:var(--teal); color:white; text-align:center; text-decoration:none; font-weight:bold; transition:.18s; }} .subscribe:hover {{ background:var(--teal-dark); transform:translateY(-1px); }}

@@ -14,6 +14,10 @@ create table if not exists public.catalog_products (
 alter table public.catalog_products
   add column if not exists aliases text[] not null default '{}';
 
+-- وصف مختصر يظهر لزوار كاتالوج MedBox العام فقط.
+alter table public.catalog_products
+  add column if not exists description text;
+
 create table if not exists public.catalog_plans (
   id uuid primary key default gen_random_uuid(),
   product_id uuid not null references public.catalog_products(id) on delete cascade,
@@ -26,6 +30,10 @@ create table if not exists public.catalog_plans (
   updated_at timestamptz not null default now(),
   unique (product_id, name)
 );
+
+-- الباقة قد تبقى مفعلة داخل البوت، لكن تخفى من كاتالوج الموقع العام.
+alter table public.catalog_plans
+  add column if not exists show_in_catalog boolean not null default true;
 
 create index if not exists catalog_plans_product_id_idx
   on public.catalog_plans(product_id);
