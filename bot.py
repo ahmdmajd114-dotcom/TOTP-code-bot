@@ -1329,7 +1329,12 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_add_plan_"):
         product_id = data[len("catalog_add_plan_"):]
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "plan_data", "product_id": product_id}
-        await query.edit_message_text("اكتب الباقة بهذا الشكل كـرد على هذي الرسالة:\nاسم الباقة | السعر | المدة | وصف اختياري", reply_markup=None)
+        await query.edit_message_text(
+            "اكتب الباقة بهذا الشكل كـرد على هذي الرسالة:\n"
+            "اسم الباقة | السعر | عدد الأيام | وصف اختياري\n"
+            "مثال: شهر خاص | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم.",
+            reply_markup=None,
+        )
         return
 
     if data.startswith("catalog_plan_"):
@@ -1463,10 +1468,15 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 await message.reply_text("✅ تم إضافة المنتج.")
         elif state["step"] == "plan_data":
             parts = [part.strip() for part in text.split("|", 3)]
-            if len(parts) < 2 or not parts[0] or not parts[1].isdigit():
-                await message.reply_text("الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | المدة | وصف")
+            duration = parts[2] if len(parts) > 2 else ""
+            valid_duration = bool(re.fullmatch(r"[1-9]\d*", duration)) or is_permanent_duration(duration)
+            if len(parts) < 3 or not parts[0] or not parts[1].isdigit() or not valid_duration:
+                await message.reply_text(
+                    "الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | عدد الأيام | وصف\n"
+                    "مثال: شهر خاص | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم."
+                )
                 return True
-            payload = {"product_id": state["product_id"], "name": parts[0], "price": int(parts[1]), "duration": parts[2] if len(parts) > 2 else None, "description": parts[3] if len(parts) > 3 else None}
+            payload = {"product_id": state["product_id"], "name": parts[0], "price": int(parts[1]), "duration": duration, "description": parts[3] if len(parts) > 3 else None}
             if state.get("plan_id"):
                 supabase.table("catalog_plans").update(payload).eq("id", state["plan_id"]).execute()
                 await message.reply_text("✅ تم تعديل الباقة.")
@@ -2564,7 +2574,12 @@ def build_ambos_duration_keyboard() -> InlineKeyboardMarkup:
 
 
 def duration_to_days(duration: str | None) -> int | None:
-    """يحوّل مدة الكاتالوج إلى أيام تقريبية ثابتة للتنبيه."""
+    """يحوّل مدة الكاتالوج إلى أيام؛ الإدخال الجديد رقم إنكليزي فقط."""
+    raw = str(duration or "").strip()
+    if re.fullmatch(r"[1-9]\d*", raw):
+        return int(raw)
+
+    # توافق مؤقت مع الباقات القديمة التي كانت تحفظ "شهر" أو "30 يوم".
     text = normalize_style_text(duration or "")
     joined = " ".join(text)
     if any(word in text for word in {"سنه", "سنة", "عام", "سنه"}):
@@ -2850,6 +2865,16 @@ CHATGPT_PRODUCT_NAME = "جات"
 CHATGPT_ROW_MATCH_WINDOW_DAYS = 7
 
 
+def is_chatgpt_product_name(product_name: str | None) -> bool:
+    """اسم ChatGPT في الكاتالوج الجديد أو الاسم الإرثي في الشيت."""
+    normalized = str(product_name or "").strip().lower()
+    return normalized in {"chatgpt", CHATGPT_PRODUCT_NAME}
+
+
+def is_chatgpt_payment_state(state: dict) -> bool:
+    return is_chatgpt_product_name(state.get("product"))
+
+
 def format_customer_line(customer_name: str, customer_username: str | None) -> str:
     line = customer_name
     if customer_username:
@@ -2859,7 +2884,7 @@ def format_customer_line(customer_name: str, customer_username: str | None) -> s
 
 def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
     """
-    يدور عن آخر سطر بالشيت لنفس chat_id، شرط المنتج = جات، خلال آخر
+    يدور عن آخر سطر ChatGPT بالشيت لنفس chat_id، خلال آخر
     أسبوع، وفيه خانة مهمة فاضية (مبلغ/طرق الدفع/حسابات جات). يرجع رقم
     الصف (1-indexed كما تتوقعه gspread) لو لقى، أو None لو لازم سطر جديد.
     """
@@ -2884,7 +2909,7 @@ def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
         row_chat_id = row[SHEET_COL_CHAT_ID - 1].strip()
         row_product = row[SHEET_COL_PRODUCT - 1].strip()
 
-        if row_chat_id != chat_id_str or row_product != CHATGPT_PRODUCT_NAME:
+        if row_chat_id != chat_id_str or not is_chatgpt_product_name(row_product):
             continue
 
         try:
@@ -2933,7 +2958,7 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
 
     try:
         target_row = None
-        if not force_new and product == CHATGPT_PRODUCT_NAME and chat_id is not None:
+        if not force_new and is_chatgpt_product_name(product) and chat_id is not None:
             target_row = find_completable_chatgpt_row(sheet, chat_id)
 
         if target_row is not None:
@@ -2998,7 +3023,9 @@ def upsert_chatgpt_account(
         return False
 
 
-def save_subscription_reminder(state: dict) -> bool:
+def save_subscription_reminder(
+    state: dict, *, status: str = "active", started_at: datetime | None = None,
+) -> bool:
     """يحفظ تنبيه انتهاء أي منتج ذي مدة من الكاتالوج أو ChatGPT."""
     subscription_type = state.get("subscription_type")
     duration_months = state.get("duration_months")
@@ -3012,7 +3039,7 @@ def save_subscription_reminder(state: dict) -> bool:
     if not chat_id or not duration_days or duration_days <= 0:
         return False
 
-    now = datetime.now(timezone.utc)
+    start = started_at or datetime.now(timezone.utc)
     try:
         supabase.table("subscription_reminders").insert({
             "customer_chat_id": chat_id,
@@ -3024,8 +3051,9 @@ def save_subscription_reminder(state: dict) -> bool:
             "subscription_type": subscription_type or "general", "duration_months": duration_months,
             "duration_days": duration_days, "feedback_only": feedback_only,
             "feedback_status": "scheduled" if feedback_only else "none",
-            "is_debt": bool(state.get("is_debt", False)), "started_at": now.isoformat(),
-            "expires_at": (now + timedelta(days=duration_days)).isoformat(),
+            "is_debt": bool(state.get("is_debt", False)), "status": status,
+            "started_at": start.isoformat(),
+            "expires_at": (start + timedelta(days=duration_days)).isoformat(),
         }).execute()
         return True
     except Exception:
@@ -3065,6 +3093,42 @@ async def schedule_subscription_feedback(state: dict) -> None:
         }).eq("id", row[0]["id"]).execute()
     except Exception:
         logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
+
+
+def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
+    """يبدأ عدّ اشتراك ChatGPT عند إرسال الحساب فعلياً عبر /link."""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id, product_name, duration_days, feedback_only")
+            .eq("customer_chat_id", chat_id)
+            .eq("status", "pending_delivery")
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute().data or []
+        )
+        reminder = next(
+            (row for row in rows if is_chatgpt_product_name(row.get("product_name"))),
+            None,
+        )
+        if reminder is None:
+            return None
+
+        duration_days = 1 if reminder.get("feedback_only") else int(reminder.get("duration_days") or 0)
+        if duration_days <= 0:
+            logger.error("Pending ChatGPT subscription %s has no duration", reminder["id"])
+            return None
+        started_at = datetime.now(timezone.utc)
+        supabase.table("subscription_reminders").update({
+            "status": "active",
+            "started_at": started_at.isoformat(),
+            "expires_at": (started_at + timedelta(days=duration_days)).isoformat(),
+        }).eq("id", reminder["id"]).execute()
+        return {"customer_chat_id": chat_id, "duration_days": duration_days,
+                "reminder_disabled": bool(reminder.get("feedback_only"))}
+    except Exception:
+        logger.exception("Failed to activate pending ChatGPT subscription for delivery %s", chat_id)
+        return None
 
 
 async def cancel_scheduled_subscription_feedback(customer_chat_id: int) -> None:
@@ -6473,6 +6537,12 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         ).execute()
         authorize_recently_linked_customer_code(chat_id)
 
+        # دفع ChatGPT لا يبدأ منه العد. يبدأ الآن، عند إرسال الحساب فعلياً
+        # بهذا الـ /link، ثم تُحجز رسالة المتابعة لتاريخ انتهائه الجديد.
+        activated_subscription = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+        if activated_subscription:
+            await schedule_subscription_feedback(activated_subscription)
+
         # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
         # بطلب الكود تلقائياً. الحسابات المشتركة تبقى على مسارها المعتاد.
         state = get_interactive_sale_state(chat_id)
@@ -7153,8 +7223,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             return
 
         if (not state.get("manual_product")
-                and state["product"] == CHATGPT_PRODUCT_NAME
-                and not state.get("subscription_type")):
+                and is_chatgpt_payment_state(state)
+                and not state.get("duration_days")
+                and not state.get("reminder_disabled")):
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر نوع ومدة الاشتراك حتى ينحفظ تنبيه نهايته:",
                 reply_markup=build_subscription_type_keyboard(),
@@ -7178,10 +7249,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         saved = append_payment_row(state)
         subscription_saved = False
         if saved and not state.get("manual_product") and (
-            state["product"] == CHATGPT_PRODUCT_NAME or state.get("duration_days") or state.get("reminder_disabled")
+            is_chatgpt_payment_state(state) or state.get("duration_days") or state.get("reminder_disabled")
         ):
-            subscription_saved = save_subscription_reminder(state)
-            if subscription_saved:
+            # ChatGPT ينتظر تسليم الحساب: لا يبدأ الاشتراك ولا تُرسل المتابعة
+            # من وقت الدفع، بل من /link. بقية المنتجات تبدأ عند تثبيت الدفع.
+            pending_delivery = is_chatgpt_payment_state(state)
+            subscription_saved = save_subscription_reminder(
+                state, status="pending_delivery" if pending_delivery else "active",
+            )
+            if subscription_saved and not pending_delivery:
                 await schedule_subscription_feedback(state)
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
