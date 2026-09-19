@@ -24,7 +24,6 @@ import base64
 import asyncio
 import logging
 import json
-import time
 from html import escape
 from types import SimpleNamespace
 import pyotp
@@ -996,9 +995,9 @@ LEGACY_PRODUCT_FAQ_CATEGORIES = {
 # الاسم القديم مستخدم في مسار الاختبار/المعرفة لاستبعاد النصوص الثابتة أيضاً.
 INTERACTIVE_PRODUCT_FAQ_CATEGORIES = LEGACY_PRODUCT_FAQ_CATEGORIES
 
-SEEN_DELAY_SECONDS = 5       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
-PRE_TYPING_PAUSE_SECONDS = 3  # فترة صمت بعد علامة الصح، قبل ما يبدأ "يكتب..."
-TYPING_DURATION_SECONDS = 6   # مدة ظهور "يكتب..." قبل إرسال الرد
+SEEN_DELAY_SECONDS = 3       # فترة قبل ما البوت "يشوف" الرسالة (قبل علامة الصح الزرقاء)
+PRE_TYPING_PAUSE_SECONDS = 2  # فترة ظهور المشاهدة قبل ما يبدأ "يكتب..."
+TYPING_DURATION_SECONDS = 3   # مدة ظهور "يكتب..." قبل إرسال الرد
 
 LINK_PATTERN = re.compile(r"^/link\s+(\S+)$", re.IGNORECASE)
 ADD_PATTERN = re.compile(r"^/addaccount\s+(\S+)\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
@@ -6169,15 +6168,11 @@ def generate_totp_code(secret: str) -> str:
     return totp.now()
 
 
-CODE_REPLY_MARKER = "__SEND_FRESH_TOTP_CODE__"
+CODE_REPLY_MARKER = "__SEND_CURRENT_TOTP_CODE__"
 
 
-async def generate_fresh_totp_code_for_chat(chat_id: int) -> str | None:
-    """Generate a code at the beginning of a fresh 30-second TOTP window."""
-    elapsed = time.time() % 30
-    # لو دخلنا بالفعل بأول ثانية من الدورة، لا نؤخره دورة كاملة.
-    if elapsed > 1:
-        await asyncio.sleep((30 - elapsed) + 0.12)
+async def generate_current_totp_code_for_chat(chat_id: int) -> str | None:
+    """Generate the currently valid code immediately before sending it."""
     result = get_secret_for_chat(chat_id)
     if result is None:
         return None
@@ -6191,17 +6186,8 @@ async def human_like_code_reply_sequence(
     business_connection_id: str,
     message_id: int,
 ) -> None:
-    """Code timing: 3 seconds to read the request, then 5 seconds typing."""
-    await asyncio.sleep(3)
-    try:
-        await context.bot.read_business_message(
-            business_connection_id=business_connection_id,
-            chat_id=chat_id,
-            message_id=message_id,
-        )
-    except Exception:
-        logger.exception("Failed to mark code request as read")
-    await _show_typing(context, chat_id, business_connection_id, 5)
+    """Code requests deliberately wait one second only, with no typing UI."""
+    await asyncio.sleep(1)
 
 
 def authorize_recently_linked_customer_code(chat_id: int) -> None:
@@ -6494,8 +6480,7 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     )
     if decision.action == "send_code":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
-        # التوليد نفسه يتأجل لآخر لحظة قبل الإرسال بعد انتهاء التأخير
-        # البشري، حتى يصل الكود ببداية عمره الكامل تقريباً.
+        # التوليد يتأجل لآخر لحظة قبل الإرسال، بعد انتظار ثانية واحدة فقط.
         return CODE_REPLY_MARKER, False
     if decision.action == "ask_restart":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
@@ -6526,7 +6511,7 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
     if result is None:
         await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
         return
-    code = await generate_fresh_totp_code_for_chat(chat_id)
+    code = await generate_current_totp_code_for_chat(chat_id)
     if not code:
         await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
         return
@@ -6580,12 +6565,12 @@ async def human_like_reply_sequence(
 ) -> None:
     """
     يحاكي تسلسل رد إنسان حقيقي، بالترتيب الزمني التالي:
-    1) 5 ثواني: البوت "ما يشوف" الرسالة بعد (ما يسوي شي)
-    2) بعد الـ5 ثواني: تنعلّم الرسالة كمقروءة (✓✓ زرقاء تظهر عند الزبون)
-    3) 3 ثواني: صمت بعد علامة الصح، قبل ما يبدأ الكتابة
-    4) 6 ثواني: يظهر مؤشر 'يكتب...'
+    1) 3 ثواني: البوت "ما يشوف" الرسالة بعد (ما يسوي شي)
+    2) بعد الـ3 ثواني: تنعلّم الرسالة كمقروءة (✓✓ زرقاء تظهر عند الزبون)
+    3) ثانيتان: صمت بعد علامة الصح، قبل ما يبدأ الكتابة
+    4) 3 ثوانٍ: يظهر مؤشر 'يكتب...'
     بعدها الكود المستدعي يرسل الرد الفعلي.
-    المجموع: 5 + 3 + 6 = 14 ثانية قبل وصول الرد.
+    المجموع: 3 + 2 + 3 = 8 ثوانٍ قبل وصول الرد.
     """
     # 1) فترة قبل الرؤية
     await asyncio.sleep(SEEN_DELAY_SECONDS)
@@ -6923,7 +6908,7 @@ async def handle_customer_photo(
             await human_like_code_reply_sequence(
                 context, chat_id, bm.business_connection_id, bm.message_id
             )
-            reply_text = await generate_fresh_totp_code_for_chat(chat_id)
+            reply_text = await generate_current_totp_code_for_chat(chat_id)
             if not reply_text:
                 return
         else:
@@ -9133,7 +9118,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         reply, stopped = process_code_request(customer_chat_id)
         if reply:
             if reply == CODE_REPLY_MARKER:
-                reply = await generate_fresh_totp_code_for_chat(customer_chat_id)
+                reply = await generate_current_totp_code_for_chat(customer_chat_id)
             if not reply:
                 reply = render_test_response("handoff", user_text, customer_chat_id)
             else:
@@ -10423,7 +10408,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await human_like_code_reply_sequence(
                 context, chat_id, bm.business_connection_id, bm.message_id
             )
-            code = await generate_fresh_totp_code_for_chat(chat_id)
+            code = await generate_current_totp_code_for_chat(chat_id)
             if not code:
                 return
             try:
@@ -10657,7 +10642,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     sent_replies: list[str] = []
     for reply_text in outgoing_replies:
         if reply_text == CODE_REPLY_MARKER:
-            reply_text = await generate_fresh_totp_code_for_chat(chat_id)
+            reply_text = await generate_current_totp_code_for_chat(chat_id)
             if not reply_text:
                 continue
         await context.bot.send_message(
