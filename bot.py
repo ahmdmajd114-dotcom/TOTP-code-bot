@@ -3187,9 +3187,13 @@ async def schedule_subscription_feedback(state: dict) -> bool:
     if not chat_id or not duration_days:
         return False
     try:
-        row = (supabase.table("subscription_reminders").select("id, expires_at")
-               .eq("customer_chat_id", chat_id).eq("status", "active")
-               .order("created_at", desc=True).limit(1).execute().data or [])
+        query = (supabase.table("subscription_reminders").select("id, expires_at")
+                 .eq("customer_chat_id", chat_id).eq("status", "active"))
+        if state.get("reminder_id"):
+            query = query.eq("id", state["reminder_id"])
+        else:
+            query = query.order("created_at", desc=True).limit(1)
+        row = query.execute().data or []
         if not row:
             return False
         expires_at = datetime.fromisoformat(row[0]["expires_at"].replace("Z", "+00:00"))
@@ -3202,6 +3206,46 @@ async def schedule_subscription_feedback(state: dict) -> bool:
     except Exception:
         logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
         return False
+
+
+async def replace_chatgpt_reminder_with_compensation(state: dict, duration_days: int) -> dict | None:
+    """يبدّل آخر تنبيه ChatGPT للزبون بمدة تعويض، بدل إنشاء تنبيه ثانٍ."""
+    chat_id = state.get("customer_chat_id")
+    if not chat_id or duration_days <= 0:
+        return None
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id, product_name, scheduled_message_id")
+            .eq("customer_chat_id", chat_id)
+            .order("created_at", desc=True).limit(50).execute().data or []
+        )
+        reminder = next((row for row in rows if is_chatgpt_product_name(row.get("product_name"))), None)
+        if reminder is None:
+            return None
+        old_message_id = reminder.get("scheduled_message_id")
+        if old_message_id and personal_scheduler_is_configured():
+            await cancel_personal_scheduled_message(int(chat_id), int(old_message_id))
+
+        started_at = datetime.now(timezone.utc)
+        supabase.table("subscription_reminders").update({
+            "product_name": CHATGPT_PRODUCT_NAME,
+            "plan_name": "تعويض",
+            "plan_duration": f"{duration_days} يوم",
+            "duration_days": duration_days,
+            "feedback_only": False,
+            "feedback_status": "none",
+            "is_debt": False,
+            "status": "active",
+            "started_at": started_at.isoformat(),
+            "expires_at": (started_at + timedelta(days=duration_days)).isoformat(),
+            "scheduled_message_id": None,
+            "scheduled_message_status": "none",
+        }).eq("id", reminder["id"]).execute()
+        return {**state, "duration_days": duration_days, "reminder_id": reminder["id"]}
+    except Exception:
+        logger.exception("Failed to replace ChatGPT reminder with compensation for %s", chat_id)
+        return None
 
 
 async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6418,6 +6462,25 @@ def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
     return is_chatgpt_product_name(product)
 
 
+def has_previous_chatgpt_subscription_for_delivery_choice(chat_id: int) -> bool:
+    """هل للزبون اشتراك ChatGPT سابق غير دفعة التسليم الجديدة المعلّقة؟"""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("product_name")
+            .eq("customer_chat_id", chat_id)
+            .neq("status", "pending_delivery")
+            .limit(50)
+            .execute().data or []
+        )
+        return any(is_chatgpt_product_name(row.get("product_name")) for row in rows)
+    except Exception:
+        logger.exception("Failed to check previous ChatGPT subscriptions for %s", chat_id)
+        # لا نُخفي سؤال التمييز عند تعذر القراءة؛ هذا أكثر أماناً من البدء
+        # بمدة غير مقصودة فوق اشتراك قديم.
+        return True
+
+
 def recover_paid_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
     """يعيد إنشاء تنبيه باقة فات حفظه بعد دفعة ChatGPT ناجحة.
 
@@ -6854,16 +6917,8 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             saved = upsert_chatgpt_account(chat_id, customer_name, customer_username, label)
             sheet_note = "\n✅ تم تسجيل الحساب بالشيت." if saved else "\n⚠️ فشل تسجيل الحساب بالشيت."
 
-        await context.bot.send_message(
-            chat_id=OWNER_USER_ID,
-            text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
-                  "حدد نوع التسليم حتى تنحسب المدة صح:"),
-            reply_markup=build_link_delivery_keyboard(chat_id),
-        )
-        # لا نبدأ العداد هنا: الأونر يحدد أولاً هل هذا اشتراك جديد،
-        # تعويض، أو دين. هذا يمنع تحويل التعويض إلى مدة قديمة بالخطأ.
         fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
-        context.user_data["pending_link_delivery"] = {
+        delivery_state = {
             "customer_chat_id": chat_id,
             "customer_name": (
                 bm.chat.full_name or bm.chat.first_name or "غير معروف"
@@ -6872,6 +6927,41 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "customer_username": bm.chat.username if bm is not None else fallback_username,
             "account_label": label or link_code,
         }
+        previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
+        if previous_subscription:
+            # فقط الزبون الذي عنده اشتراك سابق يحتاج يحدد: جديد لو تعويض.
+            context.user_data["pending_link_delivery"] = delivery_state
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                      "عنده اشتراك سابق؛ حدد نوع هذا التسليم:"),
+                reply_markup=build_link_delivery_keyboard(chat_id),
+            )
+        else:
+            # زبون جديد دافع: نفس الفلو القديم، نفعّل باقته تلقائياً من لحظة
+            # تسليم الحساب، من دون أي سؤال إضافي.
+            activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+            if activated is None:
+                activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
+            if activated:
+                scheduled = await schedule_subscription_feedback(activated)
+                end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
+                schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                          f"✅ تم تفعيل باقته تلقائياً لمدة {activated['duration_days']} يوم.\n"
+                          f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"),
+                )
+            else:
+                # ماكو دفعة مسجلة: هذا هو فلو الدين القديم فقط.
+                context.user_data["pending_link_debt"] = delivery_state
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                          "هل هذا الزبون دين؟"),
+                    reply_markup=build_link_debt_keyboard(chat_id),
+                )
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
             customer_username_for_topic = bm.chat.username if bm is not None else None
@@ -7827,25 +7917,19 @@ async def handle_link_compensation_duration_input(update: Update, context: Conte
     if duration_days is None or duration_days <= 0:
         await message.reply_text("اكتب مدة التعويض بالأيام، مثلاً: 30")
         return True
-    reminder_state = {
-        **state,
-        "product": CHATGPT_PRODUCT_NAME,
-        "plan_name": "تعويض",
-        "plan_duration": f"{duration_days} يوم",
-        "duration_days": duration_days,
-        "subscription_type": "shared",
-        "reminder_disabled": False,
-    }
-    saved = save_subscription_reminder(reminder_state)
-    if not saved:
-        await message.reply_text("⚠️ تم الربط، لكن فشل حفظ مدة التعويض.")
+    reminder_state = await replace_chatgpt_reminder_with_compensation(state, duration_days)
+    if reminder_state is None:
+        await message.reply_text(
+            "⚠️ تم الربط، لكن ما لكيت تنبيه ChatGPT سابق حتى أستبدله بالتعويض. "
+            "سجّل التنبيه أولاً أو راجع سجل الاشتراك."
+        )
         return True
     scheduled = await schedule_subscription_feedback(reminder_state)
     context.user_data.pop("pending_link_compensation", None)
     end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=duration_days)
     schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
     await message.reply_text(
-        f"✅ تم تسجيل تعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
+        f"✅ تم تعديل تنبيه الاشتراك نفسه إلى تعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
         f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
     )
     return True
