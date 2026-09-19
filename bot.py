@@ -10391,10 +10391,15 @@ def start_health_server() -> None:
     logger.info(f"Health check server running on port {port}")
 
 
+async def on_bot_initialized(app: Application) -> None:
+    """يشغّل إصلاح الجدولات القديمة فور إقلاع الخدمة، لا بعد انتظار الـJobQueue."""
+    app.create_task(backfill_linked_chatgpt_schedules(None))
+
+
 def main() -> None:
     start_health_server()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_bot_initialized).build()
 
     # يفحص كل 15 دقيقة؛ لذلك التنبيه يصل خلال ربع ساعة كحد أقصى من النهاية.
     if app.job_queue is None:
