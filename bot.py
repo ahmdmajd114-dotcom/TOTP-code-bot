@@ -3137,21 +3137,27 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
             )
             if not links or not links[0].get("linked_at"):
                 continue
-            linked_at = datetime.fromisoformat(str(links[0]["linked_at"]).replace("Z", "+00:00"))
-            expires_at = linked_at + timedelta(days=duration_days)
-            if expires_at <= now:
-                continue
-            supabase.table("subscription_reminders").update({
-                "started_at": linked_at.isoformat(),
-                "expires_at": expires_at.isoformat(),
-            }).eq("id", reminder["id"]).execute()
-            message_id = await schedule_personal_message(
-                int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at,
-            )
-            supabase.table("subscription_reminders").update({
-                "scheduled_message_id": message_id,
-                "scheduled_message_status": "scheduled",
-            }).eq("id", reminder["id"]).execute()
+            try:
+                linked_at = datetime.fromisoformat(str(links[0]["linked_at"]).replace("Z", "+00:00"))
+                expires_at = linked_at + timedelta(days=duration_days)
+                if expires_at <= now:
+                    continue
+                supabase.table("subscription_reminders").update({
+                    "started_at": linked_at.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                }).eq("id", reminder["id"]).execute()
+                message_id = await schedule_personal_message(
+                    int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at,
+                )
+                supabase.table("subscription_reminders").update({
+                    "scheduled_message_id": message_id,
+                    "scheduled_message_status": "scheduled",
+                }).eq("id", reminder["id"]).execute()
+            except Exception:
+                logger.exception("Failed to backfill scheduled feedback for customer %s", chat_id)
+                supabase.table("subscription_reminders").update({
+                    "scheduled_message_status": "failed",
+                }).eq("id", reminder["id"]).execute()
     except Exception:
         logger.exception("Failed to backfill scheduled ChatGPT feedback")
 

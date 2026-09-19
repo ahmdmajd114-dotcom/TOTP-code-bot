@@ -36,6 +36,17 @@ def _client():
     )
 
 
+async def _resolve_customer_entity(client, chat_id: int):
+    """يستخرج access_hash للعميل من محادثات الحساب الشخصي عند الحاجة."""
+    try:
+        return await client.get_input_entity(chat_id)
+    except (ValueError, TypeError):
+        # الـchat_id وحده لا يكفي دائماً في MTProto، خصوصاً عندما تكون
+        # الرسالة السابقة وصلت عن طريق Telegram Business لا Telethon.
+        await client.get_dialogs(limit=None)
+        return await client.get_input_entity(chat_id)
+
+
 async def schedule_message(chat_id: int, text: str, when: datetime) -> int:
     """Schedule a message in the owner's existing private chat with customer."""
     client = _client()
@@ -43,7 +54,8 @@ async def schedule_message(chat_id: int, text: str, when: datetime) -> int:
     try:
         if not await client.is_user_authorized():
             raise RuntimeError("Personal Telegram session is no longer authorized")
-        message = await client.send_message(chat_id, text, schedule=when)
+        entity = await _resolve_customer_entity(client, chat_id)
+        message = await client.send_message(entity, text, schedule=when)
         return int(message.id)
     finally:
         await client.disconnect()
@@ -56,7 +68,8 @@ async def send_message(chat_id: int, text: str) -> int:
         await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError("Telegram personal session is not authorized")
-        message = await client.send_message(chat_id, text)
+        entity = await _resolve_customer_entity(client, chat_id)
+        message = await client.send_message(entity, text)
         return int(message.id)
     finally:
         await client.disconnect()
