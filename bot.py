@@ -10776,6 +10776,20 @@ def format_public_catalog_price(price: object, display_price: object = None) -> 
     return f"{amount} د.ع"
 
 
+PUBLIC_CATALOG_SECTIONS = (
+    ("تطبيقات الذكاء الاصطناعي", {"chatgpt", "claude"}),
+    ("تطبيقات الكتابة", {"freenote", "goodnote", "goodnotes"}),
+    ("تطبيقات التصميم", {"canva", "capcut"}),
+    ("تطبيقات التفريغ الصوتي والإنتاجية", {"scripta", "ank i", "anki"}),
+    ("تطبيقات تيليجرام", {"telegram"}),
+)
+
+
+def public_catalog_product_key(name: object) -> str:
+    """Stable key for the small, deliberately ordered public catalog groups."""
+    return " ".join(str(name or "").strip().casefold().split())
+
+
 def build_public_catalog_html() -> str:
     """Render the public MedBox catalog from the active control-panel catalog."""
     try:
@@ -10784,8 +10798,8 @@ def build_public_catalog_html() -> str:
         logger.exception("Failed to load public catalog")
         products = []
 
-    cards: list[str] = []
     support_href = escape(CATALOG_SUPPORT_URL, quote=True) if CATALOG_SUPPORT_URL else "#support"
+    cards_by_product_id: dict[str, str] = {}
     for product in products:
         try:
             plans = [
@@ -10803,16 +10817,38 @@ def build_public_catalog_html() -> str:
             "</div>"
             for plan in plans
         ) or "<p class=\"empty\">لا توجد باقات متاحة حالياً.</p>"
-        cards.append("".join([
+        cards_by_product_id[str(product.get("id"))] = "".join([
             "<article class=\"product-card\">",
             f"<h2>{escape(str(product.get('name') or 'منتج'))}</h2>",
             f"<p class=\"product-description\">{escape(str(product['description']))}</p>" if product.get("description") else "",
             f"<div class=\"plans\">{plan_rows}</div>",
             f"<a class=\"subscribe\" href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">اشترك عبر الدعم ←</a>",
             "</article>",
-        ]))
+        ])
 
-    catalog_content = "".join(cards) or (
+    remaining_products = list(products)
+    catalog_sections: list[str] = []
+    for section_name, product_names in PUBLIC_CATALOG_SECTIONS:
+        section_products = [
+            product for product in remaining_products
+            if public_catalog_product_key(product.get("name")) in product_names
+        ]
+        if not section_products:
+            continue
+        section_ids = {str(product.get("id")) for product in section_products}
+        remaining_products = [product for product in remaining_products if str(product.get("id")) not in section_ids]
+        catalog_sections.append(
+            f"<section class=\"catalog-group\"><h2>{escape(section_name)}</h2>"
+            f"<div class=\"grid\">{''.join(cards_by_product_id[str(product.get('id'))] for product in section_products)}</div></section>"
+        )
+    # حتى لا تختفي أي باقة تضيفها مستقبلاً قبل تصنيفها ضمن الأقسام أعلاه.
+    if remaining_products:
+        catalog_sections.append(
+            "<section class=\"catalog-group\"><h2>تطبيقات أخرى</h2>"
+            f"<div class=\"grid\">{''.join(cards_by_product_id[str(product.get('id'))] for product in remaining_products)}</div></section>"
+        )
+
+    catalog_content = "".join(catalog_sections) or (
         "<div class=\"no-products\"><h2>قريباً</h2>"
         "<p>نحدّث الباقات حالياً. تواصل ويانا للدعم والاشتراك.</p></div>"
     )
@@ -10837,7 +10873,7 @@ def build_public_catalog_html() -> str:
     .mark {{ position:relative; display:grid; place-items:center; width:48px; height:48px; border-radius:15px; background:#f5f2e9; color:var(--teal); font-size:38px; line-height:1; }}
     .mark::after {{ content:''; position:absolute; width:8px; height:8px; border-radius:50%; top:8px; right:8px; background:var(--teal); }}
     .hero {{ text-align:center; padding:55px 12px 2px; }} .hero h1 {{ margin:0; font-size:clamp(30px,5vw,52px); }} .school-welcome {{ margin:17px auto 0; color:#fff7dd; font-size:clamp(16px,2vw,20px); font-weight:bold; line-height:1.8; }} .hero p {{ max-width:590px; margin:16px auto 0; font-size:clamp(16px,2vw,19px); opacity:.94; line-height:1.9; }}
-    main {{ padding:38px 0 58px; }} .section-title {{ text-align:center; margin:0 0 24px; font-size:25px; }}
+    main {{ padding:38px 0 58px; }} .section-title {{ text-align:center; margin:0 0 24px; font-size:25px; }} .catalog-group {{ padding-top:10px; margin-top:34px; border-top:2px solid var(--line); }} .catalog-group:first-child {{ border-top:0; margin-top:0; padding-top:0; }} .catalog-group h2 {{ margin:0 0 20px; color:var(--teal-dark); font-size:clamp(22px,3vw,29px); }}
     .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:18px; }}
     .product-card {{ border:1px solid var(--line); border-radius:22px; background:#fff; padding:23px; box-shadow:0 12px 28px #163c4110; display:flex; flex-direction:column; }}
     .product-card h2 {{ margin:0 0 9px; color:var(--teal-dark); font-size:23px; }} .product-description {{ min-height:24px; margin:0 0 17px; color:#617478; line-height:1.7; font-size:14px; }} .plans {{ border-top:1px solid #edf1ef; }}
@@ -10851,7 +10887,7 @@ def build_public_catalog_html() -> str:
 </head>
 <body>
   <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><div class=\"school-welcome\">نرحّب بكم بالعام الدراسي الجديد، ونتمنى لكم عاماً دراسياً مثمراً وسعيداً.</div><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
-  <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2><section class=\"grid\">{catalog_content}</section></main>
+  <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2>{catalog_content}</main>
   <footer>© MedBox Pro<br>{escape(support_note)}<br><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a></footer>
 </body></html>"""
 
