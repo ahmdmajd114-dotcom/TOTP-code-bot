@@ -40,6 +40,10 @@ alter table public.catalog_plans
 alter table public.catalog_plans
   add column if not exists show_to_customers boolean not null default true;
 
+-- سعر عرض اختياري: يظهر للزبون ولموقع MedBox، بينما يبقى price للحسابات.
+alter table public.catalog_plans
+  add column if not exists display_price text;
+
 create index if not exists catalog_plans_product_id_idx
   on public.catalog_plans(product_id);
 

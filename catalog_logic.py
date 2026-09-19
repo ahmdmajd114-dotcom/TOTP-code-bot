@@ -121,16 +121,20 @@ def format_customer_catalog_reply(
         elif duration and normalize_arabic_text(duration) not in normalized_title:
             title = f"{title} لمدة {duration}" if title else duration
 
-        raw_price = plan.get("price")
-        try:
-            numeric_price = float(raw_price)
-            if numeric_price >= 1000:
-                numeric_price /= 1000
-            shown_price = int(numeric_price) if numeric_price.is_integer() else numeric_price
-            unit = "آلاف" if 3 <= numeric_price <= 10 else "ألف"
-            price_text = f"{shown_price} {unit}"
-        except (TypeError, ValueError):
-            price_text = str(raw_price or "").strip()
+        custom_display_price = str(plan.get("display_price") or "").strip()
+        if custom_display_price:
+            price_text = custom_display_price
+        else:
+            raw_price = plan.get("price")
+            try:
+                numeric_price = float(raw_price)
+                if numeric_price >= 1000:
+                    numeric_price /= 1000
+                shown_price = int(numeric_price) if numeric_price.is_integer() else numeric_price
+                unit = "آلاف" if 3 <= numeric_price <= 10 else "ألف"
+                price_text = f"{shown_price} {unit}"
+            except (TypeError, ValueError):
+                price_text = str(raw_price or "").strip()
 
         line = f"- {title}، سعره {price_text}."
         if plan.get("description"):

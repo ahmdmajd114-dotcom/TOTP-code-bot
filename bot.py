@@ -1235,7 +1235,8 @@ def format_catalog_product(product: dict, plans: list[dict]) -> str:
         details = f" — {plan['duration']}" if plan.get("duration") else ""
         public_status = "ظاهر بالموقع" if plan.get("show_in_catalog", True) else "مخفي من الموقع"
         customer_status = "ظاهر للزبون" if plan.get("show_to_customers", True) else "مخفي عن الزبون"
-        lines.append(f"• {plan['name']}: {plan['price']}{details} ({plan_status}، {public_status}، {customer_status})")
+        shown_price = plan.get("display_price") or plan["price"]
+        lines.append(f"• {plan['name']}: {plan['price']} (المعروض: {shown_price}){details} ({plan_status}، {public_status}، {customer_status})")
     return "\n".join(lines)
 
 
@@ -1352,8 +1353,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
         context.user_data["pending_catalog_input"] = {"message_id": query.message.message_id, "step": "plan_data", "product_id": product_id}
         await query.edit_message_text(
             "اكتب الباقة بهذا الشكل:\n"
-            "اسم الزبون (اسم الموقع) | السعر | عدد الأيام | وصف اختياري\n"
-            "مثال: شهر خاص (شهر خاص للطلاب) | 10000 | 30 | وصف. وللباقة الدائمة اكتب: دائم.",
+            "اسم الزبون (اسم الموقع) | السعر الحقيقي (السعر المعروض اختياري) | المدة | وصف اختياري\n"
+            "مثال: شهر خاص (شهر خاص للطلاب) | 10000 (5 الف د.ع) | 30 | وصف. وإذا ما كتبت السعر بين قوسين يظهر السعر الحقيقي تلقائياً.",
             reply_markup=None,
         )
         return
@@ -1371,7 +1372,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             return
         visibility = "ظاهرة في كاتالوج الموقع" if plan.get("show_in_catalog", True) else "مخفية من كاتالوج الموقع"
         customer_visibility = "ظاهرة للزبون" if plan.get("show_to_customers", True) else "مخفية عن ردود الزبائن"
-        text = f"{plan['name']}\nالسعر: {plan['price']}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}\nالموقع: {visibility}\nالزبون: {customer_visibility}"
+        display_price = plan.get("display_price") or "تلقائي من السعر الحقيقي"
+        text = f"{plan['name']}\nالسعر الحقيقي: {plan['price']}\nالسعر المعروض: {display_price}\nالمدة: {plan.get('duration') or '—'}\nالوصف: {plan.get('description') or '—'}\nالحالة: {'مفعلة' if plan['is_active'] else 'متوقفة'}\nالموقع: {visibility}\nالزبون: {customer_visibility}"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تعديل السعر", callback_data=f"catalog_price_{plan_id}")],
             [InlineKeyboardButton("✏️ تعديل تفاصيل الباقة", callback_data=f"catalog_edit_plan_{plan_id}")],
@@ -1390,7 +1392,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "step": "plan_price",
             "plan_id": data[len("catalog_price_"):],
         }
-        await query.edit_message_text("اكتب السعر الجديد رقم فقط:", reply_markup=None)
+        await query.edit_message_text("اكتب السعر الحقيقي، وتكدر تضيف السعر المعروض بين قوسين:\nمثال: 10000 (5 الف د.ع)\nوإذا كتبت 10000 فقط، راح يظهر تلقائياً.", reply_markup=None)
         return
 
     if data.startswith("catalog_public_"):
@@ -1444,7 +1446,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
             "product_id": plan["product_id"],
             "plan_id": plan_id,
         }
-        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل:\nاسم الزبون (اسم الموقع) | السعر | المدة | وصف اختياري", reply_markup=None)
+        await query.edit_message_text("اكتب البيانات الجديدة بهذا الشكل:\nاسم الزبون (اسم الموقع) | السعر الحقيقي (السعر المعروض اختياري) | المدة | وصف اختياري", reply_markup=None)
         return
 
     if data.startswith("catalog_xdelc_"):
@@ -1532,13 +1534,15 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
             parts = [part.strip() for part in text.split("|", 3)]
             duration = parts[2] if len(parts) > 2 else ""
             valid_duration = duration_to_days(duration) is not None or is_permanent_duration(duration)
-            if len(parts) < 3 or not parts[0] or not parts[1].isdigit() or not valid_duration:
+            parsed_price = parse_catalog_plan_price(parts[1]) if len(parts) > 1 else None
+            if len(parts) < 3 or not parts[0] or parsed_price is None or not valid_duration:
                 await message.reply_text(
-                    "الصيغة غير صحيحة. استخدم: اسم الباقة | السعر | المدة | وصف\n"
-                    "أمثلة للمدة: 30، 30 يوم، شهر، سنة، أو دائم."
+                    "الصيغة غير صحيحة. استخدم: اسم الباقة | السعر الحقيقي (السعر المعروض اختياري) | المدة | وصف\n"
+                    "مثال السعر: 10000 (5 الف د.ع). وأمثلة للمدة: 30، 30 يوم، شهر، سنة، أو دائم."
                 )
                 return True
-            payload = {"product_id": state["product_id"], "name": parts[0], "price": int(parts[1]), "duration": duration, "description": parts[3] if len(parts) > 3 else None}
+            price, display_price = parsed_price
+            payload = {"product_id": state["product_id"], "name": parts[0], "price": price, "display_price": display_price, "duration": duration, "description": parts[3] if len(parts) > 3 else None}
             if state.get("plan_id"):
                 supabase.table("catalog_plans").update(payload).eq("id", state["plan_id"]).execute()
                 await message.reply_text("✅ تم تعديل الباقة.")
@@ -1546,10 +1550,12 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 supabase.table("catalog_plans").insert(payload).execute()
                 await message.reply_text("✅ تم إضافة الباقة.")
         elif state["step"] == "plan_price":
-            if not text.isdigit():
-                await message.reply_text("اكتب السعر رقم فقط.")
+            parsed_price = parse_catalog_plan_price(text)
+            if parsed_price is None:
+                await message.reply_text("اكتب السعر الحقيقي، وتكدر تضيف المعروض بين قوسين. مثال: 10000 (5 الف د.ع)")
                 return True
-            supabase.table("catalog_plans").update({"price": int(text)}).eq("id", state["plan_id"]).execute()
+            price, display_price = parsed_price
+            supabase.table("catalog_plans").update({"price": price, "display_price": display_price}).eq("id", state["plan_id"]).execute()
             await message.reply_text("✅ تم تعديل السعر.")
         else:
             return False
@@ -2675,6 +2681,16 @@ def duration_to_days(duration: str | None) -> int | None:
                 return days
         return 1
     return None
+
+
+def parse_catalog_plan_price(value: str) -> tuple[int, str | None] | None:
+    """Parse `real price (customer/public display)` while keeping accounting numeric."""
+    raw = str(value or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    match = re.fullmatch(r"([1-9]\d*)\s*(?:[\(\[]\s*(.*?)\s*[\)\]])?", raw)
+    if not match:
+        return None
+    display_price = (match.group(2) or "").strip() or None
+    return int(match.group(1)), display_price
 
 
 def is_permanent_duration(duration: str | None) -> bool:
@@ -10744,8 +10760,11 @@ def format_public_catalog_duration(duration: str | None) -> str:
     return value
 
 
-def format_public_catalog_price(price: object) -> str:
-    """Compact Iraqi-dinar price for the public customer catalog."""
+def format_public_catalog_price(price: object, display_price: object = None) -> str:
+    """Use the optional catalog/customer display price, otherwise format the real price."""
+    custom_price = str(display_price or "").strip()
+    if custom_price:
+        return custom_price
     try:
         amount = int(price or 0)
     except (TypeError, ValueError):
@@ -10780,7 +10799,7 @@ def build_public_catalog_html() -> str:
             "<div class=\"plan\">"
             f"<div><strong>{escape(split_plan_display_names(plan.get('name'))[1] or 'باقة')}</strong>"
             f"<span>المدة: {escape(format_public_catalog_duration(plan.get('duration')))}</span></div>"
-            f"<b>{escape(format_public_catalog_price(plan.get('price')))}</b>"
+            f"<b>{escape(format_public_catalog_price(plan.get('price'), plan.get('display_price')))}</b>"
             "</div>"
             for plan in plans
         ) or "<p class=\"empty\">لا توجد باقات متاحة حالياً.</p>"
