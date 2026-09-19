@@ -149,7 +149,9 @@ SHARED_CHATGPT_ACCOUNT_CAPACITY = 3  # الحد الثابت لكل حساب Cha
 # معرف المحادثة المسموح للفلتر أن يعمل عليها. يبقى في Render فقط، ولا يوضع
 # في الكود أو Git. الصفر يعني أن الفلتر متوقف بالكامل.
 MODESTY_GUARD_CHAT_ID = int(os.environ.get("MODESTY_GUARD_CHAT_ID", "0"))
-CATALOG_SUPPORT_URL = os.environ.get("CATALOG_SUPPORT_URL", "").strip()
+CATALOG_SUPPORT_URL = os.environ.get(
+    "CATALOG_SUPPORT_URL", "https://t.me/medbox_support"
+).strip()
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
