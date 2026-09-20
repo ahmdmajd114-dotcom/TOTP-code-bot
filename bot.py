@@ -2981,6 +2981,14 @@ def build_amount_keyboard(has_catalog_price: bool = False) -> InlineKeyboardMark
     ])
 
 
+def build_catalog_payment_ready_keyboard() -> InlineKeyboardMarkup:
+    """بعد اختيار المحفظة: مبلغ الباقة مثبت تلقائياً، ويبقى التعديل اختياري."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
+        [InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")],
+    ])
+
+
 def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repayment: bool = False) -> InlineKeyboardMarkup:
     """
     الشاشة الرئيسية بعد ما فيه منتج أو طريقة دفع واحدة محفوظة على الأقل —
@@ -7748,17 +7756,26 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     # -------------------- اختيار طريقة دفع مباشرة (سريعة أو من القائمة) --------------------
     if data.startswith("pay_method_") and data != "pay_method_list":
         method = data[len("pay_method_"):]
-        state["pending_method"] = method
         plan_price = int(state.get("plan_price") or 0)
-        state["pending_amount"] = plan_price
-        amount_note = (
-            f"مبلغ الباقة تلقائياً: {plan_price}"
-            if plan_price > 0 else
-            "حدد المبلغ:"
-        )
+        if plan_price > 0:
+            # الباقة هي مصدر السعر؛ بمجرد اختيار المحفظة نعتبر مبلغها مثبتاً.
+            # نحتفظ بمؤشره فقط حتى يبدل الأونر الرقم عند الحاجة، بلا خطوة
+            # «تثبيت مبلغ» إضافية.
+            state["payments"].append((method, plan_price))
+            state["editing_payment_index"] = len(state["payments"]) - 1
+            state["pending_method"] = None
+            state["pending_amount"] = 0
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + f"\n\nتم اعتماد مبلغ الباقة تلقائياً لطريقة: {method}",
+                reply_markup=build_catalog_payment_ready_keyboard(),
+            )
+            return
+
+        state["pending_method"] = method
+        state["pending_amount"] = 0
         await query.edit_message_caption(
-            caption=format_payment_summary(state) + f"\n\nطريقة الدفع المختارة: {method}\n{amount_note}",
-            reply_markup=build_amount_keyboard(has_catalog_price=plan_price > 0),
+            caption=format_payment_summary(state) + f"\n\nطريقة الدفع المختارة: {method}\nحدد المبلغ:",
+            reply_markup=build_amount_keyboard(),
         )
         return
 
@@ -7807,9 +7824,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     # -------------------- طلب إدخال يدوي (ينتظر رسالة نصية جاية) --------------------
     if data == "pay_amount_manual":
         state["awaiting_manual_amount"] = True
+        editing_index = state.get("editing_payment_index")
+        if isinstance(editing_index, int) and 0 <= editing_index < len(state.get("payments", [])):
+            method, current_amount = state["payments"][editing_index]
+            prompt = f"طريقة الدفع: {method}\nالمبلغ الحالي: {current_amount}\nاكتب المبلغ الجديد رقم فقط بالرسالة الجاية:"
+        else:
+            prompt = f"طريقة الدفع المختارة: {state['pending_method']}\nاكتب المبلغ رقم بس بالرسالة الجاية:"
         await query.edit_message_caption(
             caption=format_payment_summary(state)
-            + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
+            + f"\n\n{prompt}",
             reply_markup=None,
         )
         return
@@ -8351,8 +8374,23 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
         await message.reply_text("الرجاء إدخال مبلغ أكبر من صفر.")
         return True
 
-    state["pending_amount"] = amount
     state["awaiting_manual_amount"] = False
+    editing_index = state.get("editing_payment_index")
+    if isinstance(editing_index, int) and 0 <= editing_index < len(state.get("payments", [])):
+        method, _ = state["payments"][editing_index]
+        state["payments"][editing_index] = (method, amount)
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=OWNER_USER_ID,
+                message_id=replied_id,
+                caption=format_payment_summary(state) + f"\n\n✅ تم تعديل مبلغ {method} إلى {amount}.",
+                reply_markup=build_catalog_payment_ready_keyboard(),
+            )
+        except Exception:
+            logger.exception("Failed to update catalog payment amount")
+        return True
+
+    state["pending_amount"] = amount
 
     try:
         await context.bot.edit_message_caption(
