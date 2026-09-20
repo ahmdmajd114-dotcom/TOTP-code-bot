@@ -3678,6 +3678,7 @@ def build_expense_amount_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="exp_amount_manual")],
         [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="exp_amount_commit")],
+        [InlineKeyboardButton("❌ إلغاء العملية", callback_data="exp_cancel")],
     ])
 
 
@@ -3685,6 +3686,7 @@ def build_expense_vault_keyboard() -> InlineKeyboardMarkup:
     """شاشة اختيار الخزنة اللي ينسحب منها مبلغ المصروف."""
     rows = [[InlineKeyboardButton(v, callback_data=f"exp_vault_{v}")] for v in VAULT_NAMES]
     rows.append([InlineKeyboardButton("بدون خزنة محددة", callback_data="exp_vault_none")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_amount")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3695,6 +3697,7 @@ def build_expense_reason_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(quick_pick, callback_data=f"exp_reason_{quick_pick}")],
         [InlineKeyboardButton("بقية المنتجات ▾", callback_data="exp_reason_list")],
         [InlineKeyboardButton("✏️ إدخال حر", callback_data="exp_reason_manual")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_vault")],
     ])
 
 
@@ -3729,6 +3732,7 @@ def build_debt_product_keyboard() -> InlineKeyboardMarkup:
     ]
     if not rows:
         rows.append([InlineKeyboardButton("⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="debt_noop")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3759,6 +3763,7 @@ def build_debt_amount_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="debt_amount_manual")],
         [InlineKeyboardButton("✅ تثبيت الدين", callback_data="debt_amount_commit")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")],
     ])
 
 
@@ -8537,6 +8542,11 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if data == "debt_back_to_main":
+        _pending_debt = None
+        await query.edit_message_text("💳 الدين", reply_markup=build_debt_main_keyboard())
+        return
+
     if _pending_debt is None or _pending_debt.get("message_id") != query.message.message_id:
         await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
         return
@@ -8569,7 +8579,9 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         debt["awaiting_manual_product"] = True
         await query.edit_message_text(
             text=format_debt_summary(debt) + "\n\nاكتب اسم المنتج بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")
+            ]]),
         )
         return
 
@@ -8591,7 +8603,9 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         debt["awaiting_manual_amount"] = True
         await query.edit_message_text(
             text=format_debt_summary(debt) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")
+            ]]),
         )
         return
 
@@ -8763,7 +8777,9 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             query,
             expense,
             format_expense_summary(expense) + "\n\nاكتب المبلغ رقم بس بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            None,
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="exp_cancel_manual_amount")
+            ]]),
         )
         return
 
@@ -8775,6 +8791,21 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("مبلغ التعويض أكبر من الدفعة المسجلة.", show_alert=True)
             return
         await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_vault_keyboard())
+        return
+
+    if data == "exp_back_to_amount":
+        expense["vault"] = None
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_amount_keyboard())
+        return
+
+    if data == "exp_back_to_vault":
+        expense["reason"] = None
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_vault_keyboard())
+        return
+
+    if data == "exp_cancel_manual_amount":
+        expense["awaiting_manual_amount"] = False
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_amount_keyboard())
         return
 
     if data.startswith("exp_vault_"):
@@ -8826,8 +8857,15 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
             query,
             expense,
             format_expense_summary(expense) + "\n\nاكتب سبب المصروف بالرسالة الجاية (كـ رد على هذي الرسالة):",
-            None,
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="exp_cancel_manual_reason")
+            ]]),
         )
+        return
+
+    if data == "exp_cancel_manual_reason":
+        expense["awaiting_manual_reason"] = False
+        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
         return
 
 
