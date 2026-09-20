@@ -222,6 +222,9 @@ _manual_link_code_authorizations: dict[int, datetime] = {}
 MANUAL_LINK_CODE_WINDOW_MINUTES = int(
     os.environ.get("MANUAL_LINK_CODE_WINDOW_MINUTES", "30")
 )
+# بعد تسليم حساب ثانٍ، طلب الكود خلال هذه النافذة يخص الحساب المسلَّم
+# حديثاً. بعدها لا نخمن بين الحسابات ونطلب من الزبون أن يختار بنفسه.
+RECENT_ACCOUNT_CODE_MINUTES = int(os.environ.get("RECENT_ACCOUNT_CODE_MINUTES", "15"))
 
 
 async def _call_alibaba_api(payload: dict, timeout: float) -> dict | None:
@@ -3153,6 +3156,14 @@ def build_link_delivery_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🆕 اشتراك جديد", callback_data=f"linkdelivery_new_{customer_chat_id}")],
         [InlineKeyboardButton("💸 تعويض", callback_data=f"linkdelivery_comp_{customer_chat_id}")],
         [InlineKeyboardButton("💳 دين", callback_data=f"linkdelivery_debt_{customer_chat_id}")],
+    ])
+
+
+def build_link_account_relationship_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
+    """يسأل الأونر هل الحساب الذي سلّمه بديل أم حساب إضافي مستقل."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 استبدال الحساب السابق", callback_data=f"linkaccount_replace_{customer_chat_id}")],
+        [InlineKeyboardButton("➕ حساب جديد إضافي", callback_data=f"linkaccount_new_{customer_chat_id}")],
     ])
 
 
@@ -6323,8 +6334,78 @@ def get_exact_test_faq_reply(text: str) -> str | None:
     return "\n".join(reply for reply in replies if reply) or None
 
 
-def get_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
-    """يرجع (secret, label) للحساب المربوط بهذا الزبون، أو None اذا مو مربوط."""
+def get_customer_totp_accounts(chat_id: int) -> list[dict]:
+    """كل حسابات TOTP الفعالة للزبون، مع دعم الربطات القديمة."""
+    try:
+        links = (supabase.table("customer_totp_account_links")
+                 .select("account_id, linked_at, is_primary, last_selected_at")
+                 .eq("customer_chat_id", chat_id).eq("status", "active")
+                 .order("linked_at", desc=True).execute().data or [])
+    except Exception:
+        # الجدول الجديد لا يجب أن يمنع الزبائن القدامى من استلام الكود قبل
+        # تشغيل SQL؛ نرجع للمسار القديم بأمان.
+        links = []
+    if not links:
+        try:
+            legacy = (supabase.table("totp_links").select("account_id, linked_at")
+                      .eq("chat_id", chat_id).limit(1).execute().data or [])
+            links = [{
+                "account_id": row["account_id"], "linked_at": row.get("linked_at"),
+                "is_primary": True, "last_selected_at": None,
+            } for row in legacy]
+        except Exception:
+            logger.exception("Failed to read legacy TOTP link for chat %s", chat_id)
+            return []
+    accounts: list[dict] = []
+    for link in links:
+        try:
+            rows = (supabase.table("totp_accounts").select("id, secret, label")
+                    .eq("id", link["account_id"]).limit(1).execute().data or [])
+            if rows:
+                accounts.append({**rows[0], **link})
+        except Exception:
+            logger.exception("Failed to read TOTP account %s", link.get("account_id"))
+    return accounts
+
+
+def get_secret_for_chat(chat_id: int, account_id: str | None = None) -> tuple[str, str] | None:
+    """يرجع سر حساب محدد، أو الحساب الأساسي للزبون إن لم يُحدد حساب."""
+    if account_id:
+        accounts = get_customer_totp_accounts(chat_id)
+        match = next((account for account in accounts if str(account["id"]) == str(account_id)), None)
+        if match:
+            return match["secret"], match.get("label") or ""
+    else:
+        accounts = get_customer_totp_accounts(chat_id)
+        primary = next((account for account in accounts if account.get("is_primary")), None)
+        if primary:
+            return primary["secret"], primary.get("label") or ""
+
+    # حسابات ChatGPT المشتركة التي سُلّمت عبر خزينة الحسابات.
+    if account_id:
+        return None
+    try:
+        assigned = (
+            supabase.table("chatgpt_account_assignments")
+            .select("account_id")
+            .eq("customer_chat_id", chat_id).eq("status", "active")
+            .order("assigned_at", desc=True).limit(1).execute().data or []
+        )
+        if assigned:
+            account = (
+                supabase.table("chatgpt_shared_accounts")
+                .select("totp_secret, email")
+                .eq("id", assigned[0]["account_id"]).limit(1).execute().data or []
+            )
+            if account:
+                return account[0]["totp_secret"], account[0]["email"]
+    except Exception:
+        logger.exception("Failed to get shared-account TOTP secret")
+    return None
+
+
+def get_legacy_secret_for_chat(chat_id: int) -> tuple[str, str] | None:
+    """Deprecated compatibility path retained for old calls during rollout."""
     link_res = (
         supabase.table("totp_links")
         .select("account_id")
@@ -6626,11 +6707,66 @@ def generate_totp_code(secret: str) -> str:
 
 
 CODE_REPLY_MARKER = "__SEND_CURRENT_TOTP_CODE__"
+CODE_ACCOUNT_PICKER_MARKER = "__CHOOSE_TOTP_ACCOUNT__"
 
 
-async def generate_current_totp_code_for_chat(chat_id: int) -> str | None:
+def remember_customer_totp_account(
+    chat_id: int, account_id: str, *, primary: bool, replace_previous: bool = False,
+) -> bool:
+    """يحفظ تاريخ حسابات الزبون من دون حذف القديم إلا عند الاستبدال الصريح."""
+    try:
+        if primary:
+            supabase.table("customer_totp_account_links").update({
+                "is_primary": False,
+                "status": "replaced" if replace_previous else "active",
+            }).eq("customer_chat_id", chat_id).eq("is_primary", True).execute()
+        supabase.table("customer_totp_account_links").upsert({
+            "customer_chat_id": chat_id,
+            "account_id": str(account_id),
+            "is_primary": primary,
+            "status": "active",
+            "linked_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="customer_chat_id,account_id").execute()
+        return True
+    except Exception:
+        logger.exception("Failed to store TOTP account relationship for customer %s", chat_id)
+        return False
+
+
+def should_prompt_for_totp_account(chat_id: int, attempt_count: int) -> bool:
+    """نطلب الاختيار بعد محاولتين أو بعد انتهاء نافذة الحساب الجديد."""
+    accounts = get_customer_totp_accounts(chat_id)
+    if len(accounts) <= 1:
+        return False
+    if attempt_count >= 2:
+        return True
+    newest = accounts[0]
+    linked_at = newest.get("linked_at")
+    if not linked_at:
+        return True
+    try:
+        linked_time = datetime.fromisoformat(str(linked_at).replace("Z", "+00:00"))
+        return datetime.now(timezone.utc) - linked_time > timedelta(minutes=RECENT_ACCOUNT_CODE_MINUTES)
+    except ValueError:
+        return True
+
+
+def build_totp_account_picker(chat_id: int) -> InlineKeyboardMarkup | None:
+    accounts = get_customer_totp_accounts(chat_id)
+    if len(accounts) <= 1:
+        return None
+    rows = []
+    for index, account in enumerate(accounts, start=1):
+        label = str(account.get("label") or f"حساب {index}").strip()
+        rows.append([InlineKeyboardButton(
+            label[:50], callback_data=f"codeacct_{chat_id}_{account['id']}",
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+async def generate_current_totp_code_for_chat(chat_id: int, account_id: str | None = None) -> str | None:
     """Generate the currently valid code immediately before sending it."""
-    result = get_secret_for_chat(chat_id)
+    result = get_secret_for_chat(chat_id, account_id)
     if result is None:
         return None
     secret, _ = result
@@ -6749,6 +6885,20 @@ def has_active_subscription(chat_id: int) -> bool:
         # عند تعذر قراءة حالة الاشتراك نختار عدم إرسال الكود؛ هذا يمنع
         # استمرار الوصول بالخطأ بعد الانتهاء.
         logger.exception("Failed to check active subscription for chat %s", chat_id)
+        return False
+
+
+def has_active_chatgpt_subscription(chat_id: int) -> bool:
+    """نظهر سؤال استبدال/حساب جديد فقط لصاحب ChatGPT فعّال فعلاً."""
+    try:
+        rows = (supabase.table("subscription_reminders")
+                .select("product_name").eq("customer_chat_id", chat_id)
+                .eq("status", "active")
+                .gt("expires_at", datetime.now(timezone.utc).isoformat())
+                .limit(50).execute().data or [])
+        return any(is_chatgpt_product_name(row.get("product_name")) for row in rows)
+    except Exception:
+        logger.exception("Failed to check active ChatGPT subscription for %s", chat_id)
         return False
 
 
@@ -6942,7 +7092,12 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     ):
         return None, False
 
-    result = get_secret_for_chat(chat_id)
+    accounts = get_customer_totp_accounts(chat_id)
+    if should_prompt_for_totp_account(chat_id, attempt_count):
+        return CODE_ACCOUNT_PICKER_MARKER, False
+
+    selected_account_id = accounts[0]["id"] if accounts else None
+    result = get_secret_for_chat(chat_id, selected_account_id)
     if result is None:
         # مو مربوط اصلاً — نفس السلوك القديم، تجاهل صامت
         return None, False
@@ -6957,7 +7112,11 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     if decision.action == "send_code":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         # التوليد يتأجل لآخر لحظة قبل الإرسال، بعد انتظار ثانية واحدة فقط.
-        return CODE_REPLY_MARKER, False
+        return (
+            f"{CODE_REPLY_MARKER}:{selected_account_id}"
+            if selected_account_id else CODE_REPLY_MARKER,
+            False,
+        )
     if decision.action == "ask_restart":
         _save_retry_state(chat_id, decision.attempt_count, decision.awaiting_restart)
         return RESTART_MESSAGE, False
@@ -7005,6 +7164,45 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
     except Exception:
         logger.exception("Failed to send manual extra code to %s", chat_id)
         await query.answer("تعذر إرسال الكود.", show_alert=True)
+
+
+async def handle_totp_account_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """الزبون يختار حسابه عند وجود أكثر من TOTP مرتبط به."""
+    query = update.callback_query
+    if query is None:
+        return
+    match = re.fullmatch(r"codeacct_(-?\d+)_(.+)", query.data or "")
+    if not match:
+        return
+    chat_id = int(match.group(1))
+    account_id = match.group(2)
+    # لا نسمح لشخص آخر باستعمال زر حساب زبون مختلف.
+    if query.from_user.id != chat_id:
+        await query.answer("هذا الاختيار مو إلك.", show_alert=True)
+        return
+    if get_secret_for_chat(chat_id, account_id) is None:
+        await query.answer("هذا الحساب لم يعد متاحاً.", show_alert=True)
+        return
+    try:
+        supabase.table("customer_totp_account_links").update({
+            "last_selected_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("customer_chat_id", chat_id).eq("account_id", account_id).execute()
+    except Exception:
+        logger.exception("Failed to remember TOTP account selection for %s", chat_id)
+    await query.answer()
+    code = await generate_current_totp_code_for_chat(chat_id, account_id)
+    if not code:
+        return
+    connection_id = getattr(query.message, "business_connection_id", None) or get_customer_business_connection_id(chat_id)
+    if not connection_id:
+        logger.warning("No business connection for account selection code to %s", chat_id)
+        return
+    try:
+        await context.bot.send_message(
+            business_connection_id=connection_id, chat_id=chat_id, text=code,
+        )
+    except Exception:
+        logger.exception("Failed to send selected-account code to %s", chat_id)
 
 
 async def _show_typing(
@@ -7218,9 +7416,22 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         account_id = acc_res.data[0]["id"]
         label = acc_res.data[0].get("label") or ""
 
+        # نحتفظ بالحساب السابق قبل أن يحدث /link الحساب الأساسي. السؤال
+        # يظهر فقط لمن لديه اشتراك ChatGPT فعّال وحساب مختلف فعلاً.
+        old_link = (supabase.table("totp_links").select("account_id")
+                    .eq("chat_id", chat_id).limit(1).execute().data or [])
+        old_account_id = old_link[0].get("account_id") if old_link else None
+        needs_account_relationship_choice = bool(
+            old_account_id and str(old_account_id) != str(account_id)
+            and has_active_chatgpt_subscription(chat_id)
+        )
+        if old_account_id:
+            remember_customer_totp_account(chat_id, str(old_account_id), primary=True)
+
         supabase.table("totp_links").upsert(
             {"chat_id": chat_id, "account_id": account_id}
         ).execute()
+        remember_customer_totp_account(chat_id, str(account_id), primary=True)
         authorize_recently_linked_customer_code(chat_id)
 
         # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
@@ -7302,6 +7513,21 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             logger.exception("Failed to send account-link notification to topic")
+        if needs_account_relationship_choice:
+            context.user_data["pending_link_account_relationship"] = {
+                "customer_chat_id": chat_id,
+                "old_account_id": str(old_account_id),
+                "new_account_id": str(account_id),
+                "old_account_label": next((item.get("label") for item in get_customer_totp_accounts(chat_id)
+                                           if str(item.get("id")) == str(old_account_id)), "الحساب السابق"),
+                "new_account_label": label or link_code,
+            }
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=("هذا الزبون عنده حساب ChatGPT فعّال سابقاً.\n"
+                      "الحساب الذي سلّمته الآن هو استبدال للحساب السابق أم حساب جديد إضافي؟"),
+                reply_markup=build_link_account_relationship_keyboard(chat_id),
+            )
         # أمر الربط يحتوي رمزاً داخلياً ولا نريد أن يبقى ظاهراً في محادثة
         # العميل بعد نجاح الربط.
         if bm is not None:
@@ -8314,6 +8540,52 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         f"الكود متاح للزبون من هسه.\n"
         + ("🔔 متابعة الرضا راح تنرسل " + duration_text if is_permanent else f"ينتهي الاشتراك: {duration_text}")
     )
+
+
+async def handle_link_account_relationship_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يثبت قرار الأونر: استبدال الحساب أو الاحتفاظ بحسابين للزبون."""
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    match = re.fullmatch(r"linkaccount_(replace|new)_(-?\d+)", query.data or "")
+    if not match:
+        return
+    await query.answer()
+    choice, raw_chat_id = match.groups()
+    chat_id = int(raw_chat_id)
+    state = context.user_data.get("pending_link_account_relationship") or {}
+    if int(state.get("customer_chat_id", 0)) != chat_id:
+        await query.edit_message_text("⚠️ انتهت صلاحية سؤال الحساب. أعد /link إذا احتجت تعدل العلاقة.")
+        return
+    old_account_id = state.get("old_account_id")
+    new_account_id = state.get("new_account_id")
+    if not old_account_id or not new_account_id:
+        await query.edit_message_text("⚠️ تعذر تحديد الحسابين. أعد /link.")
+        return
+    try:
+        if choice == "replace":
+            supabase.table("customer_totp_account_links").update({
+                "status": "replaced", "is_primary": False,
+            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()
+        else:
+            supabase.table("customer_totp_account_links").update({
+                "status": "active",
+            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()
+        supabase.table("customer_totp_account_links").update({
+            "status": "active", "is_primary": True,
+        }).eq("customer_chat_id", chat_id).eq("account_id", str(new_account_id)).execute()
+    except Exception:
+        logger.exception("Failed to save account relationship choice for customer %s", chat_id)
+        await query.edit_message_text("⚠️ تعذر حفظ الاختيار. تأكد من تشغيل SQL الجديد ثم أعد /link.")
+        return
+    context.user_data.pop("pending_link_account_relationship", None)
+    if choice == "replace":
+        await query.edit_message_text("✅ تم الاستبدال. الحساب الجديد فقط يبقى متاحاً لطلب الكود.")
+    else:
+        await query.edit_message_text(
+            "✅ تم حفظ الحسابين. خلال 15 دقيقة من التسليم يرسل كود الحساب الجديد؛ "
+            "بعدها، أو بعد محاولتين، يسأل الزبون أي حساب يريد."
+        )
 
 
 async def handle_link_compensation_duration_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -11469,7 +11741,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
 
-    has_code_reply = CODE_REPLY_MARKER in replies_to_send
+    has_code_reply = any(reply.startswith(CODE_REPLY_MARKER) for reply in replies_to_send)
+    has_account_picker = CODE_ACCOUNT_PICKER_MARKER in replies_to_send
     if not was_delayed_greeting:
         if has_code_reply:
             await human_like_code_reply_sequence(
@@ -11483,21 +11756,29 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not has_code_reply and (chat_id, bm.message_id) in _suppressed_auto_reply_keys:
         archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
         return
-    outgoing_replies = replies_to_send if has_code_reply else (
+    outgoing_replies = replies_to_send if (has_code_reply or has_account_picker) else (
         ["\n\n".join(replies_to_send)]
         if has_greeting_and_action and len(replies_to_send) > 1
         else replies_to_send
     )
     sent_replies: list[str] = []
     for reply_text in outgoing_replies:
-        if reply_text == CODE_REPLY_MARKER:
-            reply_text = await generate_current_totp_code_for_chat(chat_id)
+        reply_markup = None
+        if reply_text.startswith(CODE_REPLY_MARKER):
+            _marker, _separator, selected_account_id = reply_text.partition(":")
+            reply_text = await generate_current_totp_code_for_chat(chat_id, selected_account_id or None)
             if not reply_text:
+                continue
+        elif reply_text == CODE_ACCOUNT_PICKER_MARKER:
+            reply_text = "أي حساب تريد تسجل؟"
+            reply_markup = build_totp_account_picker(chat_id)
+            if reply_markup is None:
                 continue
         await context.bot.send_message(
             business_connection_id=bm.business_connection_id,
             chat_id=chat_id,
             text=reply_text,
+            reply_markup=reply_markup,
         )
         sent_replies.append(reply_text)
     if not sent_replies:
@@ -11734,6 +12015,7 @@ def main() -> None:
 
     # سؤال الدين والباقته بعد ربط زبون بحساب /link.
     app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan|delivery)_"))
+    app.add_handler(CallbackQueryHandler(handle_link_account_relationship_callback, pattern=r"^linkaccount_"))
 
     # أزرار تسجيل المصروف — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_expense_callback, pattern=r"^exp_"))
@@ -11767,6 +12049,8 @@ def main() -> None:
 
     # أزرار الأونر لإرسال كود إضافي أو إيقافه بعد توقف المحاولات التلقائية.
     app.add_handler(CallbackQueryHandler(handle_manual_extra_code_callback, pattern=r"^code_manual_(?:send|stop)_"))
+    # اختيار الزبون للحساب المطلوب عند امتلاكه أكثر من حساب TOTP.
+    app.add_handler(CallbackQueryHandler(handle_totp_account_picker_callback, pattern=r"^codeacct_"))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
