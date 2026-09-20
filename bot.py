@@ -1083,6 +1083,7 @@ BTN_PERSONAL_REMINDER = "⏰ تذكير شخصي"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
 BTN_CAMPAIGNS = "📣 إرسال رسالة للعملاء"
+BTN_CONTINUITY_STATS = "🎁 إحصائيات بوت المكافآت"
 BTN_AUTO_REPLY = "⏯️ الردود التلقائية"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
@@ -1095,6 +1096,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
         [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
         [KeyboardButton(BTN_PERSONAL_REMINDER), KeyboardButton(BTN_CAMPAIGNS)],
+        [KeyboardButton(BTN_CONTINUITY_STATS)],
         [KeyboardButton(BTN_AUTO_REPLY)],
         [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
     ],
@@ -2572,6 +2574,54 @@ def continuity_invite_keyboard() -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🎁 دخول بوت الهدايا والمكافآت", url=url),
     ]])
+
+
+def get_continuity_bot_stats() -> str:
+    """يعرض تسجيلات Start وحالة الدعوات الفردية والجماعية بدقة."""
+    try:
+        contacts_result = supabase.table("continuity_bot_contacts").select(
+            "customer_chat_id", count="exact"
+        ).execute()
+        started_count = int(contacts_result.count or len(contacts_result.data or []))
+
+        invite_rows = (supabase.table("continuity_bot_invites")
+                       .select("status").execute().data or [])
+        invite_counts: dict[str, int] = {}
+        for row in invite_rows:
+            status = str(row.get("status") or "unknown")
+            invite_counts[status] = invite_counts.get(status, 0) + 1
+
+        campaign_rows = (supabase.table("customer_campaigns")
+                         .select("recipient_count, sent_count, failed_count, skipped_count, status")
+                         .eq("message_text", CONTINUITY_INVITE_TEXT)
+                         .execute().data or [])
+        campaign_total = sum(int(row.get("recipient_count") or 0) for row in campaign_rows)
+        campaign_sent = sum(int(row.get("sent_count") or 0) for row in campaign_rows)
+        campaign_failed = sum(int(row.get("failed_count") or 0) for row in campaign_rows)
+        campaign_skipped = sum(int(row.get("skipped_count") or 0) for row in campaign_rows)
+        campaign_pending = max(
+            campaign_total - campaign_sent - campaign_failed - campaign_skipped, 0
+        )
+
+        return (
+            "🎁 إحصائيات بوت المكافآت\n\n"
+            f"✅ دخلوا البوت وضغطوا Start: {started_count}\n\n"
+            "الدعوات الفردية بعد الشراء:\n"
+            f"• بانتظار الإرسال: {invite_counts.get('scheduled', 0)}\n"
+            f"• وصلت ولم يضغطوا Start بعد: {invite_counts.get('sent', 0)}\n"
+            f"• دخلوا عن طريق الدعوة: {invite_counts.get('started', 0)}\n"
+            f"• فشل إرسالها: {invite_counts.get('failed', 0)}\n"
+            f"• ملغاة: {invite_counts.get('cancelled', 0)}\n\n"
+            "حملات دعوة بوت المكافآت:\n"
+            f"• إجمالي الجمهور: {campaign_total}\n"
+            f"• تم الإرسال: {campaign_sent}\n"
+            f"• متبقي بالطابور: {campaign_pending}\n"
+            f"• فشل: {campaign_failed}\n"
+            f"• تم التخطي: {campaign_skipped}"
+        )
+    except Exception:
+        logger.exception("Failed to build continuity bot stats")
+        return "⚠️ تعذر قراءة إحصائيات بوت المكافآت حالياً."
 
 
 CONTINUITY_INVITE_TEXT = (
@@ -9787,7 +9837,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
         BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
-        BTN_AUTO_REPLY,
+        BTN_CONTINUITY_STATS, BTN_AUTO_REPLY,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -9830,6 +9880,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
             "ثم تشوف العدد والمعاينة قبل أي إرسال.",
             reply_markup=build_campaign_audience_keyboard(),
         )
+        return True
+
+    if text == BTN_CONTINUITY_STATS:
+        await message.reply_text(get_continuity_bot_stats())
         return True
 
     if text == BTN_AUTO_REPLY:
