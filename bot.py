@@ -2107,11 +2107,11 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     recipient = recipients[0]
     status, error_text = "sent", None
     try:
-        # نبدأ بـBusiness، وإذا انتهت نافذته نستخدم الحساب الشخصي الموجود
-        # نفسه، بشرط أن تكون جلسة Telegram الشخصية محفوظة في Render.
-        await send_relogin_notice(
-            context, int(recipient["customer_chat_id"]), campaign["message_text"],
-        )
+        # الحملات الجماعية تطلع من حساب الدعم الشخصي نفسه، لا من Business.
+        # لذلك لا نعتمد على نافذة الرد القصيرة الخاصة بـBusiness Connection.
+        if not personal_scheduler_is_configured():
+            raise RuntimeError("جلسة حساب الدعم الشخصي غير مهيأة في Render")
+        await send_personal_message(int(recipient["customer_chat_id"]), campaign["message_text"])
     except Exception as exc:
         status, error_text = "failed", str(exc)[:500]
         logger.exception("Campaign queue delivery failed campaign=%s chat=%s", campaign["id"], recipient["customer_chat_id"])
@@ -2258,18 +2258,12 @@ async def handle_campaign_message_input(update: Update, context: ContextTypes.DE
     if campaign is None:
         await message.reply_text("⚠️ تعذر حفظ الحملة. شغّل ملف Supabase الجديد وتأكد من الاتصال.")
         return True
-    business_ready = sum(1 for row in recipients if row.get("business_connection_id"))
     personal_fallback_ready = personal_scheduler_is_configured()
-    no_business_connection = len(recipients) - business_ready
     preview = text if len(text) <= 900 else text[:900] + "…"
     delivery_note = (
-        f"Business مباشر: {business_ready}\n"
-        f"بدون اتصال Business: {no_business_connection}\n"
-        + (
-            "✅ لهؤلاء راح يحاول من حساب الدعم الشخصي المحفوظ، واحدًا واحدًا."
-            if personal_fallback_ready else
-            "⚠️ جلسة حساب الدعم الشخصي غير مهيأة؛ هؤلاء سيفشل إرسالهم خارج Business."
-        )
+        "✅ الإرسال راح يطلع من حساب الدعم الشخصي المحفوظ، واحدًا واحدًا."
+        if personal_fallback_ready else
+        "⚠️ جلسة حساب الدعم الشخصي غير مهيأة؛ لا تؤكد الحملة قبل تهيئتها."
     )
     await message.reply_text(
         f"📣 معاينة الحملة\n\nالجمهور: {CAMPAIGN_AUDIENCES[draft['audience_key']]}\n"
