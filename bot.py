@@ -6716,10 +6716,15 @@ def remember_customer_totp_account(
     """يحفظ تاريخ حسابات الزبون من دون حذف القديم إلا عند الاستبدال الصريح."""
     try:
         if primary:
-            supabase.table("customer_totp_account_links").update({
+            previous_links = supabase.table("customer_totp_account_links").update({
                 "is_primary": False,
                 "status": "replaced" if replace_previous else "active",
-            }).eq("customer_chat_id", chat_id).eq("is_primary", True).execute()
+            }).eq("customer_chat_id", chat_id)
+            if replace_previous:
+                previous_links = previous_links.neq("account_id", str(account_id))
+            else:
+                previous_links = previous_links.eq("is_primary", True)
+            previous_links.execute()
         supabase.table("customer_totp_account_links").upsert({
             "customer_chat_id": chat_id,
             "account_id": str(account_id),
@@ -7421,10 +7426,6 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         old_link = (supabase.table("totp_links").select("account_id")
                     .eq("chat_id", chat_id).limit(1).execute().data or [])
         old_account_id = old_link[0].get("account_id") if old_link else None
-        needs_account_relationship_choice = bool(
-            old_account_id and str(old_account_id) != str(account_id)
-            and has_active_chatgpt_subscription(chat_id)
-        )
         if old_account_id:
             remember_customer_totp_account(chat_id, str(old_account_id), primary=True)
 
@@ -7459,6 +7460,8 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "customer_username": bm.chat.username if bm is not None else fallback_username,
             "account_label": label or link_code,
             "business_connection_id": bm.business_connection_id if bm is not None else get_customer_business_connection_id(chat_id),
+            "previous_account_id": str(old_account_id) if old_account_id else None,
+            "new_account_id": str(account_id),
         }
         previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
         if previous_subscription:
@@ -7513,21 +7516,6 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception:
             logger.exception("Failed to send account-link notification to topic")
-        if needs_account_relationship_choice:
-            context.user_data["pending_link_account_relationship"] = {
-                "customer_chat_id": chat_id,
-                "old_account_id": str(old_account_id),
-                "new_account_id": str(account_id),
-                "old_account_label": next((item.get("label") for item in get_customer_totp_accounts(chat_id)
-                                           if str(item.get("id")) == str(old_account_id)), "الحساب السابق"),
-                "new_account_label": label or link_code,
-            }
-            await context.bot.send_message(
-                chat_id=OWNER_USER_ID,
-                text=("هذا الزبون عنده حساب ChatGPT فعّال سابقاً.\n"
-                      "الحساب الذي سلّمته الآن هو استبدال للحساب السابق أم حساب جديد إضافي؟"),
-                reply_markup=build_link_account_relationship_keyboard(chat_id),
-            )
         # أمر الربط يحتوي رمزاً داخلياً ولا نريد أن يبقى ظاهراً في محادثة
         # العميل بعد نجاح الربط.
         if bm is not None:
@@ -8444,15 +8432,37 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
             return
         if choice == "comp":
             context.user_data.pop("pending_link_delivery", None)
+            # التعويض يعني تلقائياً أن الحساب الذي سلّمناه بديل عن السابق؛
+            # لا نحمّل الأونر سؤالاً ثانياً ولا نبقي كود الحساب المعطّل.
+            if state.get("previous_account_id") and state.get("new_account_id"):
+                remember_customer_totp_account(
+                    customer_chat_id, str(state["new_account_id"]),
+                    primary=True, replace_previous=True,
+                )
             context.user_data["pending_link_compensation"] = state
             await query.edit_message_text(
-                "💸 هذا تعويض. اكتب مدة التعويض بالأيام فقط، مثلاً: 30\n"
-                "ينحفظ له تنبيه مستقل من وقت تسليم الحساب، ولا نلمس التذكيرات القديمة.",
+                "💸 هذا تعويض، وتم اعتماد الحساب الجديد بدلاً من السابق.\n"
+                "اكتب مدة التعويض بالأيام فقط، مثلاً: 30\n"
+                "يُعدّل تنبيه الاشتراك نفسه من وقت تسليم الحساب.",
                 reply_markup=None,
             )
             return
 
-        # اشتراك جديد: نفعّل الدفعة المسجلة سابقاً فقط عند التسليم الفعلي.
+        # اشتراك جديد: إن كان عنده حساب سابق، نحدد أولاً هل يبقى حساباً
+        # إضافياً أم يستبدله؛ بعدها فقط نفعّل الدفعة المسجلة.
+        if state.get("previous_account_id") and state.get("new_account_id"):
+            context.user_data.pop("pending_link_delivery", None)
+            context.user_data["pending_link_account_relationship"] = {
+                **state,
+                "activate_subscription_after_choice": True,
+            }
+            await query.edit_message_text(
+                "هذا اشتراك جديد. الحساب الذي سلّمته الآن حساب إضافي أم استبدال للحساب السابق؟",
+                reply_markup=build_link_account_relationship_keyboard(customer_chat_id),
+            )
+            return
+
+        # زبون بلا حساب سابق: نفعّل الدفعة مباشرة عند التسليم الفعلي.
         activated = activate_pending_chatgpt_subscription_on_delivery(customer_chat_id)
         if activated is None:
             activated = recover_paid_chatgpt_subscription_on_delivery(customer_chat_id)
@@ -8579,6 +8589,27 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
         await query.edit_message_text("⚠️ تعذر حفظ الاختيار. تأكد من تشغيل SQL الجديد ثم أعد /link.")
         return
     context.user_data.pop("pending_link_account_relationship", None)
+    if state.get("activate_subscription_after_choice"):
+        activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+        if activated is None:
+            activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
+        if activated is None:
+            await query.edit_message_text(
+                "⚠️ تم حفظ نوع الحساب، لكن ما لكيت دفعة ChatGPT غير مفعّلة. سجّل الدفع أولاً."
+            )
+            return
+        scheduled = await schedule_subscription_feedback(activated)
+        invite_scheduled = schedule_continuity_invite(chat_id, state.get("business_connection_id"))
+        end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
+        schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+        if invite_scheduled:
+            schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت بعد 5 دقائق."
+        account_text = "استبدال الحساب السابق" if choice == "replace" else "حساب إضافي محفوظ"
+        await query.edit_message_text(
+            f"✅ تم {account_text} وتفعيل الاشتراك الجديد لمدة {activated['duration_days']} يوم.\n"
+            f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
+        )
+        return
     if choice == "replace":
         await query.edit_message_text("✅ تم الاستبدال. الحساب الجديد فقط يبقى متاحاً لطلب الكود.")
     else:
