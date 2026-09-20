@@ -208,6 +208,9 @@ _latest_customer_message_ids: dict[int, int] = {}
 _support_context_until: dict[int, datetime] = {}
 # وقت آخر رد من الأونر الذي أنهى تدخله في المشكلة الحالية.
 _support_context_resolved_at: dict[int, datetime] = {}
+# None تعني لم نقرأ الحالة المحفوظة بعد. نستخدم قاعدة البيانات حتى لا
+# يعيد Render تشغيل الردود من نفسه لو كان الأونر موقفها مؤقتاً.
+_auto_reply_paused: bool | None = None
 # ربط المالك اليدوي يفتح نافذة قصيرة فقط لطلب OTP؛ لا يتحول إلى إذن
 # مفتوح للحسابات المشتركة المنتهية. تُسجَّل عند نجاح /link.
 _manual_link_code_authorizations: dict[int, datetime] = {}
@@ -1072,6 +1075,7 @@ BTN_PERSONAL_REMINDER = "⏰ تذكير شخصي"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
 BTN_CAMPAIGNS = "📣 إرسال رسالة للعملاء"
+BTN_AUTO_REPLY = "⏯️ الردود التلقائية"
 BTN_BACK = "◀️ رجوع"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
@@ -1083,6 +1087,7 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
         [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
         [KeyboardButton(BTN_PERSONAL_REMINDER), KeyboardButton(BTN_CAMPAIGNS)],
+        [KeyboardButton(BTN_AUTO_REPLY)],
         [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
     ],
     resize_keyboard=True,
@@ -1091,6 +1096,186 @@ MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
 INSTAGRAM_MANAGER_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_INSTAGRAM_SALE)]], resize_keyboard=True
 )
+
+
+def get_auto_reply_paused() -> bool:
+    """الحالة العامة للردود، محفوظة لكل مالك وليست إعداداً مؤقتاً بالذاكرة."""
+    global _auto_reply_paused
+    if _auto_reply_paused is not None:
+        return _auto_reply_paused
+    try:
+        rows = (
+            supabase.table("auto_reply_controls")
+            .select("replies_paused")
+            .eq("owner_user_id", OWNER_USER_ID)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        _auto_reply_paused = bool(rows[0].get("replies_paused")) if rows else False
+    except Exception:
+        # قبل تشغيل ترحيل الجدول لأول مرة أو عند تعذر قاعدة البيانات، نبقي
+        # السلوك السابق (الرد شغال) ولا نحوّل عطل إعداد جديد إلى توقف صامت.
+        logger.exception("Failed to read auto-reply pause state")
+        _auto_reply_paused = False
+    return _auto_reply_paused
+
+
+def set_auto_reply_paused(paused: bool) -> bool:
+    """يحفظ تبديل الردود. يرجع False عند فشل الحفظ حتى لا نوهم الأونر."""
+    global _auto_reply_paused
+    try:
+        supabase.table("auto_reply_controls").upsert(
+            {
+                "owner_user_id": OWNER_USER_ID,
+                "replies_paused": paused,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="owner_user_id",
+        ).execute()
+        _auto_reply_paused = paused
+        return True
+    except Exception:
+        logger.exception("Failed to save auto-reply pause state")
+        return False
+
+
+def build_auto_reply_keyboard(paused: bool) -> InlineKeyboardMarkup:
+    if paused:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ استئناف الردود الآن", callback_data="autoreply_resume")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏸️ إيقاف الردود التلقائية", callback_data="autoreply_pause")],
+    ])
+
+
+def hold_customer_message_while_paused(bm, text: str) -> bool:
+    """يحفظ آخر كلام لكل زبون ليُعالج مرة واحدة عند استئناف الردود."""
+    chat_id = bm.chat.id
+    try:
+        existing = (
+            supabase.table("paused_customer_messages")
+            .select("message_text")
+            .eq("owner_user_id", OWNER_USER_ID)
+            .eq("customer_chat_id", chat_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        previous_text = str(existing[0].get("message_text") or "").strip() if existing else ""
+        combined_text = "\n".join(part for part in (previous_text, text.strip()) if part)
+        supabase.table("paused_customer_messages").upsert(
+            {
+                "owner_user_id": OWNER_USER_ID,
+                "customer_chat_id": chat_id,
+                "business_connection_id": bm.business_connection_id,
+                "customer_name": bm.chat.full_name or bm.chat.first_name or "غير معروف",
+                "customer_username": bm.chat.username,
+                "message_id": bm.message_id,
+                "message_text": combined_text,
+                "received_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="owner_user_id,customer_chat_id",
+        ).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to hold paused customer message for %s", chat_id)
+        return False
+
+
+async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعيد إدخال رسالة واحدة مجمعة لكل زبون عبر مسار الرد الطبيعي."""
+    try:
+        rows = (
+            supabase.table("paused_customer_messages")
+            .select("*")
+            .eq("owner_user_id", OWNER_USER_ID)
+            .order("received_at")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        logger.exception("Failed to load paused customer messages")
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ تعذر جلب الرسائل المعلّقة. بقيت محفوظة؛ جرّب الاستئناف مرة ثانية.")
+        return
+
+    completed = 0
+    failed = 0
+    for row in rows:
+        chat_id = int(row["customer_chat_id"])
+        message_id = int(row["message_id"])
+        text = str(row.get("message_text") or "").strip()
+        business_connection_id = str(row.get("business_connection_id") or "")
+        if not text or not business_connection_id:
+            failed += 1
+            continue
+        customer_name = str(row.get("customer_name") or "غير معروف")
+        customer_username = row.get("customer_username")
+        synthetic_bm = SimpleNamespace(
+            from_user=SimpleNamespace(id=chat_id),
+            chat=SimpleNamespace(
+                id=chat_id,
+                full_name=customer_name,
+                first_name=customer_name,
+                username=customer_username,
+            ),
+            business_connection_id=business_connection_id,
+            message_id=message_id,
+            text=text,
+            caption=None,
+            photo=None,
+            voice=None,
+        )
+        _ready_customer_texts[(chat_id, message_id)] = text
+        try:
+            await on_business_message(
+                SimpleNamespace(business_message=synthetic_bm, edited_business_message=None),
+                context,
+            )
+            supabase.table("paused_customer_messages").delete().eq(
+                "owner_user_id", OWNER_USER_ID
+            ).eq("customer_chat_id", chat_id).execute()
+            completed += 1
+        except Exception:
+            _ready_customer_texts.pop((chat_id, message_id), None)
+            failed += 1
+            logger.exception("Failed to resume paused message for %s", chat_id)
+
+    summary = f"▶️ استؤنفت الردود. تمّت معالجة رسائل {completed} زبون"
+    if failed:
+        summary += f"، وبقيت رسائل {failed} زبون معلّقة لإعادة المحاولة"
+    await context.bot.send_message(chat_id=OWNER_USER_ID, text=summary + ".")
+
+
+async def handle_auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    if query.data == "autoreply_pause":
+        if not set_auto_reply_paused(True):
+            await query.edit_message_text("⚠️ تعذر حفظ الإيقاف. لم تتغير حالة الردود.")
+            return
+        await query.edit_message_text(
+            "⏸️ تم إيقاف الردود التلقائية.\n\n"
+            "البوت يبقى يستلم الرسائل ويحفظ آخر رسالة لكل زبون، لكنه لا يرسل أي رد. "
+            "اضغط الاستئناف عندما تكون جاهزاً.",
+            reply_markup=build_auto_reply_keyboard(True),
+        )
+        return
+    if query.data == "autoreply_resume":
+        if not set_auto_reply_paused(False):
+            await query.edit_message_text("⚠️ تعذر حفظ الاستئناف. الردود ما زالت متوقفة.")
+            return
+        await query.edit_message_text(
+            "▶️ تم استئناف الردود. راح يعالج البوت الرسائل التي وصلت أثناء الإيقاف حسب منطقها الطبيعي.",
+            reply_markup=build_auto_reply_keyboard(False),
+        )
+        context.application.create_task(resume_paused_customer_messages(context))
 
 
 def is_instagram_manager(user_id: int | None) -> bool:
@@ -8870,6 +9055,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
         BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
+        BTN_AUTO_REPLY,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
@@ -8911,6 +9097,16 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
             "📣 رسالة موحدة للعملاء\n\nاختَر الجمهور. بعدها تكتب الرسالة، "
             "ثم تشوف العدد والمعاينة قبل أي إرسال.",
             reply_markup=build_campaign_audience_keyboard(),
+        )
+        return True
+
+    if text == BTN_AUTO_REPLY:
+        paused = get_auto_reply_paused()
+        status = "⏸️ متوقفة" if paused else "✅ شغّالة"
+        await message.reply_text(
+            f"الردود التلقائية الآن: {status}\n\n"
+            "الإيقاف يمنع أي رد للزبائن، مع حفظ رسائلهم لمعالجتها عند الاستئناف.",
+            reply_markup=build_auto_reply_keyboard(paused),
         )
         return True
 
@@ -10636,6 +10832,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # كل نص من الزبون ينتظر نافذة قصيرة حتى تكتمل الأجزاء المتتابعة.
     # التحية المنفردة تستخدم نفس النظام لكن بانتظار دقيقة كاملة.
     if not is_from_owner and ready_customer_text is None:
+        # إيقاف يدوي عام: نستقبل النص ونحفظه، لكن لا نحلله ولا نرد عليه.
+        # الصور تبقى قبل هذا الموضع حتى لا تضيع مراجعة إثباتات الدفع.
+        if get_auto_reply_paused():
+            hold_customer_message_while_paused(bm, text)
+            return
         # وقت التوقف يحجب جميع الردود، حتى طلب الكود السريع.
         if seconds_until_customer_replies_allowed():
             queue_customer_text_batch(update, context, bm, text)
@@ -11251,6 +11452,9 @@ def main() -> None:
 
     # حملات الرسائل الموحدة — لا ترسل شيئاً قبل معاينة وتأكيد الأونر.
     app.add_handler(CallbackQueryHandler(handle_campaign_callback, pattern=r"^campaign_"))
+
+    # إيقاف/استئناف الردود التلقائية مع إبقاء رسائل الزبائن معلّقة بأمان.
+    app.add_handler(CallbackQueryHandler(handle_auto_reply_callback, pattern=r"^autoreply_"))
 
     # إدارة خزينة حسابات ChatGPT المشتركة — للأونر فقط.
     app.add_handler(CallbackQueryHandler(handle_chatgpt_vault_callback, pattern=r"^vault_"))
