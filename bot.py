@@ -2919,6 +2919,7 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
             state.update({
                 "plan_id": plan["id"], "plan_name": plan["name"],
                 "plan_duration": plan.get("duration"),
+                "plan_price": int(plan.get("price") or 0),
                 "duration_days": duration_to_days(plan.get("duration")),
                 # يخزن تذكيراً بعد يوم لأخذ الرضا، وليس انتهاء اشتراك.
                 "reminder_disabled": is_permanent_duration(plan.get("duration")),
@@ -2945,6 +2946,7 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
         state.update({
             "plan_id": plan["id"], "plan_name": plan["name"],
             "plan_duration": plan.get("duration"),
+            "plan_price": int(plan.get("price") or 0),
             "duration_days": duration_to_days(plan.get("duration")),
             "reminder_disabled": is_permanent_duration(plan.get("duration")),
         })
@@ -2962,8 +2964,13 @@ def build_method_list_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def build_amount_keyboard() -> InlineKeyboardMarkup:
-    """شاشة تحديد مبلغ طريقة الدفع المختارة — أزرار تراكمية + إدخال يدوي + تثبيت المبلغ."""
+def build_amount_keyboard(has_catalog_price: bool = False) -> InlineKeyboardMarkup:
+    """تأكيد مبلغ الباقة أو تعديله؛ الإدخال التراكمي للحالات الحرة فقط."""
+    if has_catalog_price:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
+            [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="pay_amount_commit")],
+        ])
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="pay_amount_add_small"),
@@ -3144,6 +3151,11 @@ def format_payment_summary(state: dict) -> str:
         total = sum(amount for _, amount in payments)
         lines.append(f"طرق الدفع: {payments_text}")
         lines.append(f"المجموع الكلي: {total}")
+    elif state.get("pending_method") and state.get("pending_amount", 0) > 0:
+        lines.append(
+            f"طريقة الدفع المختارة: {state['pending_method']} {state['pending_amount']}"
+        )
+        lines.append(f"المجموع الكلي: {state['pending_amount']}")
     else:
         lines.append("طرق الدفع: — لم تُضف بعد —")
 
@@ -7439,6 +7451,7 @@ async def handle_incoming_payment_photo(
         "plan_id": None,
         "plan_name": None,
         "plan_duration": None,
+        "plan_price": None,
         "duration_days": None,
     }
     archive_photo_rate_limit_marker(customer_chat_id, "customer")
@@ -7570,7 +7583,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("pay_plan_"):
         plan_id = data[len("pay_plan_"):]
         try:
-            rows = supabase.table("catalog_plans").select("id, product_id, name, duration, is_active").eq("id", plan_id).limit(1).execute().data or []
+            rows = supabase.table("catalog_plans").select("id, product_id, name, price, duration, is_active").eq("id", plan_id).limit(1).execute().data or []
         except Exception:
             rows = []
         selected_product_id = state.get("catalog_product_id")
@@ -7585,6 +7598,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state.update({
             "plan_id": plan["id"], "plan_name": plan["name"],
             "plan_duration": plan.get("duration"),
+            "plan_price": int(plan.get("price") or 0),
             "duration_days": duration_to_days(plan.get("duration")),
             "reminder_disabled": is_permanent_duration(plan.get("duration")),
         })
@@ -7649,6 +7663,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             "plan_id": None,
             "plan_name": None,
             "plan_duration": None,
+            "plan_price": None,
             "duration_days": None,
             "reminder_disabled": False,
         })
@@ -7674,7 +7689,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         product = data[len("pay_product_"):]
         # هذا مسار توافق لرسائل الأزرار القديمة فقط؛ لا تظهر منه منتجات
         # جديدة بعد الآن لأن شاشة الدفع صارت تعتمد كاتالوج التحكم.
-        state.update({"product": product, "catalog_product_id": None, "manual_product": False})
+        state.update({
+            "product": product,
+            "catalog_product_id": None,
+            "manual_product": False,
+            "plan_price": None,
+        })
         if product == "امبوس":
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر مدة Ambos:",
@@ -7729,10 +7749,16 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("pay_method_") and data != "pay_method_list":
         method = data[len("pay_method_"):]
         state["pending_method"] = method
-        state["pending_amount"] = 0
+        plan_price = int(state.get("plan_price") or 0)
+        state["pending_amount"] = plan_price
+        amount_note = (
+            f"مبلغ الباقة تلقائياً: {plan_price}"
+            if plan_price > 0 else
+            "حدد المبلغ:"
+        )
         await query.edit_message_caption(
-            caption=format_payment_summary(state) + f"\n\nطريقة الدفع المختارة: {method}\nحدد المبلغ:",
-            reply_markup=build_amount_keyboard(),
+            caption=format_payment_summary(state) + f"\n\nطريقة الدفع المختارة: {method}\n{amount_note}",
+            reply_markup=build_amount_keyboard(has_catalog_price=plan_price > 0),
         )
         return
 
@@ -7765,7 +7791,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_caption(
             caption=format_payment_summary(state)
             + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {state['pending_amount']}",
-            reply_markup=build_amount_keyboard(),
+            reply_markup=build_amount_keyboard(has_catalog_price=bool(state.get("plan_price"))),
         )
         return
 
@@ -7774,7 +7800,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_caption(
             caption=format_payment_summary(state)
             + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {state['pending_amount']}",
-            reply_markup=build_amount_keyboard(),
+            reply_markup=build_amount_keyboard(has_catalog_price=bool(state.get("plan_price"))),
         )
         return
 
@@ -8276,6 +8302,7 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
         "plan_id": None,
         "plan_name": None,
         "plan_duration": None,
+        "plan_price": None,
         "duration_days": None,
         "reminder_disabled": False,
     })
@@ -8333,7 +8360,7 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
             message_id=replied_id,
             caption=format_payment_summary(state)
             + f"\n\nطريقة الدفع المختارة: {state['pending_method']}\nالمبلغ الحالي: {amount}",
-            reply_markup=build_amount_keyboard(),
+            reply_markup=build_amount_keyboard(has_catalog_price=bool(state.get("plan_price"))),
         )
     except Exception:
         logger.exception("Failed to update caption after manual amount entry")
