@@ -2111,7 +2111,12 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
         # لذلك لا نعتمد على نافذة الرد القصيرة الخاصة بـBusiness Connection.
         if not personal_scheduler_is_configured():
             raise RuntimeError("جلسة حساب الدعم الشخصي غير مهيأة في Render")
-        await send_personal_message(int(recipient["customer_chat_id"]), campaign["message_text"])
+        is_continuity_invite = campaign["message_text"].strip() == CONTINUITY_INVITE_TEXT
+        await send_personal_message(
+            int(recipient["customer_chat_id"]), campaign["message_text"],
+            button_text="🎁 دخول بوت الهدايا والمكافآت" if is_continuity_invite else None,
+            button_url=continuity_bot_url() if is_continuity_invite else None,
+        )
     except Exception as exc:
         status, error_text = "failed", str(exc)[:500]
         logger.exception("Campaign queue delivery failed campaign=%s chat=%s", campaign["id"], recipient["customer_chat_id"])
@@ -2253,6 +2258,10 @@ async def handle_campaign_message_input(update: Update, context: ContextTypes.DE
     if not text or len(text) > 3_500:
         await message.reply_text("اكتب رسالة بين 1 و3500 حرف.")
         return True
+    is_continuity_invite = text == CONTINUITY_INVITE_TEXT
+    if is_continuity_invite and not continuity_bot_url():
+        await message.reply_text("⚠️ أضف CONTINUITY_BOT_USERNAME في Render أولاً حتى يظهر زر بوت المكافآت.")
+        return True
     campaign, recipients = create_campaign_snapshot(draft["audience_key"], text)
     context.user_data.pop("campaign_draft", None)
     if campaign is None:
@@ -2268,7 +2277,9 @@ async def handle_campaign_message_input(update: Update, context: ContextTypes.DE
     await message.reply_text(
         f"📣 معاينة الحملة\n\nالجمهور: {CAMPAIGN_AUDIENCES[draft['audience_key']]}\n"
         f"عدد العملاء: {len(recipients)}\n{delivery_note}\n\n"
-        f"نص الرسالة:\n{preview}\n\n"
+        f"نص الرسالة:\n{preview}\n"
+        + ("\n🎁 راح ينضاف زر يفتح بوت الهدايا والمكافآت.\n" if is_continuity_invite else "\n")
+        + "\n"
         "لن يُرسل أي شيء إلا بعد ضغط التأكيد.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ تأكيد الإرسال", callback_data=f"campaign_send_{campaign['id']}")],

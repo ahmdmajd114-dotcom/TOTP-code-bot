@@ -10,11 +10,12 @@ import os
 from datetime import datetime
 
 try:
-    from telethon import TelegramClient
+    from telethon import TelegramClient, Button
     from telethon.sessions import StringSession
 except ImportError:  # Keeps local unit tests usable before Render installs deps.
     TelegramClient = None
     StringSession = None
+    Button = None
 
 
 def is_configured() -> bool:
@@ -89,7 +90,9 @@ async def schedule_messages(
     return results
 
 
-async def send_message(chat_id: int, text: str) -> int:
+async def send_message(
+    chat_id: int, text: str, *, button_text: str | None = None, button_url: str | None = None,
+) -> int:
     """يرسل رسالة فورية من حساب Telegram الشخصي، كبديل عن Business."""
     client = _client()
     try:
@@ -97,7 +100,8 @@ async def send_message(chat_id: int, text: str) -> int:
         if not await client.is_user_authorized():
             raise RuntimeError("Telegram personal session is not authorized")
         entity = await _resolve_customer_entity(client, chat_id)
-        message = await client.send_message(entity, text)
+        buttons = [[Button.url(button_text, button_url)]] if button_text and button_url and Button else None
+        message = await client.send_message(entity, text, buttons=buttons)
         return int(message.id)
     finally:
         await client.disconnect()
