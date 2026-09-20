@@ -2899,7 +2899,7 @@ def catalog_product_for_payment_name(name: str) -> dict | None:
 
 
 def prepare_generic_subscription(state: dict) -> list[dict]:
-    """يملأ الباقة تلقائياً إن كانت وحيدة، ويرجع الباقات التي تحتاج اختياراً."""
+    """يملأ الباقة فقط إذا كانت الوحيدة؛ أي باقتين مفعّلتين تظهران للاختيار."""
     product_name = state.get("product") or ""
     # المنتج المختار من كاتالوج الدفع يلتزم بباقاته ومدده الحية، لا بمدد
     # ثابتة قديمة تحمل الاسم نفسه.
@@ -2910,11 +2910,12 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
             return []
         plans = [
             plan for plan in get_catalog_plans(str(selected_catalog_id))
-            if plan.get("is_active") and (
-                duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration"))
-            )
+            if plan.get("is_active")
         ]
-        if len(plans) == 1:
+        if len(plans) == 1 and (
+            duration_to_days(plans[0].get("duration"))
+            or is_permanent_duration(plans[0].get("duration"))
+        ):
             plan = plans[0]
             state.update({
                 "plan_id": plan["id"], "plan_name": plan["name"],
@@ -2937,11 +2938,12 @@ def prepare_generic_subscription(state: dict) -> list[dict]:
         return []
     plans = [
         plan for plan in get_catalog_plans(product["id"])
-        if plan.get("is_active") and (
-            duration_to_days(plan.get("duration")) or is_permanent_duration(plan.get("duration"))
-        )
+        if plan.get("is_active")
     ]
-    if len(plans) == 1:
+    if len(plans) == 1 and (
+        duration_to_days(plans[0].get("duration"))
+        or is_permanent_duration(plans[0].get("duration"))
+    ):
         plan = plans[0]
         state.update({
             "plan_id": plan["id"], "plan_name": plan["name"],
