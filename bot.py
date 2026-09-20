@@ -157,7 +157,7 @@ CATALOG_SUPPORT_URL = os.environ.get(
 # الحساب الاحتياطي. يبقى فارغاً إلى أن يضع الأونر اسمه في Render، حتى لا
 # نرسل دعوات خاطئة إلى بوت غير مقصود.
 CONTINUITY_BOT_USERNAME = os.environ.get("CONTINUITY_BOT_USERNAME", "").strip().lstrip("@")
-CONTINUITY_INVITE_DELAY_MINUTES = int(os.environ.get("CONTINUITY_INVITE_DELAY_MINUTES", "30"))
+CONTINUITY_INVITE_DELAY_MINUTES = int(os.environ.get("CONTINUITY_INVITE_DELAY_MINUTES", "5"))
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
@@ -2415,8 +2415,7 @@ def continuity_invite_keyboard() -> InlineKeyboardMarkup | None:
 
 
 CONTINUITY_INVITE_TEXT = (
-    "🎁 حتى توصلك هدايانا ومكافآتنا المستقبلية، "
-    "اضغط الزر أدناه وابدأ بوت ميدبوكس الاحتياطي."
+    "حتى تحصل على هدايا ومكافآت متجرنا مستقبلاً اضغط الزر أدناه."
 )
 CONTINUITY_WELCOME_TEXT = (
     "أهلاً وسهلاً 🌟\n\n"
