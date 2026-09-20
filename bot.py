@@ -1075,7 +1075,7 @@ BTN_ADD_ACCOUNT = "➕ إضافة حساب"
 BTN_STATS = "📈 إحصائيات"
 BTN_DEBT = "دين 💳"
 BTN_TEACH = "📝 بدء تلقين جديد"
-BTN_CATALOG = "🗂️ المنتجات والباقات"
+BTN_CATALOG = "📦 المنتجات والباقات"
 BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
@@ -1086,22 +1086,37 @@ BTN_CAMPAIGNS = "📣 إرسال رسالة للعملاء"
 BTN_CONTINUITY_STATS = "🎁 إحصائيات بوت المكافآت"
 BTN_AUTO_REPLY = "⏯️ الردود التلقائية"
 BTN_BACK = "◀️ رجوع"
+BTN_MAIN_MENU = "◀️ القائمة الرئيسية"
+BTN_REPORTS = "📊 التقارير والإحصائيات"
+BTN_FINANCE = "💰 المالية والحسابات"
+BTN_FOLLOW_UP = "🔔 المتابعة والتذكيرات"
+BTN_CUSTOMERS = "📣 العملاء والتسويق"
+BTN_ADMIN = "⚙️ الإدارة والأتمتة"
 PAYMENT_METHOD_INPUT_TIMEOUT = timedelta(minutes=10)
 
 MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton(BTN_EXPENSE), KeyboardButton(BTN_INCOME)],
-        [KeyboardButton(BTN_ADD_ACCOUNT), KeyboardButton(BTN_STATS)],
-        [KeyboardButton(BTN_DEBT), KeyboardButton(BTN_TEACH)],
-        [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_PAYMENT_METHODS)],
-        [KeyboardButton(BTN_CHATGPT_VAULT), KeyboardButton(BTN_SUBSCRIPTION_REMINDER)],
-        [KeyboardButton(BTN_PERSONAL_REMINDER), KeyboardButton(BTN_CAMPAIGNS)],
-        [KeyboardButton(BTN_CONTINUITY_STATS)],
-        [KeyboardButton(BTN_AUTO_REPLY)],
-        [KeyboardButton(BTN_INSTAGRAM_ADMIN)],
+        [KeyboardButton(BTN_TEACH), KeyboardButton(BTN_CATALOG)],
+        [KeyboardButton(BTN_REPORTS)],
+        [KeyboardButton(BTN_FINANCE)],
+        [KeyboardButton(BTN_FOLLOW_UP)],
+        [KeyboardButton(BTN_CUSTOMERS)],
+        [KeyboardButton(BTN_ADMIN)],
     ],
     resize_keyboard=True,
 )
+
+def _submenu_keyboard(rows: list[list[str]]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label) for label in row] for row in rows] + [[KeyboardButton(BTN_MAIN_MENU)]],
+        resize_keyboard=True,
+    )
+
+REPORTS_REPLY_KEYBOARD = _submenu_keyboard([[BTN_INCOME, BTN_STATS], [BTN_CONTINUITY_STATS]])
+FINANCE_REPLY_KEYBOARD = _submenu_keyboard([[BTN_EXPENSE, BTN_ADD_ACCOUNT], [BTN_PAYMENT_METHODS, BTN_DEBT]])
+FOLLOW_UP_REPLY_KEYBOARD = _submenu_keyboard([[BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER]])
+CUSTOMERS_REPLY_KEYBOARD = _submenu_keyboard([[BTN_CAMPAIGNS], [BTN_INSTAGRAM_ADMIN]])
+ADMIN_REPLY_KEYBOARD = _submenu_keyboard([[BTN_CHATGPT_VAULT], [BTN_AUTO_REPLY]])
 
 INSTAGRAM_MANAGER_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_INSTAGRAM_SALE)]], resize_keyboard=True
@@ -1713,6 +1728,7 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return False
 
     text = message.text.strip()
+
     try:
         if state["step"] == "product_data":
             parts = [part.strip() for part in text.split("|", 2)]
@@ -9831,13 +9847,30 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     text = message.text.strip()
 
+    if text == BTN_MAIN_MENU:
+        await message.reply_text("القائمة الرئيسية:", reply_markup=MAIN_REPLY_KEYBOARD)
+        return True
+
+    submenu_by_button = {
+        BTN_REPORTS: ("📊 التقارير والإحصائيات", REPORTS_REPLY_KEYBOARD),
+        BTN_FINANCE: ("💰 المالية والحسابات", FINANCE_REPLY_KEYBOARD),
+        BTN_FOLLOW_UP: ("🔔 المتابعة والتذكيرات", FOLLOW_UP_REPLY_KEYBOARD),
+        BTN_CUSTOMERS: ("📣 العملاء والتسويق", CUSTOMERS_REPLY_KEYBOARD),
+        BTN_ADMIN: ("⚙️ الإدارة والأتمتة", ADMIN_REPLY_KEYBOARD),
+    }
+    if text in submenu_by_button:
+        title, keyboard = submenu_by_button[text]
+        await message.reply_text(title, reply_markup=keyboard)
+        return True
+
     # هذا الزر يعني أن المستخدم بدأ مهمة جديدة، لذلك نلغي أوضاع الإدخال
     # القديمة حتى ما تعترض المصروف أو التقرير أو أي وظيفة ثانية.
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
         BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
-        BTN_CONTINUITY_STATS, BTN_AUTO_REPLY,
+        BTN_CONTINUITY_STATS, BTN_AUTO_REPLY, BTN_REPORTS, BTN_FINANCE,
+        BTN_FOLLOW_UP, BTN_CUSTOMERS, BTN_ADMIN, BTN_MAIN_MENU,
     }:
         context.user_data.pop("pending_payment_input", None)
         context.user_data.pop("pending_catalog_input", None)
