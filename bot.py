@@ -1985,13 +1985,12 @@ def resolve_reminder_delivery_target(reminder: dict) -> tuple[int | None, str | 
 
 
 def apply_campaign_business_connection(recipients: list[dict]) -> list[dict]:
-    """Backfill old recipients with the current Business connection when known."""
-    fallback_connection = get_current_business_connection_id()
-    if not fallback_connection:
-        return recipients
-    for recipient in recipients:
-        if not recipient.get("business_connection_id"):
-            recipient["business_connection_id"] = fallback_connection
+    """لا نعدّ اتصالاً عاماً كصلاحية Business مؤكدة لزبون بعينه.
+
+    معرف Business Connection يخص حساب الدعم، لكن Telegram قد يمنع الإرسال
+    خارج نافذة الرد. لذلك تبقى المعاينة صادقة: نحسب فقط الاتصال المخزّن
+    مع ذلك الزبون، ثم العامل يجرب الحساب الشخصي كخطة بديلة عند الحاجة.
+    """
     return recipients
 
 
