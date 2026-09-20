@@ -9129,12 +9129,21 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
 
     if text == BTN_AUTO_REPLY:
         paused = get_auto_reply_paused()
-        status = "⏸️ متوقفة" if paused else "✅ شغّالة"
-        await message.reply_text(
-            f"الردود التلقائية الآن: {status}\n\n"
-            "الإيقاف يمنع أي رد للزبائن، مع حفظ رسائلهم لمعالجتها عند الاستئناف.",
-            reply_markup=build_auto_reply_keyboard(paused),
-        )
+        # نفس زر لوحة المفاتيح هو تبديل مباشر: ما نطلب ضغطة ثانية أو
+        # تأكيداً لأن الغرض منه إيقاف سريع عند انشغال الأونر.
+        next_paused = not paused
+        if not set_auto_reply_paused(next_paused):
+            await message.reply_text("⚠️ تعذر حفظ التغيير؛ حالة الردود لم تتبدل.")
+            return True
+        if next_paused:
+            await message.reply_text(
+                "⏸️ توقفت الردود التلقائية. البوت يبقى يستلم ويحفظ رسائل الزبائن، لكنه ما يرد."
+            )
+        else:
+            await message.reply_text(
+                "▶️ استؤنفت الردود. راح يعالج البوت الرسائل التي وصلت أثناء الإيقاف."
+            )
+            context.application.create_task(resume_paused_customer_messages(context))
         return True
 
     if text == BTN_EXPENSE:
