@@ -4,7 +4,7 @@ create table if not exists public.customer_campaigns (
   owner_user_id bigint not null,
   audience_key text not null,
   message_text text not null,
-  status text not null default 'draft' check (status in ('draft', 'sending', 'sent', 'cancelled')),
+  status text not null default 'draft' check (status in ('draft', 'queued', 'sending', 'sent', 'cancelled')),
   recipient_count integer not null default 0,
   sent_count integer not null default 0,
   failed_count integer not null default 0,
@@ -12,6 +12,21 @@ create table if not exists public.customer_campaigns (
   created_at timestamptz not null default now(),
   sent_at timestamptz
 );
+
+-- تنفيذ الحملة على دفعات آمنة قابلة للاستئناف بعد إعادة تشغيل Render.
+alter table public.customer_campaigns
+  add column if not exists next_send_at timestamptz;
+alter table public.customer_campaigns
+  add column if not exists attempted_count integer not null default 0;
+alter table public.customer_campaigns
+  drop constraint if exists customer_campaigns_status_check;
+alter table public.customer_campaigns
+  add constraint customer_campaigns_status_check
+  check (status in ('draft', 'queued', 'sending', 'sent', 'cancelled'));
+
+create index if not exists customer_campaigns_queue_idx
+  on public.customer_campaigns (next_send_at)
+  where status in ('queued', 'sending');
 
 create table if not exists public.customer_campaign_recipients (
   id bigint generated always as identity primary key,

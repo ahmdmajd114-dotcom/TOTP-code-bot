@@ -1785,7 +1785,11 @@ CAMPAIGN_AUDIENCES = {
     "support_recent": "حالات الدعم الحديثة",
     "all_contacts": "كل العملاء الذين راسلوا الحساب",
 }
-CAMPAIGN_SEND_DELAY_SECONDS = 0.08
+# طابور محافظ للحساب الشخصي: رسالة كل دقيقة، وبعد كل 50 محاولة يستريح
+# 30 دقيقة. لا نستخدم burst حتى لا يبدو الإرسال كسبام أو يعرّض الحساب لتقييد.
+CAMPAIGN_SEND_DELAY_SECONDS = float(os.environ.get("CAMPAIGN_SEND_DELAY_SECONDS", "60"))
+CAMPAIGN_BATCH_SIZE = int(os.environ.get("CAMPAIGN_BATCH_SIZE", "50"))
+CAMPAIGN_BATCH_PAUSE_SECONDS = float(os.environ.get("CAMPAIGN_BATCH_PAUSE_SECONDS", str(30 * 60)))
 
 
 def build_campaign_audience_keyboard() -> InlineKeyboardMarkup:
@@ -2054,55 +2058,86 @@ def create_campaign_snapshot(audience_key: str, message_text: str) -> tuple[dict
         return None, []
 
 
-async def send_campaign(context: ContextTypes.DEFAULT_TYPE, campaign_id: str) -> tuple[int, int, int]:
-    """Send a confirmed campaign sequentially and persist every delivery result."""
+async def send_campaign(context: ContextTypes.DEFAULT_TYPE, campaign_id: str) -> bool:
+    """يحوّل الحملة المؤكدة إلى طابور محفوظ؛ العامل الدوري يتولى الإرسال."""
+    del context
     try:
-        campaign_rows = supabase.table("customer_campaigns").select("message_text, status").eq("id", campaign_id).limit(1).execute().data or []
-        if not campaign_rows or campaign_rows[0].get("status") != "draft":
-            return 0, 0, 0
-        message_text = campaign_rows[0]["message_text"]
-        supabase.table("customer_campaigns").update({"status": "sending"}).eq("id", campaign_id).execute()
-        recipients = supabase.table("customer_campaign_recipients").select(
-            "id, customer_chat_id, business_connection_id"
-        ).eq("campaign_id", campaign_id).eq("delivery_status", "pending").execute().data or []
+        result = (supabase.table("customer_campaigns").update({
+            "status": "queued", "next_send_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", campaign_id).eq("status", "draft").execute().data or [])
+        return bool(result)
     except Exception:
-        logger.exception("Failed to start campaign %s", campaign_id)
-        return 0, 0, 0
+        logger.exception("Failed to queue campaign %s", campaign_id)
+        return False
 
-    sent = failed = skipped = 0
-    for recipient in recipients:
-        status = "sent"
-        error_text = None
-        if not recipient.get("business_connection_id"):
-            status, skipped = "skipped", skipped + 1
-            error_text = "لا يوجد اتصال Business محفوظ لهذا العميل"
-        else:
-            try:
-                await context.bot.send_message(
-                    business_connection_id=recipient["business_connection_id"],
-                    chat_id=recipient["customer_chat_id"], text=message_text,
-                )
-                sent += 1
-            except Exception as exc:
-                status, failed = "failed", failed + 1
-                error_text = str(exc)[:500]
-                logger.exception("Campaign delivery failed campaign=%s chat=%s", campaign_id, recipient["customer_chat_id"])
-        try:
-            supabase.table("customer_campaign_recipients").update({
-                "delivery_status": status, "error_text": error_text,
-                "delivered_at": datetime.now(timezone.utc).isoformat() if status == "sent" else None,
-            }).eq("id", recipient["id"]).execute()
-        except Exception:
-            logger.exception("Failed to save campaign recipient result")
-        await asyncio.sleep(CAMPAIGN_SEND_DELAY_SECONDS)
+
+async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يرسل محاولة واحدة فقط عند حلول وقتها، ثم يحجز الموعد الآمن التالي."""
+    now = datetime.now(timezone.utc)
     try:
-        supabase.table("customer_campaigns").update({
-            "status": "sent", "sent_count": sent, "failed_count": failed,
-            "skipped_count": skipped, "sent_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", campaign_id).execute()
+        campaigns = (supabase.table("customer_campaigns")
+                     .select("id, message_text, sent_count, failed_count, skipped_count, attempted_count")
+                     .in_("status", ["queued", "sending"])
+                     .lte("next_send_at", now.isoformat()).order("next_send_at").limit(1)
+                     .execute().data or [])
+        if not campaigns:
+            return
+        campaign = campaigns[0]
+        recipients = (supabase.table("customer_campaign_recipients")
+                      .select("id, customer_chat_id, business_connection_id")
+                      .eq("campaign_id", campaign["id"]).eq("delivery_status", "pending")
+                      .order("id").limit(1).execute().data or [])
     except Exception:
-        logger.exception("Failed to finalize campaign %s", campaign_id)
-    return sent, failed, skipped
+        logger.exception("Failed to load campaign queue")
+        return
+
+    if not recipients:
+        try:
+            supabase.table("customer_campaigns").update({
+                "status": "sent", "sent_at": now.isoformat(), "next_send_at": None,
+            }).eq("id", campaign["id"]).execute()
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(f"✅ اكتمل طابور الحملة.\nتم الإرسال: {campaign['sent_count']}\n"
+                      f"فشل: {campaign['failed_count']}\nتم التخطي: {campaign['skipped_count']}"),
+            )
+        except Exception:
+            logger.exception("Failed to finalize campaign queue %s", campaign["id"])
+        return
+
+    recipient = recipients[0]
+    status, error_text = "sent", None
+    try:
+        # نبدأ بـBusiness، وإذا انتهت نافذته نستخدم الحساب الشخصي الموجود
+        # نفسه، بشرط أن تكون جلسة Telegram الشخصية محفوظة في Render.
+        await send_relogin_notice(
+            context, int(recipient["customer_chat_id"]), campaign["message_text"],
+        )
+    except Exception as exc:
+        status, error_text = "failed", str(exc)[:500]
+        logger.exception("Campaign queue delivery failed campaign=%s chat=%s", campaign["id"], recipient["customer_chat_id"])
+
+    try:
+        attempted_count = int(campaign.get("attempted_count") or 0) + 1
+        next_delay = (
+            CAMPAIGN_BATCH_PAUSE_SECONDS
+            if attempted_count % CAMPAIGN_BATCH_SIZE == 0
+            else CAMPAIGN_SEND_DELAY_SECONDS
+        )
+        update = {
+            "status": "sending",
+            "attempted_count": attempted_count,
+            "next_send_at": (now + timedelta(seconds=next_delay)).isoformat(),
+            "sent_count": int(campaign.get("sent_count") or 0) + (1 if status == "sent" else 0),
+            "failed_count": int(campaign.get("failed_count") or 0) + (1 if status == "failed" else 0),
+        }
+        supabase.table("customer_campaign_recipients").update({
+            "delivery_status": status, "error_text": error_text,
+            "delivered_at": now.isoformat() if status == "sent" else None,
+        }).eq("id", recipient["id"]).execute()
+        supabase.table("customer_campaigns").update(update).eq("id", campaign["id"]).execute()
+    except Exception:
+        logger.exception("Failed to persist campaign queue result")
 
 
 def format_customer_payment_methods(methods: list[dict]) -> str | None:
@@ -2198,11 +2233,15 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if not data.startswith("campaign_send_"):
         return
     campaign_id = data[len("campaign_send_"):]
-    await query.edit_message_text("⏳ بدأ الإرسال التدريجي… لا تغلق البوت إلى أن يظهر التقرير.")
-    sent, failed, skipped = await send_campaign(context, campaign_id)
-    await query.message.reply_text(
-        "✅ اكتملت الحملة\n\n"
-        f"تم الإرسال: {sent}\nفشل الإرسال: {failed}\nتم التخطي: {skipped}"
+    queued = await send_campaign(context, campaign_id)
+    if not queued:
+        await query.edit_message_text("⚠️ تعذر حجز الحملة أو أنها بدأت مسبقاً.")
+        return
+    await query.edit_message_text(
+        "✅ تم وضع الحملة في طابور آمن.\n\n"
+        "الإرسال: رسالة واحدة كل دقيقة.\n"
+        "بعد كل 50 محاولة: استراحة 30 دقيقة.\n\n"
+        "راح يصلك تقرير تلقائي عند اكتمالها."
     )
 
 
@@ -12017,6 +12056,8 @@ def main() -> None:
     else:
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
+        # عامل طابور الحملات: محاولة واحدة عند موعدها، لا burst جماعي.
+        app.job_queue.run_repeating(process_campaign_queue, interval=15, first=25)
         # دعوات بوت الاستمرارية تُرسل بعد 30 دقيقة من تسليم اشتراك ChatGPT.
         # تبقى في Supabase، لذلك لا تضيع إذا أعاد Render تشغيل الخدمة.
         app.job_queue.run_repeating(deliver_due_continuity_invites, interval=60, first=20)
