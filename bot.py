@@ -2224,6 +2224,23 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         context.user_data.pop("campaign_draft", None)
         await query.edit_message_text("تم إلغاء الحملة.")
         return
+    if data.startswith("campaign_stop_"):
+        campaign_id = data[len("campaign_stop_"):]
+        try:
+            rows = (supabase.table("customer_campaigns").update({
+                "status": "cancelled", "next_send_at": None,
+            }).eq("id", campaign_id).in_("status", ["queued", "sending"]).execute().data or [])
+            if rows:
+                await query.edit_message_text(
+                    "⏹️ تم إيقاف الإرسال.\n\n"
+                    "لن تُرسل أي رسالة جديدة؛ الرسائل التي وصلت سابقاً تبقى كما هي."
+                )
+            else:
+                await query.edit_message_text("هذه الحملة منتهية أو موقوفة مسبقاً.")
+        except Exception:
+            logger.exception("Failed to stop campaign %s", campaign_id)
+            await query.answer("تعذر إيقاف الحملة حالياً.", show_alert=True)
+        return
     if data.startswith("campaign_aud_"):
         audience_key = data[len("campaign_aud_"):]
         if audience_key not in CAMPAIGN_AUDIENCES:
@@ -2245,7 +2262,10 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         "✅ تم وضع الحملة في طابور آمن.\n\n"
         "الإرسال: رسالة واحدة كل دقيقة.\n"
         "بعد كل 50 محاولة: استراحة 30 دقيقة.\n\n"
-        "راح يصلك تقرير تلقائي عند اكتمالها."
+        "تقدر توقفها بأي وقت من الزر أدناه.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏹️ إيقاف الإرسال", callback_data=f"campaign_stop_{campaign_id}")
+        ]]),
     )
 
 
