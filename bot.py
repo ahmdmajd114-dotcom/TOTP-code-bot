@@ -2259,13 +2259,22 @@ async def handle_campaign_message_input(update: Update, context: ContextTypes.DE
     if campaign is None:
         await message.reply_text("⚠️ تعذر حفظ الحملة. شغّل ملف Supabase الجديد وتأكد من الاتصال.")
         return True
-    ready = sum(1 for row in recipients if row.get("business_connection_id"))
-    missing_connection = len(recipients) - ready
+    business_ready = sum(1 for row in recipients if row.get("business_connection_id"))
+    personal_fallback_ready = personal_scheduler_is_configured()
+    no_business_connection = len(recipients) - business_ready
     preview = text if len(text) <= 900 else text[:900] + "…"
+    delivery_note = (
+        f"Business مباشر: {business_ready}\n"
+        f"بدون اتصال Business: {no_business_connection}\n"
+        + (
+            "✅ لهؤلاء راح يحاول من حساب الدعم الشخصي المحفوظ، واحدًا واحدًا."
+            if personal_fallback_ready else
+            "⚠️ جلسة حساب الدعم الشخصي غير مهيأة؛ هؤلاء سيفشل إرسالهم خارج Business."
+        )
+    )
     await message.reply_text(
         f"📣 معاينة الحملة\n\nالجمهور: {CAMPAIGN_AUDIENCES[draft['audience_key']]}\n"
-        f"عدد العملاء: {len(recipients)}\nجاهزون للإرسال: {ready}\n"
-        f"سيتخطاهم البوت لعدم وجود اتصال Business: {missing_connection}\n\n"
+        f"عدد العملاء: {len(recipients)}\n{delivery_note}\n\n"
         f"نص الرسالة:\n{preview}\n\n"
         "لن يُرسل أي شيء إلا بعد ضغط التأكيد.",
         reply_markup=InlineKeyboardMarkup([
