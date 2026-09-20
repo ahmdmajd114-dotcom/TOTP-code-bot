@@ -2970,6 +2970,7 @@ def build_amount_keyboard(has_catalog_price: bool = False) -> InlineKeyboardMark
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
             [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="pay_amount_commit")],
+            [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_method")],
         ])
     return InlineKeyboardMarkup([
         [
@@ -2978,6 +2979,7 @@ def build_amount_keyboard(has_catalog_price: bool = False) -> InlineKeyboardMark
         ],
         [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="pay_amount_manual")],
         [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="pay_amount_commit")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_method")],
     ])
 
 
@@ -2986,6 +2988,7 @@ def build_catalog_payment_ready_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
         [InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_catalog_payment")],
     ])
 
 
@@ -3025,13 +3028,15 @@ def build_subscription_type_keyboard() -> InlineKeyboardMarkup:
 
 def build_subscription_plan_keyboard(plans: list[dict]) -> InlineKeyboardMarkup:
     """يختار الأونر مدة/باقة المنتج العام من الكاتالوج قبل تثبيت الدفع."""
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(
             f"{plan['name']} — {plan['duration'] or 'بدون مدة'}",
             callback_data=f"pay_plan_{plan['id']}",
         )]
         for plan in plans
-    ])
+    ]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_product")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_link_debt_keyboard(customer_chat_id: int) -> InlineKeyboardMarkup:
@@ -7747,9 +7752,50 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     # -------------------- رجوع من قائمة المنتجات لشاشة اختيار المنتج الأولى --------------------
     if data == "pay_back_to_product":
+        # رجوع من اختيار الباقة يعيد لاختيار المنتج، ويلغي أي باقة كانت
+        # محددة مؤقتاً حتى لا يتسرب سعرها للمنتج التالي.
+        state.update({
+            "product": None,
+            "catalog_product_id": None,
+            "plan_id": None,
+            "plan_name": None,
+            "plan_duration": None,
+            "plan_price": None,
+            "duration_days": None,
+            "reminder_disabled": False,
+        })
         await query.edit_message_caption(
             caption=format_payment_summary(state),
             reply_markup=build_product_keyboard(),
+        )
+        return
+
+    if data == "pay_back_from_catalog_payment":
+        # سعر الباقة أُضيف تلقائياً عند اختيار المحفظة؛ الرجوع منه يلغي
+        # هذه الإضافة فقط ويعيد شاشة اختيار طرق الدفع.
+        editing_index = state.pop("editing_payment_index", None)
+        if isinstance(editing_index, int) and 0 <= editing_index < len(state.get("payments", [])):
+            state["payments"].pop(editing_index)
+        state["awaiting_manual_amount"] = False
+        customer_chat_id = state.get("customer_chat_id")
+        has_debt = (
+            state.get("product") and customer_chat_id is not None
+            and find_unpaid_debt(customer_chat_id, state["product"]) is not None
+        )
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_summary_keyboard(
+                has_product=bool(state.get("product")), has_payment=bool(state.get("payments")),
+                show_debt_repayment=has_debt,
+            ),
+        )
+        return
+
+    if data == "pay_back_from_amount_edit":
+        state["awaiting_manual_amount"] = False
+        await query.edit_message_caption(
+            caption=format_payment_summary(state),
+            reply_markup=build_catalog_payment_ready_keyboard(),
         )
         return
 
@@ -7789,6 +7835,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     # -------------------- رجوع من قائمة طرق الدفع لشاشة الملخص (اختيار سريع للطريقة) --------------------
     if data == "pay_back_to_method":
+        state["pending_method"] = None
+        state["pending_amount"] = 0
+        state["awaiting_manual_amount"] = False
         customer_chat_id = state.get("customer_chat_id")
         has_debt = (
             state["product"] and customer_chat_id is not None
@@ -7833,7 +7882,11 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_caption(
             caption=format_payment_summary(state)
             + f"\n\n{prompt}",
-            reply_markup=None,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_amount_edit")
+            ]]) if isinstance(editing_index, int) else InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_BACK, callback_data="pay_back_to_method")
+            ]]),
         )
         return
 
