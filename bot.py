@@ -2141,10 +2141,8 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
             if attempted_count % CAMPAIGN_BATCH_SIZE == 0
             else CAMPAIGN_SEND_DELAY_SECONDS
         )
-        update = {
-            "status": "sending",
+        counters = {
             "attempted_count": attempted_count,
-            "next_send_at": (now + timedelta(seconds=next_delay)).isoformat(),
             "sent_count": int(campaign.get("sent_count") or 0) + (1 if status == "sent" else 0),
             "failed_count": int(campaign.get("failed_count") or 0) + (1 if status == "failed" else 0),
         }
@@ -2152,7 +2150,19 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
             "delivery_status": status, "error_text": error_text,
             "delivered_at": now.isoformat() if status == "sent" else None,
         }).eq("id", recipient["id"]).execute()
-        supabase.table("customer_campaigns").update(update).eq("id", campaign["id"]).execute()
+        # قد يضغط المالك "إيقاف مؤقت" أثناء إرسال هذه الرسالة نفسها.
+        # نحفظ نتيجة هذه المحاولة، لكن لا نعيد تشغيل الحملة من العامل الدوري.
+        latest = (supabase.table("customer_campaigns").select("status")
+                  .eq("id", campaign["id"]).limit(1).execute().data or [])
+        latest_status = latest[0].get("status") if latest else None
+        if latest_status in {"paused", "cancelled"}:
+            supabase.table("customer_campaigns").update(counters).eq("id", campaign["id"]).execute()
+        else:
+            supabase.table("customer_campaigns").update({
+                **counters,
+                "status": "sending",
+                "next_send_at": (now + timedelta(seconds=next_delay)).isoformat(),
+            }).eq("id", campaign["id"]).execute()
     except Exception:
         logger.exception("Failed to persist campaign queue result")
 
@@ -2237,22 +2247,59 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         context.user_data.pop("campaign_draft", None)
         await query.edit_message_text("تم إلغاء الحملة.")
         return
-    if data.startswith("campaign_stop_"):
-        campaign_id = data[len("campaign_stop_"):]
+    if data.startswith("campaign_pause_"):
+        campaign_id = data[len("campaign_pause_"):]
         try:
             rows = (supabase.table("customer_campaigns").update({
-                "status": "cancelled", "next_send_at": None,
+                "status": "paused", "next_send_at": None,
             }).eq("id", campaign_id).in_("status", ["queued", "sending"]).execute().data or [])
             if rows:
                 await query.edit_message_text(
-                    "⏹️ تم إيقاف الإرسال.\n\n"
-                    "لن تُرسل أي رسالة جديدة؛ الرسائل التي وصلت سابقاً تبقى كما هي."
+                    "⏸️ تم إيقاف الإرسال مؤقتاً.\n\n"
+                    "الرسائل التي وصلت تبقى كما هي، والبقية لن تُرسل إلى أن تختار أدناه.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("▶️ استئناف الإرسال", callback_data=f"campaign_resume_{campaign_id}")],
+                        [InlineKeyboardButton("⏹️ إيقاف نهائي", callback_data=f"campaign_stop_{campaign_id}")],
+                    ]),
                 )
             else:
                 await query.edit_message_text("هذه الحملة منتهية أو موقوفة مسبقاً.")
         except Exception:
             logger.exception("Failed to stop campaign %s", campaign_id)
             await query.answer("تعذر إيقاف الحملة حالياً.", show_alert=True)
+        return
+    if data.startswith("campaign_resume_"):
+        campaign_id = data[len("campaign_resume_"):]
+        try:
+            rows = (supabase.table("customer_campaigns").update({
+                "status": "queued", "next_send_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", campaign_id).eq("status", "paused").execute().data or [])
+            if rows:
+                await query.edit_message_text(
+                    "▶️ تم استئناف الإرسال بالطابور الآمن.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⏸️ إيقاف مؤقت", callback_data=f"campaign_pause_{campaign_id}")
+                    ]]),
+                )
+            else:
+                await query.edit_message_text("ما كدرت أستأنف؛ الحملة ليست متوقفة مؤقتاً.")
+        except Exception:
+            logger.exception("Failed to resume campaign %s", campaign_id)
+            await query.answer("تعذر استئناف الحملة حالياً.", show_alert=True)
+        return
+    if data.startswith("campaign_stop_"):
+        campaign_id = data[len("campaign_stop_"):]
+        try:
+            rows = (supabase.table("customer_campaigns").update({
+                "status": "cancelled", "next_send_at": None,
+            }).eq("id", campaign_id).eq("status", "paused").execute().data or [])
+            if rows:
+                await query.edit_message_text("⏹️ تم الإيقاف النهائي. لن تُرسل بقية رسائل هذه الحملة.")
+            else:
+                await query.edit_message_text("ما كدرت أوقفها نهائياً؛ الحملة ليست متوقفة مؤقتاً.")
+        except Exception:
+            logger.exception("Failed to permanently stop campaign %s", campaign_id)
+            await query.answer("تعذر الإيقاف النهائي حالياً.", show_alert=True)
         return
     if data.startswith("campaign_aud_"):
         audience_key = data[len("campaign_aud_"):]
@@ -2275,9 +2322,9 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
         "✅ تم وضع الحملة في طابور آمن.\n\n"
         "الإرسال: رسالة واحدة كل دقيقة.\n"
         "بعد كل 50 محاولة: استراحة 30 دقيقة.\n\n"
-        "تقدر توقفها بأي وقت من الزر أدناه.",
+        "تقدر توقفها مؤقتاً بأي وقت من الزر أدناه.",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹️ إيقاف الإرسال", callback_data=f"campaign_stop_{campaign_id}")
+            InlineKeyboardButton("⏸️ إيقاف مؤقت", callback_data=f"campaign_pause_{campaign_id}")
         ]]),
     )
 

@@ -4,7 +4,7 @@ create table if not exists public.customer_campaigns (
   owner_user_id bigint not null,
   audience_key text not null,
   message_text text not null,
-  status text not null default 'draft' check (status in ('draft', 'queued', 'sending', 'sent', 'cancelled')),
+  status text not null default 'draft' check (status in ('draft', 'queued', 'sending', 'paused', 'sent', 'cancelled')),
   recipient_count integer not null default 0,
   sent_count integer not null default 0,
   failed_count integer not null default 0,
@@ -22,7 +22,7 @@ alter table public.customer_campaigns
   drop constraint if exists customer_campaigns_status_check;
 alter table public.customer_campaigns
   add constraint customer_campaigns_status_check
-  check (status in ('draft', 'queued', 'sending', 'sent', 'cancelled'));
+  check (status in ('draft', 'queued', 'sending', 'paused', 'sent', 'cancelled'));
 
 create index if not exists customer_campaigns_queue_idx
   on public.customer_campaigns (next_send_at)
