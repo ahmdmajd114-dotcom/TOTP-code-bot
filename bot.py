@@ -2434,13 +2434,21 @@ def schedule_continuity_invite(chat_id: int, connection_id: str | None) -> bool:
     if not continuity_bot_url() or not connection_id:
         return False
     try:
+        already_started = (supabase.table("continuity_bot_contacts")
+                           .select("customer_chat_id").eq("customer_chat_id", chat_id)
+                           .limit(1).execute().data or [])
+        existing_invite = (supabase.table("continuity_bot_invites")
+                           .select("customer_chat_id").eq("customer_chat_id", chat_id)
+                           .limit(1).execute().data or [])
+        if already_started or existing_invite:
+            return False
         due_at = datetime.now(timezone.utc) + timedelta(minutes=CONTINUITY_INVITE_DELAY_MINUTES)
-        supabase.table("continuity_bot_invites").upsert({
+        supabase.table("continuity_bot_invites").insert({
             "customer_chat_id": chat_id,
             "business_connection_id": connection_id,
             "due_at": due_at.isoformat(),
             "status": "scheduled",
-        }, on_conflict="customer_chat_id").execute()
+        }).execute()
         return True
     except Exception:
         logger.exception("Failed to schedule continuity invite for customer %s", chat_id)
