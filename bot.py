@@ -2039,6 +2039,19 @@ def get_campaign_recipients(audience_key: str) -> list[dict]:
 
 def create_campaign_snapshot(audience_key: str, message_text: str) -> tuple[dict | None, list[dict]]:
     recipients = get_campaign_recipients(audience_key)
+    # دعوة بوت المكافآت هدفها Start لمرة واحدة فقط. نستبعد من بدأ البوت
+    # سابقاً، سواء وصل إليه عبر التسليم الفردي أو حملة قديمة.
+    if message_text.strip() == CONTINUITY_INVITE_TEXT:
+        try:
+            started_rows = (supabase.table("continuity_bot_contacts")
+                            .select("customer_chat_id").execute().data or [])
+            started_ids = {
+                int(row["customer_chat_id"])
+                for row in started_rows if row.get("customer_chat_id") is not None
+            }
+            recipients = [row for row in recipients if int(row["customer_chat_id"]) not in started_ids]
+        except Exception:
+            logger.exception("Failed to exclude existing continuity-bot contacts from campaign")
     try:
         campaign = (supabase.table("customer_campaigns").insert({
             "owner_user_id": OWNER_USER_ID,
