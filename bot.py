@@ -153,6 +153,11 @@ MODESTY_GUARD_CHAT_ID = int(os.environ.get("MODESTY_GUARD_CHAT_ID", "0"))
 CATALOG_SUPPORT_URL = os.environ.get(
     "CATALOG_SUPPORT_URL", "https://t.me/medbox_support"
 ).strip()
+# اسم بوت الاستمرارية، من دون @. نستخدم نفس بوت TOTP بعد نقل ملكيته إلى
+# الحساب الاحتياطي. يبقى فارغاً إلى أن يضع الأونر اسمه في Render، حتى لا
+# نرسل دعوات خاطئة إلى بوت غير مقصود.
+CONTINUITY_BOT_USERNAME = os.environ.get("CONTINUITY_BOT_USERNAME", "").strip().lstrip("@")
+CONTINUITY_INVITE_DELAY_MINUTES = int(os.environ.get("CONTINUITY_INVITE_DELAY_MINUTES", "30"))
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 GROQ_API_KEYS = [
@@ -2374,11 +2379,13 @@ def parse_payment_vault_amounts(payments_text: str) -> dict[str, int]:
 
 async def send_business_message_with_current_fallback(
     context: ContextTypes.DEFAULT_TYPE, customer_chat_id: int, text: str, connection_id: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """يرسل عبر اتصال الزبون، ثم يعيد المحاولة بأحدث اتصال إن كان قديماً."""
     try:
         await context.bot.send_message(
             business_connection_id=connection_id, chat_id=customer_chat_id, text=text,
+            reply_markup=reply_markup,
         )
     except Exception:
         current_connection_id = get_current_business_connection_id()
@@ -2387,7 +2394,91 @@ async def send_business_message_with_current_fallback(
         logger.warning("Retrying Business message to %s with current connection", customer_chat_id)
         await context.bot.send_message(
             business_connection_id=current_connection_id, chat_id=customer_chat_id, text=text,
+            reply_markup=reply_markup,
         )
+
+
+def continuity_bot_url() -> str | None:
+    """رابط Start صالح فقط بعد ضبط اسم بوت الاستمرارية في Render."""
+    if not CONTINUITY_BOT_USERNAME:
+        return None
+    return f"https://t.me/{CONTINUITY_BOT_USERNAME}?start=medbox_rewards"
+
+
+def continuity_invite_keyboard() -> InlineKeyboardMarkup | None:
+    url = continuity_bot_url()
+    if not url:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎁 دخول بوت الهدايا والمكافآت", url=url),
+    ]])
+
+
+CONTINUITY_INVITE_TEXT = (
+    "🎁 حتى توصلك هدايانا ومكافآتنا المستقبلية، "
+    "اضغط الزر أدناه وابدأ بوت ميدبوكس الاحتياطي."
+)
+CONTINUITY_WELCOME_TEXT = (
+    "أهلاً وسهلاً 🌟\n\n"
+    "تم تسجيلك ضمن قائمة ميدبوكس للهدايا والمكافآت المستقبلية. "
+    "عند توفر شيء جديد راح نبلغك هنا."
+)
+
+
+def schedule_continuity_invite(chat_id: int, connection_id: str | None) -> bool:
+    """يحجز دعوة إنقاذ واحدة بعد تسليم اشتراك مدفوع فعلياً.
+
+    لا نحجز شيئاً إن لم يضبط الأونر اسم البوت، ولا نعيد إزعاج نفس الزبون
+    عند تجديد الحساب؛ ضغط Start مرة واحدة هو هدف هذا المسار.
+    """
+    if not continuity_bot_url() or not connection_id:
+        return False
+    try:
+        due_at = datetime.now(timezone.utc) + timedelta(minutes=CONTINUITY_INVITE_DELAY_MINUTES)
+        supabase.table("continuity_bot_invites").upsert({
+            "customer_chat_id": chat_id,
+            "business_connection_id": connection_id,
+            "due_at": due_at.isoformat(),
+            "status": "scheduled",
+        }, on_conflict="customer_chat_id").execute()
+        return True
+    except Exception:
+        logger.exception("Failed to schedule continuity invite for customer %s", chat_id)
+        return False
+
+
+async def deliver_due_continuity_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يرسل دعوات بوت الاستمرارية المستحقة ويحفظ النتيجة لمنع التكرار."""
+    if not continuity_bot_url():
+        return
+    try:
+        rows = (supabase.table("continuity_bot_invites")
+                .select("customer_chat_id, business_connection_id")
+                .eq("status", "scheduled")
+                .lte("due_at", datetime.now(timezone.utc).isoformat())
+                .limit(100).execute().data or [])
+    except Exception:
+        logger.exception("Failed to load due continuity invites")
+        return
+
+    for row in rows:
+        chat_id = row.get("customer_chat_id")
+        connection_id = row.get("business_connection_id")
+        if not chat_id or not connection_id:
+            continue
+        try:
+            await send_business_message_with_current_fallback(
+                context, int(chat_id), CONTINUITY_INVITE_TEXT, str(connection_id),
+                continuity_invite_keyboard(),
+            )
+            supabase.table("continuity_bot_invites").update({
+                "status": "sent", "sent_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("customer_chat_id", int(chat_id)).execute()
+        except Exception:
+            logger.exception("Failed to deliver continuity invite to customer %s", chat_id)
+            supabase.table("continuity_bot_invites").update({
+                "status": "failed",
+            }).eq("customer_chat_id", int(chat_id)).execute()
 
 
 async def send_relogin_notice(context: ContextTypes.DEFAULT_TYPE, customer_chat_id: int, text: str) -> None:
@@ -7149,6 +7240,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             ),
             "customer_username": bm.chat.username if bm is not None else fallback_username,
             "account_label": label or link_code,
+            "business_connection_id": bm.business_connection_id if bm is not None else get_customer_business_connection_id(chat_id),
         }
         previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
         if previous_subscription:
@@ -7168,8 +7260,13 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
             if activated:
                 scheduled = await schedule_subscription_feedback(activated)
+                invite_scheduled = schedule_continuity_invite(
+                    chat_id, delivery_state.get("business_connection_id"),
+                )
                 end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
                 schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+                if invite_scheduled:
+                    schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت بعد 30 دقيقة."
                 await context.bot.send_message(
                     chat_id=OWNER_USER_ID,
                     text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
@@ -8133,9 +8230,14 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
             )
             return
         scheduled = await schedule_subscription_feedback(activated)
+        invite_scheduled = schedule_continuity_invite(
+            customer_chat_id, state.get("business_connection_id"),
+        )
         context.user_data.pop("pending_link_delivery", None)
         end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
         schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+        if invite_scheduled:
+            schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت بعد 30 دقيقة."
         await query.edit_message_text(
             f"✅ تم تفعيل الاشتراك الجديد لمدة {activated['duration_days']} يوم.\n"
             f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
@@ -8225,9 +8327,14 @@ async def handle_link_compensation_duration_input(update: Update, context: Conte
         )
         return True
     scheduled = await schedule_subscription_feedback(reminder_state)
+    invite_scheduled = schedule_continuity_invite(
+        int(state["customer_chat_id"]), state.get("business_connection_id"),
+    )
     context.user_data.pop("pending_link_compensation", None)
     end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=duration_days)
     schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+    if invite_scheduled:
+        schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت بعد 30 دقيقة."
     await message.reply_text(
         f"✅ تم تعديل تنبيه الاشتراك نفسه إلى تعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
         f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
@@ -10260,8 +10367,30 @@ async def on_instagram_manager_private_message(update: Update, context: ContextT
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """أمر /start — يرسل لوحة المفاتيح الثابتة (مصروف/دخل/إضافة حساب) بمحادثتك مع البوت."""
+    """Start للأونر، وللزبون الذي يختار الانضمام لبوت الاستمرارية."""
     if update.effective_user is None:
+        return
+    if (
+        update.effective_user.id != OWNER_USER_ID
+        and update.effective_chat is not None
+        and update.effective_chat.type == "private"
+    ):
+        chat_id = update.effective_chat.id
+        try:
+            supabase.table("continuity_bot_contacts").upsert({
+                "customer_chat_id": chat_id,
+                "customer_name": update.effective_user.full_name or "زبون",
+                "customer_username": update.effective_user.username,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="customer_chat_id").execute()
+            supabase.table("continuity_bot_invites").update({
+                "status": "started", "started_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("customer_chat_id", chat_id).in_("status", ["scheduled", "sent", "failed"]).execute()
+        except Exception:
+            logger.exception("Failed to save continuity bot contact %s", chat_id)
+            await update.message.reply_text("⚠️ تعذر حفظ التسجيل حالياً، حاول مرة ثانية بعد قليل.")
+            return
+        await update.message.reply_text(CONTINUITY_WELCOME_TEXT)
         return
     if is_instagram_manager(update.effective_user.id):
         await update.message.reply_text("جاهز. من هنا تسجل مبيعات الإنستغرام فقط:", reply_markup=INSTAGRAM_MANAGER_KEYBOARD)
@@ -11569,6 +11698,9 @@ def main() -> None:
     else:
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
+        # دعوات بوت الاستمرارية تُرسل بعد 30 دقيقة من تسليم اشتراك ChatGPT.
+        # تبقى في Supabase، لذلك لا تضيع إذا أعاد Render تشغيل الخدمة.
+        app.job_queue.run_repeating(deliver_due_continuity_invites, interval=60, first=20)
         # مرة عند التشغيل ثم كل 15 دقيقة إلى أن تنتهي الربطات القديمة.
         # بعدها لا يفعل شيئاً إلا إن ظهرت ربطات بلا جدول، وهذا يسمح بالتعافي
         # من حد Telegram المؤقت من دون ترك الزبائن بلا متابعة ليوم كامل.
