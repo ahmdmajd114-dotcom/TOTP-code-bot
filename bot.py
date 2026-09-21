@@ -1233,6 +1233,23 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
     for row in rows:
         chat_id = int(row["customer_chat_id"])
         message_id = int(row["message_id"])
+        # قد يكون الأونر رد أثناء ما كانت قائمة الاستئناف تُقرأ. نتحقق
+        # مرة ثانية قبل المعالجة حتى لا نستعمل نسخة قديمة من الصف المحذوف.
+        try:
+            still_pending = (
+                supabase.table("paused_customer_messages")
+                .select("message_id")
+                .eq("owner_user_id", OWNER_USER_ID)
+                .eq("customer_chat_id", chat_id)
+                .eq("message_id", message_id)
+                .limit(1).execute().data or []
+            )
+        except Exception:
+            logger.exception("Failed to recheck paused message for %s", chat_id)
+            failed += 1
+            continue
+        if not still_pending or (chat_id, message_id) in _suppressed_auto_reply_keys:
+            continue
         text = str(row.get("message_text") or "").strip()
         business_connection_id = str(row.get("business_connection_id") or "")
         if not text or not business_connection_id:
@@ -11431,6 +11448,15 @@ def mark_owner_took_over_customer_chat(chat_id: int) -> None:
     # التالية يرجع البوت لخدمته المعتادة (كود، شكر، إلخ).
     _support_context_until.pop(chat_id, None)
     _support_context_resolved_at[chat_id] = datetime.now(timezone.utc)
+    # إذا كانت الردود العامة متوقفة، رد الأونر يعني أن الرسالة المعلّقة
+    # عولجت يدوياً. نحذفها من الطابور الدائم حتى لا يرد عليها البوت عند
+    # الاستئناف، حتى لو أُعيد تشغيل Render قبل ذلك.
+    try:
+        supabase.table("paused_customer_messages").delete().eq(
+            "owner_user_id", OWNER_USER_ID
+        ).eq("customer_chat_id", chat_id).execute()
+    except Exception:
+        logger.exception("Failed to clear paused message after owner reply for %s", chat_id)
     if message_id is None:
         return
     _suppressed_auto_reply_keys.add((chat_id, message_id))
@@ -11461,11 +11487,35 @@ def get_latest_archived_customer_text(chat_id: int) -> str:
         return ""
 
 
-async def send_owner_conversation_shortcut(context, bm, shortcut: str) -> bool:
+def get_latest_customer_text_for_owner_shortcut(chat_id: int) -> str:
+    """آخر كلام للزبون، ويقدّم الرسالة المعلقة أثناء توقف الردود."""
+    try:
+        rows = (
+            supabase.table("paused_customer_messages")
+            .select("message_text")
+            .eq("owner_user_id", OWNER_USER_ID)
+            .eq("customer_chat_id", chat_id)
+            .limit(1).execute().data or []
+        )
+        if rows:
+            pending_text = str(rows[0].get("message_text") or "").strip()
+            if pending_text:
+                return pending_text
+    except Exception:
+        logger.exception("Failed to read paused customer text for shortcut %s", chat_id)
+    return get_latest_archived_customer_text(chat_id)
+
+
+async def send_owner_conversation_shortcut(
+    context, bm, shortcut: str, customer_text: str | None = None,
+) -> bool:
     """يرسل اختصاري س للتحية وع للشكر، ثم يحذف حرف الاختصار من المحادثة."""
     chat_id = bm.chat.id
     if shortcut == "س":
-        greeting = infer_greeting_category(get_latest_archived_customer_text(chat_id))
+        greeting = infer_greeting_category(
+            customer_text if customer_text is not None
+            else get_latest_customer_text_for_owner_shortcut(chat_id)
+        )
         reply = "وعليكم السلام ورحمة الله وبركاته" if greeting == "سلام" else "أهلاً وسهلاً"
     elif shortcut == "ع":
         reply = contextual_thanks_reply(has_fulfilled_service_context(chat_id))
@@ -11730,10 +11780,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
+        shortcut = text.strip()
+        shortcut_customer_text = (
+            get_latest_customer_text_for_owner_shortcut(chat_id)
+            if shortcut in {"س", "ع"} else None
+        )
         mark_owner_took_over_customer_chat(chat_id)
         # اختصارات يدوية س/ع: تتعرف على آخر رسالة زبون بلا حاجة للرد عليها.
-        if text.strip() in {"س", "ع"}:
-            await send_owner_conversation_shortcut(context, bm, text.strip())
+        if shortcut in {"س", "ع"}:
+            await send_owner_conversation_shortcut(
+                context, bm, shortcut, shortcut_customer_text,
+            )
             return
         # اختصار الأونر «دين» داخل نفس محادثة الزبون يفتح بطاقة دين
         # جاهزة باسمه؛ لا يحتاج ينسخ chat_id أو يخرج لمحادثة البوت.
