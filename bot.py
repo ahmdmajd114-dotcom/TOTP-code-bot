@@ -3326,13 +3326,33 @@ def build_amount_keyboard(has_catalog_price: bool = False) -> InlineKeyboardMark
     ])
 
 
-def build_catalog_payment_ready_keyboard() -> InlineKeyboardMarkup:
-    """بعد اختيار المحفظة: مبلغ الباقة مثبت تلقائياً، ويبقى التعديل اختياري."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
-        [InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")],
-        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_catalog_payment")],
-    ])
+def build_catalog_payment_ready_keyboard(
+    show_debt_repayment: bool = False,
+) -> InlineKeyboardMarkup:
+    """شاشة التثبيت بعد اختيار المحفظة، مع تمييز الدين المطابق."""
+    rows = [[InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")]]
+    if show_debt_repayment:
+        # نجعل التسديد هو الخيار الأول، ونبقي شراءً جديداً كخيار
+        # صريح للحالات التي يدفع فيها الزبون عن عملية ثانية فعلاً.
+        rows.extend([
+            [InlineKeyboardButton("💳 تسديد الدين", callback_data="pay_debt_repay")],
+            [InlineKeyboardButton("➕ تسجيلها كشراء جديد", callback_data="pay_finalize")],
+        ])
+    else:
+        rows.append([InlineKeyboardButton("✅ تثبيت العملية", callback_data="pay_finalize")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_catalog_payment")])
+    return InlineKeyboardMarkup(rows)
+
+
+def payment_state_has_matching_debt(state: dict) -> bool:
+    """هل للزبون دين مفتوح يطابق المنتج المحدد في عملية الدفع؟"""
+    customer_chat_id = state.get("customer_chat_id")
+    product = state.get("product")
+    return bool(
+        product
+        and customer_chat_id is not None
+        and find_unpaid_debt(customer_chat_id, product) is not None
+    )
 
 
 def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repayment: bool = False) -> InlineKeyboardMarkup:
@@ -8452,7 +8472,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state["awaiting_manual_amount"] = False
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_catalog_payment_ready_keyboard(),
+            reply_markup=build_catalog_payment_ready_keyboard(
+                show_debt_repayment=payment_state_has_matching_debt(state),
+            ),
         )
         return
 
@@ -8470,7 +8492,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             state["pending_amount"] = 0
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + f"\n\nتم اعتماد مبلغ الباقة تلقائياً لطريقة: {method}",
-                reply_markup=build_catalog_payment_ready_keyboard(),
+                reply_markup=build_catalog_payment_ready_keyboard(
+                    show_debt_repayment=payment_state_has_matching_debt(state),
+                ),
             )
             return
 
@@ -9193,7 +9217,9 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
                 chat_id=OWNER_USER_ID,
                 message_id=replied_id,
                 caption=format_payment_summary(state) + f"\n\n✅ تم تعديل مبلغ {method} إلى {amount}.",
-                reply_markup=build_catalog_payment_ready_keyboard(),
+                reply_markup=build_catalog_payment_ready_keyboard(
+                    show_debt_repayment=payment_state_has_matching_debt(state),
+                ),
             )
         except Exception:
             logger.exception("Failed to update catalog payment amount")
