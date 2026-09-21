@@ -6617,9 +6617,9 @@ def get_secret_for_chat(chat_id: int, account_id: str | None = None) -> tuple[st
             return match["secret"], match.get("label") or ""
     else:
         accounts = get_customer_totp_accounts(chat_id)
-        primary = next((account for account in accounts if account.get("is_primary")), None)
-        if primary:
-            return primary["secret"], primary.get("label") or ""
+        selected = get_selected_totp_account(accounts)
+        if selected:
+            return selected["secret"], selected.get("label") or ""
 
     # حسابات ChatGPT المشتركة التي سُلّمت عبر خزينة الحسابات.
     if account_id:
@@ -6948,6 +6948,38 @@ def generate_totp_code(secret: str) -> str:
 
 CODE_REPLY_MARKER = "__SEND_CURRENT_TOTP_CODE__"
 CODE_ACCOUNT_PICKER_MARKER = "__CHOOSE_TOTP_ACCOUNT__"
+TOTP_PERIOD_SECONDS = 30
+
+
+def _totp_account_selected_at(account: dict) -> datetime | None:
+    value = account.get("last_selected_at")
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def get_selected_totp_account(accounts: list[dict]) -> dict | None:
+    """الحساب الذي اختاره الزبون أخيراً، ثم الأساسي، ثم الأحدث."""
+    selected = [account for account in accounts if _totp_account_selected_at(account)]
+    if selected:
+        return max(selected, key=lambda account: _totp_account_selected_at(account))
+    primary = next((account for account in accounts if account.get("is_primary")), None)
+    return primary or (accounts[0] if accounts else None)
+
+
+def remember_selected_totp_account(chat_id: int, account_id: str) -> bool:
+    """يثبت الحساب الحالي حتى تبقى طلبات الكود التالية على نفس الحساب."""
+    try:
+        supabase.table("customer_totp_account_links").update({
+            "last_selected_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("customer_chat_id", chat_id).eq("account_id", str(account_id)).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to remember TOTP account selection for %s", chat_id)
+        return False
 
 
 def remember_customer_totp_account(
@@ -6979,12 +7011,13 @@ def remember_customer_totp_account(
 
 
 def should_prompt_for_totp_account(chat_id: int, attempt_count: int) -> bool:
-    """نطلب الاختيار بعد محاولتين أو بعد انتهاء نافذة الحساب الجديد."""
+    """نطلب الاختيار أول مرة فقط؛ بعده يبقى الحساب المختار ثابتاً."""
+    del attempt_count
     accounts = get_customer_totp_accounts(chat_id)
     if len(accounts) <= 1:
         return False
-    if attempt_count >= 2:
-        return True
+    if any(_totp_account_selected_at(account) for account in accounts):
+        return False
     newest = accounts[0]
     linked_at = newest.get("linked_at")
     if not linked_at:
@@ -6996,25 +7029,70 @@ def should_prompt_for_totp_account(chat_id: int, attempt_count: int) -> bool:
         return True
 
 
-def build_totp_account_picker(chat_id: int) -> InlineKeyboardMarkup | None:
+def build_totp_account_picker(
+    chat_id: int, *, owner: bool = False,
+) -> InlineKeyboardMarkup | None:
     accounts = get_customer_totp_accounts(chat_id)
     if len(accounts) <= 1:
         return None
     rows = []
+    prefix = "ownercodeacct" if owner else "codeacct"
     for index, account in enumerate(accounts, start=1):
         label = str(account.get("label") or f"حساب {index}").strip()
         rows.append([InlineKeyboardButton(
-            label[:50], callback_data=f"codeacct_{chat_id}_{account['id']}",
+            label[:50], callback_data=f"{prefix}_{chat_id}_{account['id']}",
         )])
     return InlineKeyboardMarkup(rows)
 
 
+def is_totp_account_change_request(text: str) -> bool:
+    """طلب صريح لتبديل حساب الكود، من دون تشغيله من كلمة حساب وحدها."""
+    normalized = normalize_arabic_text(text)
+    phrases = {
+        "غير الحساب", "غيرلي الحساب", "بدل الحساب", "بدللي الحساب",
+        "حساب ثاني", "الحساب الثاني", "كود حساب ثاني", "كود الحساب الثاني",
+        "اريد اغير الحساب", "اريد اسجل حساب ثاني", "اختار حساب",
+        "change account", "another account", "different account",
+    }
+    return any(phrase in normalized for phrase in phrases)
+
+
+def is_totp_code_failure_after_retries(chat_id: int, text: str) -> bool:
+    """بعد كودين، شكوى قصيرة من الكود تعيد قائمة الحسابات."""
+    if int(_get_retry_state(chat_id).get("attempt_count") or 0) < 2:
+        return False
+    normalized = normalize_arabic_text(text)
+    signals = {
+        "خطا", "غلط", "ما يصير", "مايصير", "ما يشتغل", "مايشتغل",
+        "لا يمكن", "رفض", "يرفض", "incorrect", "wrong", "invalid",
+    }
+    return any(signal in normalized for signal in signals)
+
+
+def replied_totp_account_id(chat_id: int, bm) -> str | None:
+    """يستخرج الحساب المشار إليه إذا رد الزبون على رسالة فيها إيميله."""
+    replied = getattr(bm, "reply_to_message", None)
+    replied_text = str(
+        getattr(replied, "text", None) or getattr(replied, "caption", None) or ""
+    ).lower()
+    if not replied_text:
+        return None
+    for account in get_customer_totp_accounts(chat_id):
+        label = str(account.get("label") or "").strip().lower()
+        if label and label in replied_text:
+            return str(account["id"])
+    return None
+
+
 async def generate_current_totp_code_for_chat(chat_id: int, account_id: str | None = None) -> str | None:
-    """Generate the currently valid code immediately before sending it."""
+    """انتظر بداية نافذة TOTP التالية ثم ولّد أطول كود صلاحية ممكنة."""
     result = get_secret_for_chat(chat_id, account_id)
     if result is None:
         return None
     secret, _ = result
+    now_seconds = datetime.now(timezone.utc).timestamp()
+    wait_seconds = TOTP_PERIOD_SECONDS - (now_seconds % TOTP_PERIOD_SECONDS)
+    await asyncio.sleep(wait_seconds + 0.15)
     return generate_totp_code(secret)
 
 
@@ -7341,7 +7419,8 @@ def process_code_request(chat_id: int) -> tuple[str | None, bool]:
     if should_prompt_for_totp_account(chat_id, attempt_count):
         return CODE_ACCOUNT_PICKER_MARKER, False
 
-    selected_account_id = accounts[0]["id"] if accounts else None
+    selected_account = get_selected_totp_account(accounts)
+    selected_account_id = selected_account["id"] if selected_account else None
     result = get_secret_for_chat(chat_id, selected_account_id)
     if result is None:
         # مو مربوط اصلاً — نفس السلوك القديم، تجاهل صامت
@@ -7412,33 +7491,41 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
 
 
 async def handle_totp_account_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """الزبون يختار حسابه عند وجود أكثر من TOTP مرتبط به."""
+    """الزبون أو الأونر يختار الحساب؛ يثبت الاختيار ويحذف قائمة الأزرار."""
     query = update.callback_query
     if query is None:
         return
-    match = re.fullmatch(r"codeacct_(-?\d+)_(.+)", query.data or "")
+    match = re.fullmatch(r"(ownercodeacct|codeacct)_(-?\d+)_(.+)", query.data or "")
     if not match:
         return
-    chat_id = int(match.group(1))
-    account_id = match.group(2)
-    # لا نسمح لشخص آخر باستعمال زر حساب زبون مختلف.
-    if query.from_user.id != chat_id:
+    picker_kind = match.group(1)
+    chat_id = int(match.group(2))
+    account_id = match.group(3)
+    expected_user_id = OWNER_USER_ID if picker_kind == "ownercodeacct" else chat_id
+    if query.from_user.id != expected_user_id:
         await query.answer("هذا الاختيار مو إلك.", show_alert=True)
         return
     if get_secret_for_chat(chat_id, account_id) is None:
         await query.answer("هذا الحساب لم يعد متاحاً.", show_alert=True)
         return
-    try:
-        supabase.table("customer_totp_account_links").update({
-            "last_selected_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("customer_chat_id", chat_id).eq("account_id", account_id).execute()
-    except Exception:
-        logger.exception("Failed to remember TOTP account selection for %s", chat_id)
-    await query.answer()
+    remember_selected_totp_account(chat_id, account_id)
+    # الكود الذي يصدر بعد الاختيار هو المحاولة الأولى للحساب الجديد.
+    _save_retry_state(chat_id, 1, False)
+    await query.answer("تم اختيار الحساب؛ أنتظر بداية الكود الجديد.")
+    connection_id = getattr(
+        query.message, "business_connection_id", None,
+    ) or get_customer_business_connection_id(chat_id)
+    if connection_id:
+        try:
+            await context.bot.delete_business_messages(
+                business_connection_id=connection_id,
+                message_ids=[query.message.message_id],
+            )
+        except Exception:
+            logger.warning("Could not delete TOTP account picker for %s", chat_id)
     code = await generate_current_totp_code_for_chat(chat_id, account_id)
     if not code:
         return
-    connection_id = getattr(query.message, "business_connection_id", None) or get_customer_business_connection_id(chat_id)
     if not connection_id:
         logger.warning("No business connection for account selection code to %s", chat_id)
         return
@@ -11757,6 +11844,63 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         queue_customer_text_batch(update, context, bm, text)
         return
 
+    # تعدد حسابات TOTP: الحساب المختار يبقى ثابتاً. لا نعيد القائمة إلا
+    # بطلب تغيير واضح، أو بعد كودين ثم شكوى من الكود. وإذا رد الزبون على
+    # رسالة فيها إيميل حساب وقال «أريد أسجل هذا» نختاره مباشرة.
+    if not is_from_owner:
+        totp_accounts = get_customer_totp_accounts(chat_id)
+        if len(totp_accounts) > 1:
+            replied_account_id = replied_totp_account_id(chat_id, bm)
+            normalized_account_text = normalize_arabic_text(text)
+            points_to_replied_account = bool(replied_account_id) and any(
+                phrase in normalized_account_text
+                for phrase in {"هذا", "هاذا", "اريد اسجل", "اسجل هذا", "كود هذا"}
+            )
+            should_rechoose_account = (
+                is_totp_account_change_request(text)
+                or is_totp_code_failure_after_retries(chat_id, text)
+            )
+            if points_to_replied_account:
+                remember_selected_totp_account(chat_id, str(replied_account_id))
+                await human_like_code_reply_sequence(
+                    context, chat_id, bm.business_connection_id, bm.message_id
+                )
+                code = await generate_current_totp_code_for_chat(
+                    chat_id, str(replied_account_id)
+                )
+                if code:
+                    await context.bot.send_message(
+                        business_connection_id=bm.business_connection_id,
+                        chat_id=chat_id,
+                        text=code,
+                    )
+                    archive_message(
+                        chat_id, customer_name, customer_username,
+                        sender_type="customer", message_text=text,
+                    )
+                    archive_message(
+                        chat_id, customer_name, customer_username,
+                        sender_type="bot", message_text=code,
+                    )
+                return
+            if should_rechoose_account:
+                picker = build_totp_account_picker(chat_id)
+                if picker is not None:
+                    await human_like_reply_sequence(
+                        context, chat_id, bm.business_connection_id, bm.message_id
+                    )
+                    await context.bot.send_message(
+                        business_connection_id=bm.business_connection_id,
+                        chat_id=chat_id,
+                        text="أي حساب تريد تسجل؟",
+                        reply_markup=picker,
+                    )
+                    archive_message(
+                        chat_id, customer_name, customer_username,
+                        sender_type="customer", message_text=text,
+                    )
+                return
+
     # إذا بدأت مشكلة ضمن الجلسة الحالية، كل المتابعات تبقى بلا رد تلقائي
     # حتى تمر 30 دقيقة سكوت. نؤرشفها وننبه الأونر حتى يكمل هو الحوار.
     if not is_from_owner and is_live_support_context_active(chat_id):
@@ -11849,6 +11993,34 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # الإرسال نجح؛ فشل الحذف لا يجب أن يعيد إرسال الطرق أو
                 # يوهم المالك أن العملية كلها فشلت.
                 logger.warning("Sent payment methods but could not delete owner shortcut for %s", chat_id)
+            return
+        # «حسابات» يعرض للأونر حسابات هذا الزبون ليختار مصدر الكود
+        # يدوياً. القائمة نفسها تُحذف بعد الاختيار.
+        if text.strip() in {"حسابات", "الحسابات"}:
+            picker = build_totp_account_picker(chat_id, owner=True)
+            if picker is None:
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ هذا الزبون ما عنده أكثر من حساب للاختيار ({chat_id}).",
+                )
+                return
+            try:
+                await context.bot.send_message(
+                    business_connection_id=bm.business_connection_id,
+                    chat_id=chat_id,
+                    text="اختَر الحساب الذي تريد إرسال الكود منه:",
+                    reply_markup=picker,
+                )
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.exception("Failed to show owner TOTP accounts for %s", chat_id)
+                await context.bot.send_message(
+                    chat_id=OWNER_USER_ID,
+                    text=f"⚠️ تعذر عرض حسابات الزبون ({chat_id}).",
+                )
             return
         # اختصار المالك: كلمة «كود» وحدها داخل محادثة زبون مربوط ترسل
         # الكود فوراً لذلك الزبون. أي صياغة أطول لا تدخل بهذا المسار.
@@ -12390,7 +12562,10 @@ def main() -> None:
     # أزرار الأونر لإرسال كود إضافي أو إيقافه بعد توقف المحاولات التلقائية.
     app.add_handler(CallbackQueryHandler(handle_manual_extra_code_callback, pattern=r"^code_manual_(?:send|stop)_"))
     # اختيار الزبون للحساب المطلوب عند امتلاكه أكثر من حساب TOTP.
-    app.add_handler(CallbackQueryHandler(handle_totp_account_picker_callback, pattern=r"^codeacct_"))
+    app.add_handler(CallbackQueryHandler(
+        handle_totp_account_picker_callback,
+        pattern=r"^(?:owner)?codeacct_",
+    ))
 
     # زرين تبديل عرض/إخفاء كود TOTP بفرع التفاعل
     app.add_handler(CallbackQueryHandler(handle_getcode_callback, pattern=r"^getcode_"))
