@@ -7085,14 +7085,16 @@ def replied_totp_account_id(chat_id: int, bm) -> str | None:
 
 
 async def generate_current_totp_code_for_chat(chat_id: int, account_id: str | None = None) -> str | None:
-    """انتظر بداية نافذة TOTP التالية ثم ولّد أطول كود صلاحية ممكنة."""
+    """أرسل الكود الحالي خلال أول 15 ثانية، وإلا انتظر الدورة التالية."""
     result = get_secret_for_chat(chat_id, account_id)
     if result is None:
         return None
     secret, _ = result
     now_seconds = datetime.now(timezone.utc).timestamp()
-    wait_seconds = TOTP_PERIOD_SECONDS - (now_seconds % TOTP_PERIOD_SECONDS)
-    await asyncio.sleep(wait_seconds + 0.15)
+    code_age_seconds = now_seconds % TOTP_PERIOD_SECONDS
+    if code_age_seconds >= 15:
+        wait_seconds = TOTP_PERIOD_SECONDS - code_age_seconds
+        await asyncio.sleep(wait_seconds + 0.15)
     return generate_totp_code(secret)
 
 
@@ -12025,6 +12027,15 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # اختصار المالك: كلمة «كود» وحدها داخل محادثة زبون مربوط ترسل
         # الكود فوراً لذلك الزبون. أي صياغة أطول لا تدخل بهذا المسار.
         if text.strip() == "كود":
+            try:
+                # نخفي أمر المالك فوراً، بغض النظر عن نجاح
+                # العثور على الحساب أو إرسال الكود بعده.
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not delete owner code shortcut for %s", chat_id)
             linked_account = get_secret_for_chat(chat_id)
             if linked_account is None:
                 await context.bot.send_message(
@@ -12051,15 +12062,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text=f"⚠️ تعذر إرسال الكود للزبون ({chat_id}).",
                 )
                 return
-            try:
-                # نخفي كلمة الاختصار بعد نجاح إرسال الكود، مثل اختصار «دفع».
-                await context.bot.delete_business_messages(
-                    business_connection_id=bm.business_connection_id,
-                    message_ids=[bm.message_id],
-                )
-            except Exception:
-                # إرسال الكود نجح؛ لا نعيده إذا تعذر حذف رسالة الاختصار.
-                logger.warning("Sent code but could not delete owner shortcut for %s", chat_id)
             return
         # اختصارات المنتجات: «ج» يختار ChatGPT، وأي منتج آخر يحتاج اسمه
         # أو أحد أسمائه البديلة كاملاً كما هو مسجل في مركز التحكم.
