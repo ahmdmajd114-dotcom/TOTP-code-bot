@@ -7833,11 +7833,14 @@ async def handle_customer_photo(
     reply_text, stopped = process_code_request(chat_id)
     image_summary = f"[صورة شاشة تحقق]\n{description}"
     if reply_text:
-        if reply_text == CODE_REPLY_MARKER:
+        if reply_text.startswith(CODE_REPLY_MARKER):
+            _marker, _separator, selected_account_id = reply_text.partition(":")
             await human_like_code_reply_sequence(
                 context, chat_id, bm.business_connection_id, bm.message_id
             )
-            reply_text = await generate_current_totp_code_for_chat(chat_id)
+            reply_text = await generate_current_totp_code_for_chat(
+                chat_id, selected_account_id or None
+            )
             if not reply_text:
                 return
         else:
@@ -10380,8 +10383,11 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         # المستخدم بالبوت الحقيقي يطبق قواعد إعادة المحاولة أيضاً.
         reply, stopped = process_code_request(customer_chat_id)
         if reply:
-            if reply == CODE_REPLY_MARKER:
-                reply = await generate_current_totp_code_for_chat(customer_chat_id)
+            if reply.startswith(CODE_REPLY_MARKER):
+                _marker, _separator, selected_account_id = reply.partition(":")
+                reply = await generate_current_totp_code_for_chat(
+                    customer_chat_id, selected_account_id or None
+                )
             if not reply:
                 reply = render_test_response("handoff", user_text, customer_chat_id)
             else:
