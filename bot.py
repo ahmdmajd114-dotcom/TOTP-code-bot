@@ -7717,13 +7717,45 @@ async def add_private_account(
             create_if_missing=False,
         )
 
+        # الحساب الخاص هو أيضاً تسليم فعلي لـ ChatGPT؛ لذلك يبدأ عدّ
+        # الباقة المعلقة من لحظة /addprivate تماماً مثل /link. وإذا كانت
+        # الدفعة محفوظة قبل إضافة حقل التنبيه نحاول استرجاع باقتها بأمان.
+        activated = activate_pending_chatgpt_subscription_on_delivery(target_chat_id)
+        if activated is None:
+            activated = recover_paid_chatgpt_subscription_on_delivery(target_chat_id)
+
+        schedule_lines: list[str] = []
+        if activated:
+            scheduled = await schedule_subscription_feedback(activated)
+            connection_id = get_customer_business_connection_id(target_chat_id)
+            invite_scheduled = schedule_continuity_invite(target_chat_id, connection_id)
+            end = datetime.now(timezone(timedelta(hours=3))) + timedelta(
+                days=activated["duration_days"]
+            )
+            schedule_lines.extend([
+                f"✅ تم تفعيل الباقة لمدة {activated['duration_days']} يوم.",
+                f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}",
+                "✅ تم حجز رسالة المتابعة."
+                if scheduled else
+                "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة.",
+            ])
+            if invite_scheduled:
+                schedule_lines.append("🎁 تم حجز دعوة بوت المكافآت.")
+        elif has_recorded_paid_subscription_for_link(target_chat_id):
+            schedule_lines.append(
+                "⚠️ الدفعة موجودة، لكن ما كدرت أحدد باقة واحدة مطابقة لإنشاء المدة."
+            )
+        else:
+            schedule_lines.append("ℹ️ ماكو دفعة ChatGPT مسجلة لتفعيل مدتها.")
+
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
             text=(f"✅ تمت إضافة الحساب الخاص وربطه بالزبون.\n"
                   f"chat_id: {target_chat_id}\n"
                   f"اسم الحساب: {account_name} (خاص)\n"
                   + ("✅ تم تسجيله في Google Sheet.\n" if sheet_account_saved else "⚠️ تعذر تسجيله في Google Sheet.\n")
-                  + "من هسه إذا يطلب كود، ينرسل له تلقائياً."),
+                  + "\n".join(schedule_lines)
+                  + "\nمن هسه إذا يطلب كود، ينرسل له تلقائياً."),
         )
         try:
             await context.bot.send_message(
