@@ -12417,12 +12417,19 @@ def format_public_catalog_price(price: object, display_price: object = None) -> 
 
 
 PUBLIC_CATALOG_SECTIONS = (
-    ("تطبيقات الذكاء الاصطناعي", {"chatgpt", "claude"}),
+    ("تطبيقات الذكاء الاصطناعي", {"chatgpt", "gemini", "claude"}),
     ("تطبيقات الكتابة", {"freenote", "goodnote", "goodnotes"}),
     ("تطبيقات التصميم", {"canva", "capcut"}),
     ("تطبيقات التفريغ الصوتي والإنتاجية", {"scripta", "ank i", "anki"}),
     ("تطبيقات تيليجرام", {"telegram"}),
 )
+
+PUBLIC_CATALOG_PRODUCT_ORDER = {
+    # الترتيب المقصود داخل قسم الذكاء الاصطناعي.
+    "chatgpt": 0,
+    "gemini": 1,
+    "claude": 2,
+}
 
 
 def public_catalog_product_key(name: object) -> str:
@@ -12473,6 +12480,9 @@ def build_public_catalog_html() -> str:
             product for product in remaining_products
             if public_catalog_product_key(product.get("name")) in product_names
         ]
+        section_products.sort(key=lambda product: PUBLIC_CATALOG_PRODUCT_ORDER.get(
+            public_catalog_product_key(product.get("name")), 100,
+        ))
         if not section_products:
             continue
         section_ids = {str(product.get("id")) for product in section_products}
