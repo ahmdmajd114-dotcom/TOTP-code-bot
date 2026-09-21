@@ -641,6 +641,66 @@ def process_debt_repayment(row_number: int, remaining_before: int, paid_amount: 
         return False, remaining_before
 
 
+async def cmd_fix_existing_debt_payment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """يحوّل آخر دفعة مسجلة بالخطأ إلى تسديد دين، بلا إضافة دخل ثانٍ.
+
+    الاستخدام: /fixdebt CHAT_ID PRODUCT
+    """
+    message = update.effective_message
+    if message is None or update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if len(context.args) < 2:
+        await message.reply_text("الاستخدام: /fixdebt CHAT_ID PRODUCT")
+        return
+    try:
+        customer_chat_id = int(context.args[0])
+    except ValueError:
+        await message.reply_text("⚠️ chat_id غير صحيح.")
+        return
+    product = " ".join(context.args[1:]).strip()
+    debt_info = find_unpaid_debt(customer_chat_id, product)
+    if debt_info is None:
+        await message.reply_text("⚠️ ماكو دين مفتوح مطابق لهذا الزبون والمنتج.")
+        return
+    latest_payment = get_latest_customer_payment(customer_chat_id)
+    if latest_payment is None:
+        await message.reply_text("⚠️ ما لقيت دفعة مسجلة لهذا الزبون.")
+        return
+    payment_row_number, payment_row = latest_payment
+    row_product = payment_row[SHEET_COL_PRODUCT - 1].strip()
+    requested_catalog = catalog_product_for_payment_name(product)
+    row_catalog = catalog_product_for_payment_name(row_product)
+    same_product = row_product.casefold() == product.casefold() or bool(
+        requested_catalog and row_catalog
+        and requested_catalog.get("id") == row_catalog.get("id")
+    )
+    if not same_product:
+        await message.reply_text(
+            f"⚠️ آخر دفعة لهذا الزبون منتجها {row_product}، مو {product}.\n"
+            "ما غيرت أي سجل."
+        )
+        return
+    try:
+        paid_amount = int(float(payment_row[SHEET_COL_TOTAL - 1].replace(",", "")))
+    except (ValueError, IndexError):
+        await message.reply_text("⚠️ مبلغ آخر دفعة غير صحيح؛ ما غيرت أي سجل.")
+        return
+    debt_row, remaining_before = debt_info
+    saved, new_remaining = process_debt_repayment(debt_row, remaining_before, paid_amount)
+    if not saved:
+        await message.reply_text("⚠️ تعذر تحديث الدين؛ ما تم إضافة أي دفعة.")
+        return
+    status = "تم تسديده بالكامل" if new_remaining <= 0 else f"بقي {new_remaining}"
+    await message.reply_text(
+        f"✅ تم ربط الدفعة المسجلة مسبقاً بالدين.\n"
+        f"الزبون: {customer_chat_id}\nالمنتج: {product}\n"
+        f"المبلغ: {paid_amount}\nالنتيجة: {status}\n"
+        f"سطر الدفعة #{payment_row_number} بقي كما هو، وما انضاف دخل ثانٍ."
+    )
+
+
 # ------------------------------------------------------------------
 # منع تكرار ردود الـ FAQ لنفس الزبون خلال ست ساعات. نتحقق من الأرشيف حتى
 # يبقى المنع فعالاً بعد إعادة التشغيل أو إعادة النشر، ونستخدم الذاكرة أيضاً
@@ -12604,6 +12664,9 @@ def main() -> None:
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
+
+    # تصحيح دفعة حُفظت كعملية جديدة بدل تسديد دين، من دون تكرار الدخل.
+    app.add_handler(CommandHandler("fixdebt", cmd_fix_existing_debt_payment))
 
     # تقرير مبيعات الإنستغرام — للأونر فقط.
     app.add_handler(CommandHandler("instagram_report", cmd_instagram_report))
