@@ -508,6 +508,7 @@ def get_vaults_worksheet():
 
 
 _debts_sheet = None
+_customer_credits_sheet = None
 
 # أعمدة صفحة الديون بالترتيب
 DEBT_COL_DATE = 1
@@ -517,6 +518,72 @@ DEBT_COL_PRODUCT = 4
 DEBT_COL_AMOUNT = 5  # المبلغ المتبقي من الدين (يتحدث لأقل عند تسديد جزئي)
 DEBT_COL_STATUS = 6  # "غير مدفوع" أو "مدفوع"
 DEBT_COL_PAID_DATE = 7  # يتحدث بتاريخ آخر تسديد (جزئي أو نهائي)
+
+
+def get_customer_credits_worksheet():
+    """سجل حركات رصيد الزبائن، ويُنشأ تلقائياً عند أول فرق دفع."""
+    global _customer_credits_sheet
+    if _customer_credits_sheet is not None:
+        return _customer_credits_sheet
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            _customer_credits_sheet = spreadsheet.worksheet(CUSTOMER_CREDITS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            _customer_credits_sheet = spreadsheet.add_worksheet(
+                title=CUSTOMER_CREDITS_WORKSHEET_NAME, rows=1000, cols=8
+            )
+            _customer_credits_sheet.append_row([
+                "التاريخ", "Chat ID", "الزبون", "الحركة",
+                "المبلغ", "الرصيد بعد الحركة", "المنتج", "ملاحظة",
+            ], value_input_option="USER_ENTERED")
+        return _customer_credits_sheet
+    except Exception:
+        logger.exception("Failed to connect to customer credits worksheet")
+        return None
+
+
+def get_customer_credit_balance(chat_id: int) -> int:
+    sheet = get_customer_credits_worksheet()
+    if sheet is None:
+        return 0
+    try:
+        rows = sheet.get_all_values()
+        for row in reversed(rows[1:]):
+            if len(row) >= 6 and row[1].strip() == str(chat_id):
+                return parse_sheet_amount(row[5])
+    except Exception:
+        logger.exception("Failed to read customer credit for %s", chat_id)
+    return 0
+
+
+def append_customer_credit(
+    chat_id: int, customer_line: str, amount: int, product: str, note: str,
+) -> tuple[bool, int]:
+    """يضيف فرق الدفع لرصيد الزبون ويرجع الرصيد الجديد."""
+    if amount <= 0:
+        return False, get_customer_credit_balance(chat_id)
+    sheet = get_customer_credits_worksheet()
+    if sheet is None:
+        return False, 0
+    balance = get_customer_credit_balance(chat_id) + amount
+    try:
+        sheet.append_row([
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            str(chat_id), customer_line, "إضافة", amount, balance, product, note,
+        ], value_input_option="USER_ENTERED")
+        return True, balance
+    except Exception:
+        logger.exception("Failed to append customer credit for %s", chat_id)
+        return False, 0
 
 
 def get_debts_worksheet():
@@ -698,6 +765,43 @@ async def cmd_fix_existing_debt_payment(
         f"الزبون: {customer_chat_id}\nالمنتج: {product}\n"
         f"المبلغ: {paid_amount}\nالنتيجة: {status}\n"
         f"سطر الدفعة #{payment_row_number} بقي كما هو، وما انضاف دخل ثانٍ."
+    )
+
+
+async def cmd_add_customer_credit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """تصحيح يدوي لفرق دفعة قديمة: /addcredit CHAT_ID AMOUNT NOTE."""
+    message = update.effective_message
+    if message is None or update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    if len(context.args) < 2:
+        await message.reply_text("الاستخدام: /addcredit CHAT_ID AMOUNT NOTE")
+        return
+    try:
+        customer_chat_id = int(context.args[0])
+        amount = int(re.sub(r"[^\d]", "", context.args[1]))
+    except (ValueError, TypeError):
+        await message.reply_text("⚠️ chat_id أو المبلغ غير صحيح.")
+        return
+    if amount <= 0:
+        await message.reply_text("⚠️ المبلغ يجب أن يكون أكبر من صفر.")
+        return
+    note = " ".join(context.args[2:]).strip() or "تصحيح فرق دفعة سابقة"
+    customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
+    saved, balance = append_customer_credit(
+        customer_chat_id,
+        format_customer_line(customer_name, customer_username),
+        amount,
+        "ChatGPT",
+        note,
+    )
+    if not saved:
+        await message.reply_text("⚠️ تعذر حفظ الرصيد؛ لم يتغير أي سجل.")
+        return
+    await message.reply_text(
+        f"✅ تم حفظ {amount} رصيد للزبون {customer_chat_id}.\n"
+        f"الرصيد الحالي: {balance}.\nالملاحظة: {note}"
     )
 
 
@@ -1127,6 +1231,7 @@ VAULTS_WORKSHEET_NAME = "خزائن الرصيد"
 
 # اسم صفحة (Tab) الديون بنفس الشيت — تُنشأ تلقائياً لو مو موجودة
 DEBTS_WORKSHEET_NAME = "ديون"
+CUSTOMER_CREDITS_WORKSHEET_NAME = "أرصدة الزبائن"
 
 # نصوص أزرار لوحة المفاتيح الثابتة (Reply Keyboard) تحت صندوق الكتابة
 BTN_EXPENSE = "💸 تسجيل مصروف"
@@ -3413,6 +3518,27 @@ def payment_state_has_matching_debt(state: dict) -> bool:
         and customer_chat_id is not None
         and find_unpaid_debt(customer_chat_id, product) is not None
     )
+
+
+def payment_overage_amount(state: dict) -> int:
+    plan_price = int(state.get("plan_price") or 0)
+    paid_total = sum(int(amount or 0) for _, amount in state.get("payments", []))
+    return max(0, paid_total - plan_price) if plan_price > 0 else 0
+
+
+def build_overpayment_keyboard(overage: int) -> InlineKeyboardMarkup:
+    """يمنع اعتبار المبلغ الزائد سعراً للباقة بدون قرار صريح."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💰 حفظ {overage} رصيد للزبون",
+            callback_data="pay_overpayment_credit",
+        )],
+        [InlineKeyboardButton(
+            "✅ احتساب كامل المبلغ للعملية",
+            callback_data="pay_overpayment_product",
+        )],
+        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_amount_edit")],
+    ])
 
 
 def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repayment: bool = False) -> InlineKeyboardMarkup:
@@ -7779,6 +7905,33 @@ async def add_private_account(
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
     """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
 
+    # /id داخل محادثة الزبون: يخفي الأمر ويرسل المعرف
+    # لمحادثة الأونر الخاصة، من غير ما يظهر للزبون.
+    if text.strip().lower() == "/id":
+        fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
+        customer_name = (
+            (bm.chat.full_name or bm.chat.first_name or "غير معروف")
+            if bm is not None else fallback_name
+        )
+        customer_username = bm.chat.username if bm is not None else fallback_username
+        if bm is not None:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not delete /id shortcut for %s", chat_id)
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=(f"🆔 معرف الزبون\n"
+                  f"الاسم: {customer_name}"
+                  + (f" (@{customer_username})" if customer_username else "")
+                  + f"\nchat_id: <code>{chat_id}</code>"),
+            parse_mode="HTML",
+        )
+        return True
+
     # AC (وaccept للتوافق) — رد على صورة دفع معينة من الزبون بمحادثتك
     # Business وياه. يحول الصورة للمراجعة حتى لو تجاوزت حد الصور، ثم
     # يحذف الاختصار من شات الزبون كي لا يبقى ظاهراً.
@@ -7936,14 +8089,30 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                           f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"),
                 )
             else:
-                # ماكو دفعة مسجلة: هذا هو فلو الدين القديم فقط.
-                context.user_data["pending_link_debt"] = delivery_state
-                await context.bot.send_message(
-                    chat_id=OWNER_USER_ID,
-                    text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
-                          "هل هذا الزبون دين؟"),
-                    reply_markup=build_link_debt_keyboard(chat_id),
-                )
+                if has_recorded_paid_subscription_for_link(chat_id):
+                    # الدفعة موجودة فعلاً، لكن لم نستطع استرجاع الباقة
+                    # تلقائياً (مثل الدفع الزائد). لا نسأل عن دين.
+                    context.user_data["pending_link_debt"] = {
+                        **delivery_state, "is_debt": False,
+                    }
+                    await context.bot.send_message(
+                        chat_id=OWNER_USER_ID,
+                        text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                              "✅ الدفعة مسجلة، لكن مبلغها لا يطابق سعر باقة واحدة.\n"
+                              "اختَر الباقة التي اشتراها الزبون:"),
+                        reply_markup=build_link_debt_plan_keyboard(chat_id),
+                    )
+                else:
+                    # فقط عند عدم وجود أي دفعة نفتح سؤال الدين.
+                    context.user_data["pending_link_debt"] = {
+                        **delivery_state, "is_debt": True,
+                    }
+                    await context.bot.send_message(
+                        chat_id=OWNER_USER_ID,
+                        text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
+                              "هل هذا الزبون دين؟"),
+                        reply_markup=build_link_debt_keyboard(chat_id),
+                    )
         try:
             customer_name_for_topic = bm.chat.full_name or bm.chat.first_name or "غير معروف" if bm is not None else "غير معروف"
             customer_username_for_topic = bm.chat.username if bm is not None else None
@@ -8684,6 +8853,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    if data in {"pay_overpayment_credit", "pay_overpayment_product"}:
+        state["overpayment_decision"] = (
+            "credit" if data == "pay_overpayment_credit" else "product"
+        )
+        data = "pay_finalize"
+
     # -------------------- تثبيت العملية بالكامل وحفظها بالشيت --------------------
     if data == "pay_finalize":
         if not state["product"] or not state["payments"]:
@@ -8714,8 +8889,20 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("ما لقيت مدة مفعلة لهذا المنتج بالكاتالوج.", show_alert=True)
             return
 
+        overage = payment_overage_amount(state)
+        if overage > 0 and not state.get("overpayment_decision"):
+            await query.edit_message_caption(
+                caption=(format_payment_summary(state)
+                         + f"\n\n⚠️ المبلغ أعلى من سعر الباقة بـ {overage}.\n"
+                           "شنو تريد تسوي بالفرق؟"),
+                reply_markup=build_overpayment_keyboard(overage),
+            )
+            return
+
         saved = append_payment_row(state)
         subscription_saved = False
+        credit_saved = False
+        credit_balance = 0
         if saved and not state.get("manual_product") and (
             is_chatgpt_payment_state(state) or state.get("duration_days") or state.get("reminder_disabled")
         ):
@@ -8727,6 +8914,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             if subscription_saved and not pending_delivery:
                 await schedule_subscription_feedback(state)
+
+        if saved and overage > 0 and state.get("overpayment_decision") == "credit":
+            credit_saved, credit_balance = append_customer_credit(
+                int(state["customer_chat_id"]),
+                format_customer_line(state["customer_name"], state.get("customer_username")),
+                overage,
+                state["product"],
+                f"فرق دفعة عن باقة {state.get('plan_name') or state['product']}",
+            )
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
         if saved:
@@ -8770,6 +8966,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 reminder_note = "\nℹ️ هذا المنتج دائم؛ راح تنرسل متابعة رضا بعد 24 ساعة بدون تنبيه انتهاء."
             else:
                 reminder_note = "\n🔔 تم تسجيل تنبيه انتهاء الاشتراك." if subscription_saved else "\n⚠️ تم حفظ الدفعة، بس فشل حفظ تنبيه الاشتراك."
+            if overage > 0 and state.get("overpayment_decision") == "credit":
+                reminder_note += (
+                    f"\n💰 تم حفظ {overage} رصيد للزبون. رصيده الحالي: {credit_balance}."
+                    if credit_saved else
+                    f"\n⚠️ الدفعة انحفظت، لكن فشل حفظ فرق {overage} كرصيد."
+                )
             final_text = format_payment_summary(state) + "\n\n✅ تم الحفظ بنجاح." + reminder_note
         else:
             final_text = format_payment_summary(state) + "\n\n⚠️ فشل الحفظ بـ Google Sheet — تحقق من الاتصال يدوياً."
@@ -8940,6 +9142,8 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("تمام، تم الربط بدون تسجيل دين.")
         return
     if debt_match and debt_match.group(1) == "yes":
+        state["is_debt"] = True
+        context.user_data["pending_link_debt"] = state
         if not get_active_link_debt_catalog_plans():
             await query.edit_message_text(
                 "⚠️ ماكو باقات ChatGPT مفعّلة ويا مدة في المنتجات والباقات. "
@@ -8982,7 +9186,7 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         "plan_duration": plan.get("duration"),
         "duration_days": duration_days,
         "reminder_disabled": is_permanent,
-        "is_debt": True,
+        "is_debt": bool(state.get("is_debt", True)),
     }
     saved = save_subscription_reminder(reminder_state)
     if saved:
@@ -8993,8 +9197,9 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
     context.user_data.pop("pending_link_debt", None)
     end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=1 if is_permanent else duration_days)
     duration_text = "بعد 24 ساعة (باقة دائمة)" if is_permanent else end.strftime("%Y-%m-%d %H:%M")
+    payment_kind = "دين" if reminder_state["is_debt"] else "دفعة مسجلة"
     await query.edit_message_text(
-        f"✅ تم تسجيل دين: {product['name']} — {plan['name']}\n"
+        f"✅ تم تفعيل {payment_kind}: {product['name']} — {plan['name']}\n"
         f"الكود متاح للزبون من هسه.\n"
         + ("🔔 متابعة الرضا راح تنرسل " + duration_text if is_permanent else f"ينتهي الاشتراك: {duration_text}")
     )
@@ -12709,6 +12914,7 @@ def main() -> None:
 
     # تصحيح دفعة حُفظت كعملية جديدة بدل تسديد دين، من دون تكرار الدخل.
     app.add_handler(CommandHandler("fixdebt", cmd_fix_existing_debt_payment))
+    app.add_handler(CommandHandler("addcredit", cmd_add_customer_credit))
 
     # تقرير مبيعات الإنستغرام — للأونر فقط.
     app.add_handler(CommandHandler("instagram_report", cmd_instagram_report))
