@@ -2,6 +2,7 @@ import unittest
 
 from intent_fallback import (
     contextual_thanks_reply,
+    feedback_reply_is_negative,
     feedback_reply_is_positive,
     has_thanks_signal,
     infer_greeting_category,
@@ -91,6 +92,12 @@ class FeedbackSatisfactionTests(unittest.TestCase):
 
     def test_empty_or_vague_reply_is_not_eligible_for_rating_link(self):
         self.assertFalse(feedback_reply_is_positive("المشكلة موجودة"))
+
+    def test_unrelated_reply_is_not_misclassified_as_negative(self):
+        self.assertFalse(feedback_reply_is_negative("أريد أسأل عن باقة ثانية"))
+
+    def test_explicit_dissatisfaction_is_negative(self):
+        self.assertTrue(feedback_reply_is_negative("الخدمة مو زينة واريد استرجاع فلوسي"))
 
 
 class OwnerPaymentShortcutTests(unittest.TestCase):

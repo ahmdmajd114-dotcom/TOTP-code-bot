@@ -53,6 +53,7 @@ from catalog_logic import (
 )
 from intent_fallback import (
     contextual_thanks_reply,
+    feedback_reply_is_negative,
     feedback_reply_is_positive,
     has_thanks_signal,
     infer_greeting_category,
@@ -7114,7 +7115,7 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
         return False
 
     reminder_id = rows[0]["id"]
-    if not feedback_reply_is_positive(text):
+    if feedback_reply_is_negative(text):
         supabase.table("subscription_reminders").update({
             "feedback_status": "needs_owner",
             "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
@@ -7134,6 +7135,11 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
             logger.exception("Failed to notify owner about negative feedback")
         return True
 
+    # الرد الذي لا يعبّر بوضوح عن رضا ولا عن مشكلة ليس شكوى. نتركه
+    # للفلو الطبيعي، وتبقى المتابعة قابلة للتصحيح اليدوي بكلمة «راضي».
+    if not feedback_reply_is_positive(text):
+        return False
+
     supabase.table("subscription_reminders").update({
         "feedback_status": "positive",
         "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
@@ -7150,6 +7156,47 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
         except Exception:
             logger.exception("Failed to send feedback link")
     return True
+
+
+async def owner_mark_feedback_positive(
+    context: ContextTypes.DEFAULT_TYPE, bm,
+) -> tuple[bool, str]:
+    """يصحح تصنيف متابعة الرضا ويرسل طلب التقييم من داخل محادثة الزبون."""
+    try:
+        rows = (
+            supabase.table("subscription_reminders")
+            .select("id, business_connection_id, feedback_status")
+            .eq("customer_chat_id", bm.chat.id)
+            .in_("feedback_status", ["awaiting_reply", "needs_owner"])
+            .order("feedback_requested_at", desc=True).limit(1).execute().data or []
+        )
+    except Exception:
+        logger.exception("Failed to find feedback for owner correction")
+        return False, "⚠️ تعذر قراءة متابعة الرضا."
+    if not rows:
+        return False, "⚠️ ماكو متابعة رضا مفتوحة لهذا الزبون."
+    reminder = rows[0]
+    try:
+        supabase.table("subscription_reminders").update({
+            "feedback_status": "positive",
+            "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", reminder["id"]).execute()
+        send_kwargs = {
+            "business_connection_id": (
+                reminder.get("business_connection_id") or bm.business_connection_id
+            ),
+            "chat_id": bm.chat.id,
+            "text": "كلش خوش، عاشت إيدك 🌷\nإذا تحب، هذا رابط تقييم تجربتك ويانا:",
+        }
+        if SUBSCRIPTION_FEEDBACK_URL:
+            send_kwargs["reply_markup"] = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📝 قيّم تجربتك", url=SUBSCRIPTION_FEEDBACK_URL)
+            ]])
+        await context.bot.send_message(**send_kwargs)
+        return True, "✅ تم تصحيح الحالة إلى راضٍ وإرسال طلب التقييم."
+    except Exception:
+        logger.exception("Failed to mark feedback positive manually")
+        return False, "⚠️ تعذر تصحيح الحالة أو إرسال التقييم."
 
 
 def normalize_totp_secret(secret: str) -> str:
@@ -7914,6 +7961,21 @@ async def add_private_account(
 
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
     """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
+
+    if text.strip().lower() in {"راضي", "/satisfied"}:
+        if bm is not None:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not delete satisfied shortcut for %s", chat_id)
+            _saved, result_text = await owner_mark_feedback_positive(context, bm)
+        else:
+            result_text = "⚠️ اكتب «راضي» داخل محادثة الزبون نفسها."
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text=result_text)
+        return True
 
     # /id داخل محادثة الزبون: يخفي الأمر ويرسل المعرف
     # لمحادثة الأونر الخاصة، من غير ما يظهر للزبون.

@@ -142,6 +142,24 @@ def feedback_reply_is_positive(text: str) -> bool:
     return any(normalize_arabic_text(word) in normalized for word in positive_words)
 
 
+def feedback_reply_is_negative(text: str) -> bool:
+    """Only explicit dissatisfaction should escalate; ambiguity is not a complaint."""
+    normalized = normalize_arabic_text(text)
+    if not normalized:
+        return False
+    explicit_negative_phrases = (
+        "مو زين", "مو حلو", "سيء", "زفت", "ما يشتغل", "مايفتح",
+        "ما انحلت", "ما انحل", "ما انحلت المشكله", "ما ساعدتوني",
+        "ما فادتني", "اريد تعويض", "اريد استرجاع", "استرجاع فلوسي",
+        "تقصير منكم", "قصرتوا وياي", "مو راضي", "غير راضي",
+        "الخدمه سيئه", "الخدمة سيئة",
+    )
+    return any(
+        normalize_arabic_text(phrase) in normalized
+        for phrase in explicit_negative_phrases
+    )
+
+
 def is_owner_payment_shortcut(text: str) -> bool:
     """Recognize the owner's exact in-chat shortcut for sending payment details."""
     return normalize_arabic_text(text) in {"دفع", "طرق الدفع"}
