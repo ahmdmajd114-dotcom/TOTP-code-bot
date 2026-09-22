@@ -775,17 +775,26 @@ async def cmd_add_customer_credit(
     message = update.effective_message
     if message is None or update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
         return
+    try:
+        # الأمر إداري ومؤقت؛ نحذفه فوراً من محادثة الأونر
+        # سواء نجح حفظ الرصيد بعده أم لا.
+        await message.delete()
+    except Exception:
+        logger.warning("Could not delete /addcredit command message")
     if len(context.args) < 2:
-        await message.reply_text("الاستخدام: /addcredit CHAT_ID AMOUNT NOTE")
+        await context.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text="الاستخدام: /addcredit CHAT_ID AMOUNT NOTE",
+        )
         return
     try:
         customer_chat_id = int(context.args[0])
         amount = int(re.sub(r"[^\d]", "", context.args[1]))
     except (ValueError, TypeError):
-        await message.reply_text("⚠️ chat_id أو المبلغ غير صحيح.")
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ chat_id أو المبلغ غير صحيح.")
         return
     if amount <= 0:
-        await message.reply_text("⚠️ المبلغ يجب أن يكون أكبر من صفر.")
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ المبلغ يجب أن يكون أكبر من صفر.")
         return
     note = " ".join(context.args[2:]).strip() or "تصحيح فرق دفعة سابقة"
     customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
@@ -797,11 +806,12 @@ async def cmd_add_customer_credit(
         note,
     )
     if not saved:
-        await message.reply_text("⚠️ تعذر حفظ الرصيد؛ لم يتغير أي سجل.")
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ تعذر حفظ الرصيد؛ لم يتغير أي سجل.")
         return
-    await message.reply_text(
-        f"✅ تم حفظ {amount} رصيد للزبون {customer_chat_id}.\n"
-        f"الرصيد الحالي: {balance}.\nالملاحظة: {note}"
+    await context.bot.send_message(
+        chat_id=OWNER_USER_ID,
+        text=(f"✅ تم حفظ {amount} رصيد للزبون {customer_chat_id}.\n"
+              f"الرصيد الحالي: {balance}.\nالملاحظة: {note}"),
     )
 
 
