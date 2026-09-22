@@ -7942,6 +7942,58 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return True
 
+    # داخل محادثة الزبون يكفي: /addcredit 7000 ملاحظة اختيارية
+    # وللتوافق نقبل أيضاً الصيغة الطويلة التي تحتوي chat_id؛ لكن نعتمد
+    # دائماً معرف المحادثة الحالية حتى لا يُسجل الرصيد لشخص آخر بالخطأ.
+    if text.strip().lower().startswith("/addcredit"):
+        parts = text.strip().split()
+        numeric_parts = [part for part in parts[1:] if re.fullmatch(r"[\d,]+", part)]
+        amount_text = None
+        if numeric_parts:
+            amount_text = numeric_parts[1] if len(numeric_parts) >= 2 and numeric_parts[0].replace(",", "") == str(chat_id) else numeric_parts[0]
+        try:
+            amount = int((amount_text or "0").replace(",", ""))
+        except ValueError:
+            amount = 0
+        if bm is not None:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not delete business /addcredit command for %s", chat_id)
+        if amount <= 0:
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text="⚠️ استخدم داخل محادثة الزبون: /addcredit 7000 ملاحظة اختيارية",
+            )
+            return True
+        amount_index = parts.index(amount_text) if amount_text in parts else 1
+        note = " ".join(parts[amount_index + 1:]).strip() or "تصحيح فرق دفعة سابقة"
+        customer_name = (
+            bm.chat.full_name or bm.chat.first_name or "غير معروف"
+            if bm is not None else get_telegram_customer_identity(chat_id)[0]
+        )
+        customer_username = (
+            bm.chat.username if bm is not None else get_telegram_customer_identity(chat_id)[1]
+        )
+        saved, balance = append_customer_credit(
+            chat_id,
+            format_customer_line(customer_name, customer_username),
+            amount,
+            "ChatGPT",
+            note,
+        )
+        result_text = (
+            f"✅ تم حفظ {amount} رصيد للزبون {chat_id}.\n"
+            f"الرصيد الحالي: {balance}.\nالملاحظة: {note}"
+            if saved else
+            "⚠️ تعذر حفظ الرصيد في Google Sheet؛ لم يتغير أي سجل."
+        )
+        await context.bot.send_message(chat_id=OWNER_USER_ID, text=result_text)
+        return True
+
     # AC (وaccept للتوافق) — رد على صورة دفع معينة من الزبون بمحادثتك
     # Business وياه. يحول الصورة للمراجعة حتى لو تجاوزت حد الصور، ثم
     # يحذف الاختصار من شات الزبون كي لا يبقى ظاهراً.
