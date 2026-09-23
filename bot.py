@@ -9404,26 +9404,47 @@ async def handle_link_compensation_duration_input(update: Update, context: Conte
         return False
     duration_days = duration_to_days(message.text.strip())
     if duration_days is None or duration_days <= 0:
-        await message.reply_text("اكتب مدة التعويض بالأيام، مثلاً: 30")
-        return True
-    reminder_state = await replace_chatgpt_reminder_with_compensation(state, duration_days)
-    if reminder_state is None:
+        # لا نترك وضع التعويض يبتلع كل أوامر الأونر إلى ما لا نهاية.
+        # الرسالة الحالية تكمل لبقية المعالجات (دفع، مصروف، إلخ).
+        context.user_data.pop("pending_link_compensation", None)
         await message.reply_text(
-            "⚠️ تم الربط، لكن ما لكيت تنبيه ChatGPT سابق حتى أستبدله بالتعويض. "
-            "سجّل التنبيه أولاً أو راجع سجل الاشتراك."
+            "ℹ️ تم إلغاء انتظار مدة التعويض لأن الرسالة مو مدة."
         )
-        return True
+        return False
+    # بمجرد استلام مدة صحيحة نغلق الوضع، حتى لو تعذرت قاعدة البيانات؛
+    # لا يجوز أن تظل رسائل الأونر التالية عالقة في فلو التعويض.
+    context.user_data.pop("pending_link_compensation", None)
+    reminder_state = await replace_chatgpt_reminder_with_compensation(state, duration_days)
+    created_new = False
+    if reminder_state is None:
+        # قد يكون الحساب السابق قديماً أو سجله بلا تنبيه. بما أن الأونر
+        # اختار «تعويض» وحدد المدة صراحةً، ننشئ تنبيهاً جديداً آمناً.
+        reminder_state = {
+            **state,
+            "product": CHATGPT_PRODUCT_NAME,
+            "plan_name": "تعويض",
+            "plan_duration": f"{duration_days} يوم",
+            "duration_days": duration_days,
+            "reminder_disabled": False,
+            "is_debt": False,
+        }
+        if not save_subscription_reminder(reminder_state, status="active"):
+            await message.reply_text(
+                "⚠️ تم الربط، لكن تعذر إنشاء تنبيه التعويض. "
+                "تم إغلاق وضع التعويض ولن يعترض بقية أوامرك."
+            )
+            return True
+        created_new = True
     scheduled = await schedule_subscription_feedback(reminder_state)
     invite_scheduled = schedule_continuity_invite(
         int(state["customer_chat_id"]), state.get("business_connection_id"),
     )
-    context.user_data.pop("pending_link_compensation", None)
     end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=duration_days)
     schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
     if invite_scheduled:
         schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت بعد 30 دقيقة."
     await message.reply_text(
-        f"✅ تم تعديل تنبيه الاشتراك نفسه إلى تعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
+        f"✅ تم {'إنشاء' if created_new else 'تعديل'} تنبيه التعويض لمدة {duration_days} يوم من وقت تسليم الحساب.\n"
         f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
     )
     return True
