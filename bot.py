@@ -7273,6 +7273,37 @@ def remember_customer_totp_account(
         return False
 
 
+def recover_link_account_relationship_state(chat_id: int) -> dict | None:
+    """يسترجع الحساب الجديد والسابق إذا ضاعت حالة سؤال /link بعد إعادة التشغيل."""
+    try:
+        links = (supabase.table("customer_totp_account_links")
+                 .select("account_id, linked_at, is_primary")
+                 .eq("customer_chat_id", chat_id).eq("status", "active")
+                 .order("linked_at", desc=True).execute().data or [])
+    except Exception:
+        logger.exception("Failed to recover account relationship state for %s", chat_id)
+        return None
+    if len(links) < 2:
+        return None
+    newest = next((row for row in links if row.get("is_primary")), links[0])
+    previous = next(
+        (row for row in links if str(row.get("account_id")) != str(newest.get("account_id"))),
+        None,
+    )
+    if not newest.get("account_id") or previous is None or not previous.get("account_id"):
+        return None
+    customer_name, customer_username = get_telegram_customer_identity(chat_id)
+    return {
+        "customer_chat_id": chat_id,
+        "customer_name": customer_name,
+        "customer_username": customer_username,
+        "previous_account_id": str(previous["account_id"]),
+        "new_account_id": str(newest["account_id"]),
+        "business_connection_id": get_customer_business_connection_id(chat_id),
+        "activate_subscription_after_choice": True,
+    }
+
+
 def should_prompt_for_totp_account(chat_id: int, attempt_count: int) -> bool:
     """نطلب الاختيار أول مرة فقط؛ بعده يبقى الحساب المختار ثابتاً."""
     del attempt_count
@@ -9342,8 +9373,10 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
     chat_id = int(raw_chat_id)
     state = context.user_data.get("pending_link_account_relationship") or {}
     if int(state.get("customer_chat_id", 0)) != chat_id:
-        await query.edit_message_text("⚠️ انتهت صلاحية سؤال الحساب. أعد /link إذا احتجت تعدل العلاقة.")
-        return
+        state = recover_link_account_relationship_state(chat_id) or {}
+        if not state:
+            await query.edit_message_text("⚠️ انتهت صلاحية سؤال الحساب وما كدرت أسترجع الحسابين. أعد /link.")
+            return
     # حالة /link تحفظ الحساب السابق باسم previous_account_id. ندعم الاسم
     # القديم أيضاً حتى تبقى أي أسئلة ظاهرة قبل النشر قابلة للاستخدام.
     old_account_id = state.get("previous_account_id") or state.get("old_account_id")
