@@ -9344,7 +9344,9 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
     if int(state.get("customer_chat_id", 0)) != chat_id:
         await query.edit_message_text("⚠️ انتهت صلاحية سؤال الحساب. أعد /link إذا احتجت تعدل العلاقة.")
         return
-    old_account_id = state.get("old_account_id")
+    # حالة /link تحفظ الحساب السابق باسم previous_account_id. ندعم الاسم
+    # القديم أيضاً حتى تبقى أي أسئلة ظاهرة قبل النشر قابلة للاستخدام.
+    old_account_id = state.get("previous_account_id") or state.get("old_account_id")
     new_account_id = state.get("new_account_id")
     if not old_account_id or not new_account_id:
         await query.edit_message_text("⚠️ تعذر تحديد الحسابين. أعد /link.")
