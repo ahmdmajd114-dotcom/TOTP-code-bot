@@ -3607,6 +3607,21 @@ def build_overpayment_keyboard(overage: int) -> InlineKeyboardMarkup:
     ])
 
 
+def build_debt_overpayment_keyboard(overage: int) -> InlineKeyboardMarkup:
+    """يترك للأونر قرار مصير الزيادة بعد تسديد الدين."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💰 حفظ {overage} رصيداً للزبون",
+            callback_data="pay_debt_overage_credit",
+        )],
+        [InlineKeyboardButton(
+            "✅ احتساب كامل المبلغ بدون رصيد",
+            callback_data="pay_debt_overage_full",
+        )],
+        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_amount_edit")],
+    ])
+
+
 def build_summary_keyboard(has_product: bool, has_payment: bool, show_debt_repayment: bool = False) -> InlineKeyboardMarkup:
     """
     الشاشة الرئيسية بعد ما فيه منتج أو طريقة دفع واحدة محفوظة على الأقل —
@@ -9085,6 +9100,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         data = "pay_finalize"
 
+    if data in {"pay_debt_overage_credit", "pay_debt_overage_full"}:
+        state["debt_overage_decision"] = (
+            "credit" if data == "pay_debt_overage_credit" else "full"
+        )
+        data = "pay_debt_repay"
+
     # -------------------- تثبيت العملية بالكامل وحفظها بالشيت --------------------
     if data == "pay_finalize":
         if not state["product"] or not state["payments"]:
@@ -9227,6 +9248,15 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         debt_row, remaining_before = debt_info
         repay_amount = sum(amount for _, amount in state["payments"])
         credit_overage = max(0, repay_amount - remaining_before)
+        if credit_overage > 0 and not state.get("debt_overage_decision"):
+            await query.edit_message_caption(
+                caption=(format_payment_summary(state)
+                         + f"\n\nالدين المتبقي: {remaining_before}"
+                           f"\nالمبلغ المستلم أعلى من الدين بـ {credit_overage}."
+                           "\nشنو تريد تسوي بالزيادة؟"),
+                reply_markup=build_debt_overpayment_keyboard(credit_overage),
+            )
+            return
         saved, new_remaining = process_debt_repayment(debt_row, remaining_before, repay_amount)
         payment_stats_saved = False
         credit_saved = False
@@ -9240,7 +9270,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             # تسديد الدين دخل جديد اليوم، حتى لو كان أصل الدين قديماً.
             # force_new يمنع دمجه مع سطر ChatGPT قديم أو ناقص.
             payment_stats_saved = append_payment_row(state, force_new=True)
-            if credit_overage > 0:
+            if credit_overage > 0 and state.get("debt_overage_decision") == "credit":
                 credit_saved, credit_balance = append_customer_credit(
                     int(customer_chat_id),
                     format_customer_line(state["customer_name"], state.get("customer_username")),
@@ -9254,7 +9284,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             if new_remaining <= 0:
                 credit_line = (
                     f"\nالرصيد الزائد المحفوظ: {credit_overage}"
-                    if credit_overage > 0 and credit_saved else ""
+                    if (credit_overage > 0
+                        and state.get("debt_overage_decision") == "credit"
+                        and credit_saved) else ""
                 )
                 await send_debt_notification(
                     context,
@@ -9264,7 +9296,9 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 )
                 final_text = format_payment_summary(state) + "\n\n✅ تم تسديد الدين بالكامل."
                 if credit_overage > 0:
-                    if credit_saved:
+                    if state.get("debt_overage_decision") == "full":
+                        final_text += f"\n✅ تم احتساب الزيادة {credit_overage} ضمن كامل الدفعة بدون رصيد للزبون."
+                    elif credit_saved:
                         final_text += (
                             f"\n💰 تم حفظ المبلغ الزائد {credit_overage} رصيداً للزبون."
                             f"\nرصيده الحالي: {credit_balance}."
