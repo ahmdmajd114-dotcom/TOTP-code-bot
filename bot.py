@@ -2739,6 +2739,45 @@ def get_latest_customer_payment(chat_id: int) -> tuple[int, list[str]] | None:
     return None
 
 
+def has_current_chatgpt_delivery_payment(chat_id: int) -> bool:
+    """هل سطر تسليم ChatGPT الحالي مدفوع فعلاً؟
+
+    الربط يكمّل أحدث سطر ChatGPT خلال أسبوع أو ينشئ سطراً جديداً فارغاً.
+    لذلك نفحص أحدث سطر نفسه، لا أي دفعة قديمة للزبون؛ الاشتراك القديم
+    الفعّال لا يعني أن التسليم الجديد مدفوع.
+    """
+    sheet = get_google_sheet()
+    if sheet is None:
+        return False
+    try:
+        rows = sheet.get_all_values()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CHATGPT_ROW_MATCH_WINDOW_DAYS)
+        for row in reversed(rows[1:]):
+            if len(row) < SHEET_COL_CHAT_ID:
+                continue
+            if row[SHEET_COL_CHAT_ID - 1].strip() != str(chat_id):
+                continue
+            product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
+            if not is_chatgpt_product_name(product):
+                continue
+            try:
+                row_date = datetime.strptime(
+                    row[SHEET_COL_DATE - 1].strip(), "%Y-%m-%d %H:%M"
+                ).replace(tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                return False
+            if row_date < cutoff:
+                return False
+            total = parse_sheet_amount(
+                row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None
+            )
+            payments = row[SHEET_COL_PAYMENTS - 1].strip() if len(row) >= SHEET_COL_PAYMENTS else ""
+            return total > 0 and bool(payments) and payments != "ملغاة"
+    except Exception:
+        logger.exception("Failed to inspect current ChatGPT delivery payment for %s", chat_id)
+    return False
+
+
 def parse_payment_vault_amounts(payments_text: str) -> dict[str, int]:
     amounts: dict[str, int] = {}
     for vault in VAULT_NAMES:
@@ -8175,6 +8214,22 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         old_link = (supabase.table("totp_links").select("account_id")
                     .eq("chat_id", chat_id).limit(1).execute().data or [])
         old_account_id = old_link[0].get("account_id") if old_link else None
+        # عند إعادة نفس /link بعد فشل خطوة لاحقة يكون totp_links قد صار
+        # يشير للحساب الجديد نفسه. نسترجع عندها الحساب السابق المختلف من
+        # سجل العلاقات حتى تكون إعادة المحاولة آمنة ولا يضيع السؤال.
+        if old_account_id and str(old_account_id) == str(account_id):
+            try:
+                previous_links = (supabase.table("customer_totp_account_links")
+                                  .select("account_id, linked_at")
+                                  .eq("customer_chat_id", chat_id)
+                                  .eq("status", "active")
+                                  .neq("account_id", str(account_id))
+                                  .order("linked_at", desc=True).limit(1)
+                                  .execute().data or [])
+                if previous_links:
+                    old_account_id = previous_links[0].get("account_id")
+            except Exception:
+                logger.exception("Failed to recover previous account while retrying /link for %s", chat_id)
         if old_account_id:
             remember_customer_totp_account(chat_id, str(old_account_id), primary=True)
 
@@ -9406,9 +9461,27 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
         if activated is None:
             activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
         if activated is None:
-            await query.edit_message_text(
-                "⚠️ تم حفظ نوع الحساب، لكن ما لكيت دفعة ChatGPT غير مفعّلة. سجّل الدفع أولاً."
-            )
+            # لا نعتبر الاشتراك القديم دليلاً على دفع التسليم الجديد.
+            # سطر التسليم الحالي في الشيت هو الفيصل: إن كان مدفوعاً نطلب
+            # تحديد الباقة، وإلا نفتح سؤال الدين بدلاً من إنهاء الفلو.
+            relationship_state = {
+                **state,
+                "customer_chat_id": chat_id,
+                "is_debt": not has_current_chatgpt_delivery_payment(chat_id),
+            }
+            context.user_data["pending_link_debt"] = relationship_state
+            if relationship_state["is_debt"]:
+                await query.edit_message_text(
+                    "✅ تم حفظ نوع الحساب، لكن ماكو دفعة جديدة مسجلة لهذا التسليم.\n"
+                    "هل هذا الزبون دين؟",
+                    reply_markup=build_link_debt_keyboard(chat_id),
+                )
+            else:
+                await query.edit_message_text(
+                    "✅ تم حفظ نوع الحساب والدفعة موجودة، لكن تعذر تحديد الباقة تلقائياً.\n"
+                    "اختَر باقة ChatGPT التي دفعها الزبون:",
+                    reply_markup=build_link_debt_plan_keyboard(chat_id),
+                )
             return
         scheduled = await schedule_subscription_feedback(activated)
         invite_scheduled = schedule_continuity_invite(chat_id, state.get("business_connection_id"))
