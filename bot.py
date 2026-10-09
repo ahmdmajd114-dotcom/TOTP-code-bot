@@ -756,15 +756,31 @@ async def cmd_fix_existing_debt_payment(
         await message.reply_text("⚠️ مبلغ آخر دفعة غير صحيح؛ ما غيرت أي سجل.")
         return
     debt_row, remaining_before = debt_info
+    credit_overage = max(0, paid_amount - remaining_before)
     saved, new_remaining = process_debt_repayment(debt_row, remaining_before, paid_amount)
     if not saved:
         await message.reply_text("⚠️ تعذر تحديث الدين؛ ما تم إضافة أي دفعة.")
         return
+    credit_note = ""
+    if credit_overage > 0:
+        customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
+        credit_saved, credit_balance = append_customer_credit(
+            customer_chat_id,
+            format_customer_line(customer_name, customer_username),
+            credit_overage,
+            product,
+            f"فرق زائد بعد تصحيح تسديد دين قيمته {remaining_before}",
+        )
+        credit_note = (
+            f"\nتم حفظ الزيادة {credit_overage} رصيداً؛ الرصيد الحالي: {credit_balance}."
+            if credit_saved else
+            f"\n⚠️ الدين تسدد، لكن فشل حفظ الزيادة {credit_overage} كرصيد."
+        )
     status = "تم تسديده بالكامل" if new_remaining <= 0 else f"بقي {new_remaining}"
     await message.reply_text(
         f"✅ تم ربط الدفعة المسجلة مسبقاً بالدين.\n"
         f"الزبون: {customer_chat_id}\nالمنتج: {product}\n"
-        f"المبلغ: {paid_amount}\nالنتيجة: {status}\n"
+        f"المبلغ: {paid_amount}\nالنتيجة: {status}{credit_note}\n"
         f"سطر الدفعة #{payment_row_number} بقي كما هو، وما انضاف دخل ثانٍ."
     )
 
@@ -9210,8 +9226,11 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
         debt_row, remaining_before = debt_info
         repay_amount = sum(amount for _, amount in state["payments"])
+        credit_overage = max(0, repay_amount - remaining_before)
         saved, new_remaining = process_debt_repayment(debt_row, remaining_before, repay_amount)
         payment_stats_saved = False
+        credit_saved = False
+        credit_balance = 0
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بالتسديد
         if saved:
@@ -9221,15 +9240,37 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             # تسديد الدين دخل جديد اليوم، حتى لو كان أصل الدين قديماً.
             # force_new يمنع دمجه مع سطر ChatGPT قديم أو ناقص.
             payment_stats_saved = append_payment_row(state, force_new=True)
+            if credit_overage > 0:
+                credit_saved, credit_balance = append_customer_credit(
+                    int(customer_chat_id),
+                    format_customer_line(state["customer_name"], state.get("customer_username")),
+                    credit_overage,
+                    state["product"],
+                    f"فرق زائد بعد تسديد دين قيمته {remaining_before}",
+                )
 
         if saved:
             customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
             if new_remaining <= 0:
+                credit_line = (
+                    f"\nالرصيد الزائد المحفوظ: {credit_overage}"
+                    if credit_overage > 0 and credit_saved else ""
+                )
                 await send_debt_notification(
                     context,
-                    f"✅ تسديد دين بالكامل\nالزبون: {customer_line}\nالمنتج: {state['product']}\nالمبلغ المسدد: {repay_amount}",
+                    f"✅ تسديد دين بالكامل\nالزبون: {customer_line}\nالمنتج: {state['product']}\n"
+                    f"الدين قبل التسديد: {remaining_before}\nالمبلغ المستلم: {repay_amount}"
+                    f"{credit_line}",
                 )
                 final_text = format_payment_summary(state) + "\n\n✅ تم تسديد الدين بالكامل."
+                if credit_overage > 0:
+                    if credit_saved:
+                        final_text += (
+                            f"\n💰 تم حفظ المبلغ الزائد {credit_overage} رصيداً للزبون."
+                            f"\nرصيده الحالي: {credit_balance}."
+                        )
+                    else:
+                        final_text += f"\n⚠️ الدين تسدد، لكن فشل حفظ المبلغ الزائد {credit_overage} كرصيد."
             else:
                 await send_debt_notification(
                     context,
