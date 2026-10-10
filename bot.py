@@ -5404,26 +5404,72 @@ def calculate_totals_summary(period_key: str) -> str:
     )
 
 
+STATS_PRODUCT_EXPENSE_ALIASES = {
+    "scripta": ("سكريبت", "سكربت", "scripta"),
+    "chatgpt": ("شات جي بي تي", "جات", "چات", "chatgpt"),
+    "gemini": ("جيمناي", "جيميناي", "gemini"),
+    "claude": ("كلاود", "claude"),
+    "canva": ("كانفا", "canva"),
+    "capcut": ("كاب كت", "كابكات", "capcut"),
+    "anki": ("انكي", "أنكي", "anki"),
+}
+
+
+def _stats_catalog_product_for_name(name: str, products: list[dict]) -> dict | None:
+    normalized_name = normalize_arabic_text(name)
+    for product in products:
+        candidates = [str(product.get("name") or "")]
+        candidates.extend(str(alias) for alias in (product.get("aliases") or []))
+        if normalized_name in {normalize_arabic_text(candidate) for candidate in candidates}:
+            return product
+    return None
+
+
+def _stats_expense_product(reason: str, products: list[dict]) -> dict | None:
+    """ينسب المصروف فقط إذا دل السبب على منتج واحد بوضوح."""
+    matches = list(match_catalog_products(reason, products))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None
+    normalized_reason = normalize_arabic_text(reason)
+    fallback_matches = []
+    for product in products:
+        product_key = public_catalog_product_key(product.get("name"))
+        aliases = STATS_PRODUCT_EXPENSE_ALIASES.get(product_key, ())
+        if any(re.search(rf"(?<!\w){re.escape(normalize_arabic_text(alias))}(?!\w)", normalized_reason)
+               for alias in aliases):
+            fallback_matches.append(product)
+    return fallback_matches[0] if len(fallback_matches) == 1 else None
+
+
 def calculate_product_breakdown(period_key: str) -> str:
-    """يحسب دخل + عدد عمليات لكل منتج بفترة معينة. يرجع نص جاهز للعرض."""
+    """يحسب مبيعات ومصروفات وصافي وعدد عمليات كل منتج."""
     payment_rows = get_payment_rows_in_period(period_key)
+    expense_rows = get_expense_rows_in_period(period_key)
     instagram_rows = get_instagram_sales_rows_in_period(period_key)
-    if payment_rows is None or instagram_rows is None:
+    if payment_rows is None or expense_rows is None or instagram_rows is None:
         return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
 
     label = format_period_label(period_key)
-    if not payment_rows and not instagram_rows:
-        return f"ماكو أي عمليات دفع مسجلة لفترة {label}."
+    if not payment_rows and not expense_rows and not instagram_rows:
+        return f"ماكو أي عمليات دفع أو مصروفات مسجلة لفترة {label}."
 
+    products = get_catalog_products()
     product_totals: dict[str, int] = {}
+    product_expenses: dict[str, int] = {}
     product_counts: dict[str, int] = {}
+
+    def product_label(raw_name: str) -> str:
+        product = _stats_catalog_product_for_name(raw_name, products)
+        return str(product.get("name")) if product else (raw_name.strip() or "غير محدد")
 
     for row in payment_rows:
         if is_debt_payment_row(row):
             continue
         if len(row) < 4:
             continue
-        product = row[3].strip()
+        product = product_label(row[3])
         if not product:
             continue
         amount_str = row[1].strip() if len(row) >= 2 else ""
@@ -5440,16 +5486,43 @@ def calculate_product_breakdown(period_key: str) -> str:
     for row in instagram_rows:
         if len(row) < 7:
             continue
-        product = row[3].strip() or "غير محدد"
+        product = product_label(row[3])
         amount = parse_amount(row[6]) or 0
         product_totals[product] = product_totals.get(product, 0) + amount
         product_counts[product] = product_counts.get(product, 0) + 1
 
-    lines = [f"تفصيل المنتجات — {label}\n"]
-    for product in sorted(product_totals.keys(), key=lambda p: product_totals[p], reverse=True):
-        lines.append(f"{product}: {product_totals[product]} ({product_counts[product]} عملية)")
+    unmatched_expenses = 0
+    for row in expense_rows:
+        if len(row) < 3:
+            continue
+        amount = parse_sheet_amount(row[1]) or 0
+        if amount <= 0:
+            continue
+        matched_product = _stats_expense_product(row[2], products)
+        if matched_product is None:
+            unmatched_expenses += amount
+            continue
+        product = str(matched_product.get("name") or "غير محدد")
+        product_expenses[product] = product_expenses.get(product, 0) + amount
 
-    return "\n".join(lines)
+    lines = [f"تفصيل المنتجات — {label}\n"]
+    product_names = set(product_totals) | set(product_expenses)
+    for product in sorted(product_names, key=lambda p: product_totals.get(p, 0), reverse=True):
+        income = product_totals.get(product, 0)
+        expense = product_expenses.get(product, 0)
+        lines.append(
+            f"{product}\n"
+            f"المبيعات: {income} ({product_counts.get(product, 0)} عملية)\n"
+            f"المصروف: {expense}\n"
+            f"الصافي: {income - expense}"
+        )
+    if unmatched_expenses:
+        lines.append(
+            f"مصروفات غير مرتبطة بمنتج واضح: {unmatched_expenses}\n"
+            "لتدخل بحساب منتج، اكتب اسم المنتج ضمن سبب المصروف."
+        )
+
+    return "\n\n".join(lines)
 
 
 def calculate_chatgpt_account_stats() -> tuple[int, int]:
