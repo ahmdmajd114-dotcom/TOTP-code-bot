@@ -13096,14 +13096,48 @@ def build_public_catalog_html() -> str:
     .plan strong,.plan span {{ display:block; }} .plan span {{ color:#65767a; font-size:13px; margin-top:5px; }} .plan b {{ direction:rtl; white-space:nowrap; color:var(--navy); font-size:17px; }} .plan small {{ font-size:12px; color:#65767a; }}
     .subscribe {{ display:block; margin-top:20px; padding:13px; border-radius:12px; background:var(--teal); color:white; text-align:center; text-decoration:none; font-weight:bold; transition:.18s; }} .subscribe:hover {{ background:var(--teal-dark); transform:translateY(-1px); }}
     .empty {{ color:#69787b; margin:17px 0 3px; }} .no-products {{ text-align:center; background:#fff; padding:44px; border-radius:22px; border:1px solid var(--line); }}
-    footer {{ text-align:center; padding:29px 18px 36px; color:#627478; font-size:14px; }} footer a {{ display:inline-block; margin-top:12px; color:var(--teal-dark); font-weight:bold; }}
+    footer {{ text-align:center; padding:29px 18px 36px; color:#627478; font-size:14px; }} footer a {{ display:inline-block; color:var(--teal-dark); font-weight:bold; }}
+    .footer-links {{ display:flex; justify-content:center; align-items:center; flex-wrap:wrap; gap:10px 18px; margin-top:12px; }}
+    .terms-button {{ border:0; padding:0; background:none; color:var(--teal-dark); font:inherit; font-weight:bold; text-decoration:underline; cursor:pointer; }}
+    dialog {{ width:min(760px,calc(100% - 24px)); max-height:min(86vh,850px); padding:0; border:0; border-radius:24px; color:var(--navy); background:#fff; box-shadow:0 28px 90px #062f3560; }} dialog::backdrop {{ background:#082d35b8; backdrop-filter:blur(4px); }}
+    .terms-head {{ position:sticky; top:0; z-index:2; display:flex; justify-content:space-between; align-items:center; gap:16px; padding:20px 24px; color:#fff; background:linear-gradient(120deg,var(--teal-dark),var(--teal)); }} .terms-head h2 {{ margin:0; font-size:22px; }}
+    .terms-close {{ display:grid; place-items:center; width:36px; height:36px; flex:0 0 auto; border:1px solid #ffffff70; border-radius:50%; color:#fff; background:#ffffff18; font-size:26px; cursor:pointer; }}
+    .terms-body {{ padding:24px; overflow:auto; max-height:calc(86vh - 76px); line-height:1.9; text-align:right; }} .terms-updated {{ margin-top:0; color:#6b7d80; font-size:14px; }} .terms-intro {{ padding:14px 16px; border-radius:14px; background:#eef7f4; }} .terms-body h3 {{ margin:28px 0 8px; color:var(--teal-dark); font-size:19px; }} .terms-body ul {{ margin:8px 0; padding-right:22px; }} .terms-body li {{ margin:7px 0; }} .terms-signature {{ margin-top:28px; padding-top:18px; border-top:1px solid var(--line); font-weight:bold; }}
     @media(max-width:520px) {{ .wrap {{ width:min(100% - 24px,1120px) }} header {{ padding-top:20px }} .hero {{ padding-top:42px }} .product-card {{ padding:19px }} }}
   </style>
 </head>
 <body>
   <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><div class=\"school-welcome\">نرحّب بكم بالعام الدراسي الجديد، ونتمنى لكم عاماً دراسياً مثمراً وسعيداً.</div><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
   <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2>{catalog_content}</main>
-  <footer>© MedBox Pro<br>{escape(support_note)}<br><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a></footer>
+  <footer>© MedBox Pro<br>{escape(support_note)}<div class=\"footer-links\"><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a><button class=\"terms-button\" type=\"button\" id=\"openTerms\">شروط الاستخدام</button></div></footer>
+  <dialog id=\"termsDialog\" aria-labelledby=\"termsTitle\">
+    <div class=\"terms-head\"><h2 id=\"termsTitle\">شروط الاستخدام – MedBox Pro</h2><button class=\"terms-close\" type=\"button\" id=\"closeTerms\" aria-label=\"إغلاق\">×</button></div>
+    <div class=\"terms-body\">
+      <p class=\"terms-updated\">آخر تحديث: ٢٤ تموز ٢٠٢٦</p>
+      <p class=\"terms-intro\">بسم الله، نشكرك على ثقتك بخدمة <strong>MedBox Pro</strong>. قبل تفعيل اشتراكك، الرجاء قراءة الشروط التالية بعناية. اشتراكك بالخدمة يعني موافقتك الكاملة على هذه الشروط.</p>
+      <h3>١. طبيعة الخدمة</h3>
+      <p>MedBox Pro هي خدمة <strong>إعادة بيع اشتراكات رقمية</strong> (تطبيقات ومنصات). دورنا هو تفعيل ومتابعة الاشتراك نيابة عنك، ولسنا الجهة المالكة أو المصنّعة للتطبيق أو المنصة الأصلية.</p>
+      <h3>٢. مدة الاشتراك</h3>
+      <ul><li>مدة كل اشتراك محددة وواضحة عند الشراء (مثلاً: شهر، ٣ أشهر، سنة).</li><li>المدة تبدأ من لحظة التفعيل الفعلي، وقد تختلف بسبب تأخر التفعيل من الجهة الأصلية المزوّدة للخدمة، وهذا خارج عن إرادتنا في بعض الأحيان.</li><li>أي تغيير بالمدة (نقصان أو زيادة) بسبب أي ظرف، نحن مطالبون بالتعويض حسب المدة المحددة. وقد تنقص أو تزيد بحكم طبيعة الخدمة، ولكن إذا كان النقص كبيراً نعوضكم حسب الاتفاق.</li><li>المطالبة بالتعويض يجب أن تكون خلال مدة الاشتراك الفعلية، أو خلال ٣ أيام من تاريخ انتهائها. لا يتم النظر بأي مطالبة تصل بعد انتهاء هذه الفترة.</li></ul>
+      <h3>٣. الأعطال والمشاكل التقنية</h3>
+      <p>نتعامل بشفافية كاملة مع أي عطل يصير:</p>
+      <ul><li><strong>توقف الخدمة أو انقطاعها قبل انتهاء المدة:</strong> تعويض بالأيام المتبقية أو تمديد الاشتراك.</li><li><strong>مشكلة بالتفعيل:</strong> إذا لم يعمل الكود أو الحساب، تتم إعادة التفعيل فوراً أو استرجاع المبلغ.</li><li><strong>تغييرات من الشركة الأصلية:</strong> عند تغيير السعر أو إيقاف الخدمة أو تغيير الشروط، نخبرك فوراً ونوضح البدائل المتاحة: تعويض، تحويل لخدمة بديلة، أو استرجاع الجزء المتبقي.</li></ul>
+      <p>نحن لا نتحمل مسؤولية أي ضرر غير مباشر ناتج عن استخدامك للتطبيق نفسه، مثل فقدان بيانات داخل التطبيق؛ فهذا يقع ضمن مسؤولية الجهة المطوّرة للتطبيق الأصلي. مسؤوليتنا تنحصر بصحة تفعيل الاشتراك واستمراريته حسب المدة المتفق عليها.</p>
+      <h3>٤. آلية التواصل عند حدوث مشكلة</h3>
+      <p>إذا واجهتك أي مشكلة، تواصل معنا مباشرة عبر: <a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">@medbox_support</a></p>
+      <h3>٥. الاسترجاع</h3>
+      <ul><li>في حال تعذّر حل المشكلة أو التفعيل، يحق لك استرجاع كامل المبلغ أو الجزء المتبقي من مدة الاشتراك، حسب الحالة.</li><li>الاسترجاع لا ينطبق على الاشتراكات المستخدمة بشكل كامل أو المخالفة لشروط الاستخدام الخاصة بالتطبيق الأصلي.</li></ul>
+      <h3>٦. التزامك كمشترك</h3>
+      <ul><li>استخدام الاشتراك للغرض الشخصي المشروع فقط، وعدم مشاركة بيانات الدخول مع أطراف أخرى إلا إذا كان الاشتراك يسمح بذلك أصلاً.</li><li>الالتزام بشروط استخدام التطبيق أو المنصة الأصلية حسب الخدمة.</li></ul>
+      <p class=\"terms-signature\">نسعى دائماً أن يكون تعاملنا معكم قائماً على الصدق والوضوح، وأي استفسار أو ملاحظة نرحب بها بكل احترام.<br>MedBox Pro</p>
+    </div>
+  </dialog>
+  <script>
+    const termsDialog = document.getElementById('termsDialog');
+    document.getElementById('openTerms').addEventListener('click', () => termsDialog.showModal());
+    document.getElementById('closeTerms').addEventListener('click', () => termsDialog.close());
+    termsDialog.addEventListener('click', event => {{ if (event.target === termsDialog) termsDialog.close(); }});
+  </script>
 </body></html>"""
 
 
