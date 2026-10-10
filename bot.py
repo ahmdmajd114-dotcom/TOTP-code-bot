@@ -13109,7 +13109,7 @@ def build_public_catalog_html() -> str:
 <body>
   <header><div class=\"wrap\"><div class=\"brand\"><span class=\"mark\">+</span><span>MedBox <small>Pro</small></span></div><div class=\"hero\"><h1>متجر ميدبوكس</h1><div class=\"school-welcome\">نرحّب بكم بالعام الدراسي الجديد، ونتمنى لكم عاماً دراسياً مثمراً وسعيداً.</div><p>باقات مختارة للدراسة والإنتاجية. اختَر الباقة المناسبة وتواصل ويانا حتى نكمل اشتراكك.</p></div></div></header>
   <main class=\"wrap\"><h2 class=\"section-title\">المنتجات والباقات</h2>{catalog_content}</main>
-  <footer>© MedBox Pro<br>{escape(support_note)}<div class=\"footer-links\"><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a><button class=\"terms-button\" type=\"button\" id=\"openTerms\">شروط الاستخدام</button></div></footer>
+  <footer>© MedBox Pro<br>{escape(support_note)}<div class=\"footer-links\"><a href=\"{support_href}\" target=\"_blank\" rel=\"noopener\">تواصل مع الدعم</a><a class=\"terms-button\" href=\"/terms\" id=\"openTerms\">شروط الاستخدام</a></div></footer>
   <dialog id=\"termsDialog\" aria-labelledby=\"termsTitle\">
     <div class=\"terms-head\"><h2 id=\"termsTitle\">شروط الاستخدام – MedBox Pro</h2><button class=\"terms-close\" type=\"button\" id=\"closeTerms\" aria-label=\"إغلاق\">×</button></div>
     <div class=\"terms-body\">
@@ -13134,9 +13134,10 @@ def build_public_catalog_html() -> str:
   </dialog>
   <script>
     const termsDialog = document.getElementById('termsDialog');
-    document.getElementById('openTerms').addEventListener('click', () => termsDialog.showModal());
+    document.getElementById('openTerms').addEventListener('click', event => {{ event.preventDefault(); termsDialog.showModal(); }});
     document.getElementById('closeTerms').addEventListener('click', () => termsDialog.close());
     termsDialog.addEventListener('click', event => {{ if (event.target === termsDialog) termsDialog.close(); }});
+    if (window.location.pathname === '/terms') termsDialog.showModal();
   </script>
 </body></html>"""
 
@@ -13149,7 +13150,7 @@ def start_health_server() -> None:
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = self.path.split("?", 1)[0]
-            if path in {"/", "/catalog"}:
+            if path in {"/", "/catalog", "/terms"}:
                 body = build_public_catalog_html().encode("utf-8")
                 content_type = "text/html; charset=utf-8"
             elif path == "/health":
