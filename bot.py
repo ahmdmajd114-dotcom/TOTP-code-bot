@@ -4327,24 +4327,26 @@ def build_expense_vault_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_expense_reason_keyboard() -> InlineKeyboardMarkup:
-    """شاشة اختيار سبب المصروف — منتج سريع + بقية المنتجات + إدخال حر."""
-    quick_pick = PAYMENT_PRODUCTS[0]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(quick_pick, callback_data=f"exp_reason_{quick_pick}")],
-        [InlineKeyboardButton("بقية المنتجات ▾", callback_data="exp_reason_list")],
-        [InlineKeyboardButton("✏️ إدخال حر", callback_data="exp_reason_manual")],
-        [InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_vault")],
-    ])
+    """يعرض كل منتجات الكاتالوج المفعلة كأسباب مصروف، مع إدخال حر."""
+    products = get_active_catalog_payment_products()
+    rows = [
+        [InlineKeyboardButton(
+            product["name"], callback_data=f"exp_reason_catalog_{product['id']}"
+        )]
+        for product in products
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton(
+            "⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="exp_reason_noop"
+        )])
+    rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="exp_reason_manual")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_vault")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_expense_reason_list_keyboard() -> InlineKeyboardMarkup:
-    """قائمة كل المنتجات ما عدا الاختيار السريع + زر رجوع، لسبب المصروف."""
-    rows = [
-        [InlineKeyboardButton(p, callback_data=f"exp_reason_{p}")]
-        for p in PAYMENT_PRODUCTS[1:]
-    ]
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_reason")])
-    return InlineKeyboardMarkup(rows)
+    """توافق مع رسائل قديمة كانت تفتح شاشة «بقية المنتجات»."""
+    return build_expense_reason_keyboard()
 
 
 def format_expense_summary(expense: dict) -> str:
@@ -10286,6 +10288,20 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
         expense["vault"] = None if vault_key == "none" else vault_key
         await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
         return
+
+    if data == "exp_reason_noop":
+        await query.answer("فعّل أو أضف منتجاً من المنتجات والباقات، أو استخدم إدخال حر.", show_alert=True)
+        return
+
+    if data.startswith("exp_reason_catalog_"):
+        product_id = data[len("exp_reason_catalog_"):]
+        product = get_catalog_product(product_id)
+        if product is None or not product.get("is_active"):
+            await query.answer("هذا المنتج لم يعد مفعّلاً. اختَر غيره أو استخدم إدخال حر.", show_alert=True)
+            return
+        # نمرر اسم المنتج الحي إلى مسار الحفظ نفسه حتى يظهر في السبب
+        # وتلتقطه إحصائية المبيعات/المصروف/الصافي تلقائياً.
+        data = f"exp_reason_{product['name']}"
 
     if data.startswith("exp_reason_") and data not in ("exp_reason_list", "exp_reason_manual"):
         reason = data[len("exp_reason_"):]
