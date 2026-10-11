@@ -13303,11 +13303,20 @@ def start_health_server() -> None:
                             .execute().data or []
                         )
                     }
+                    hidden_keys = {
+                        row["beneficiary_key"]
+                        for row in (
+                            supabase.table("pmt_hidden_beneficiaries")
+                            .select("beneficiary_key")
+                            .execute().data or []
+                        )
+                    }
                 except Exception:
                     logger.exception("Could not load PMT comments")
                     comments = {}
+                    hidden_keys = set()
                 from pmt_page import build_pmt_page_html
-                body = build_pmt_page_html(comments).encode("utf-8")
+                body = build_pmt_page_html(comments, hidden_keys).encode("utf-8")
                 content_type = "text/html; charset=utf-8"
             elif path == "/health":
                 body = b"OK"
@@ -13326,7 +13335,7 @@ def start_health_server() -> None:
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
-            if path != "/pmt/comments":
+            if path not in {"/pmt/comments", "/pmt/beneficiary/delete"}:
                 self._write_json(404, {"ok": False})
                 return
             try:
@@ -13337,16 +13346,23 @@ def start_health_server() -> None:
                 key = str(payload.get("key", ""))
                 comment = str(payload.get("comment", "")).strip()
                 from pmt_page import beneficiary_keys
-                if key not in beneficiary_keys() or len(comment) > 1000:
-                    raise ValueError("invalid comment")
-                supabase.table("pmt_beneficiary_comments").upsert(
-                    {
-                        "beneficiary_key": key,
-                        "comment": comment,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    on_conflict="beneficiary_key",
-                ).execute()
+                if key not in beneficiary_keys():
+                    raise ValueError("invalid beneficiary")
+                if path == "/pmt/comments":
+                    if len(comment) > 1000:
+                        raise ValueError("invalid comment")
+                    supabase.table("pmt_beneficiary_comments").upsert(
+                        {
+                            "beneficiary_key": key,
+                            "comment": comment,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        on_conflict="beneficiary_key",
+                    ).execute()
+                else:
+                    supabase.table("pmt_hidden_beneficiaries").upsert(
+                        {"beneficiary_key": key}, on_conflict="beneficiary_key"
+                    ).execute()
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
                 self._write_json(400, {"ok": False})
                 return
