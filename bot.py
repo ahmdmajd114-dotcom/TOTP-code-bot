@@ -13289,7 +13289,11 @@ def start_health_server() -> None:
                     }
                 except Exception:
                     logger.exception("Could not load PMT comments")
-                    self._write_json(503, {"ok": False, "error": "comments_storage_unavailable"})
+                    self._write_json(503, {
+                        "ok": False,
+                        "error": "comments_storage_unavailable",
+                        "project_ref": SUPABASE_URL.split("//", 1)[-1].split(".", 1)[0],
+                    })
                     return
                 self._write_json(200, {"ok": True, "comments": comments})
                 return
