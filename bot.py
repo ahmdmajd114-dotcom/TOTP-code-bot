@@ -13259,6 +13259,15 @@ def start_health_server() -> None:
     import threading
 
     class HealthHandler(BaseHTTPRequestHandler):
+        def _write_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path in {"/", "/catalog", "/terms"}:
@@ -13267,6 +13276,38 @@ def start_health_server() -> None:
             elif path in {"/propmt", "/prompt"}:
                 from prompt_page import build_prompt_page_html
                 body = build_prompt_page_html().encode("utf-8")
+                content_type = "text/html; charset=utf-8"
+            elif path == "/pmt/comments":
+                try:
+                    comments = {
+                        row["beneficiary_key"]: row["comment"]
+                        for row in (
+                            supabase.table("pmt_beneficiary_comments")
+                            .select("beneficiary_key, comment")
+                            .execute().data or []
+                        )
+                    }
+                except Exception:
+                    logger.exception("Could not load PMT comments")
+                    self._write_json(503, {"ok": False})
+                    return
+                self._write_json(200, {"ok": True, "comments": comments})
+                return
+            elif path == "/pmt":
+                try:
+                    comments = {
+                        row["beneficiary_key"]: row["comment"]
+                        for row in (
+                            supabase.table("pmt_beneficiary_comments")
+                            .select("beneficiary_key, comment")
+                            .execute().data or []
+                        )
+                    }
+                except Exception:
+                    logger.exception("Could not load PMT comments")
+                    comments = {}
+                from pmt_page import build_pmt_page_html
+                body = build_pmt_page_html(comments).encode("utf-8")
                 content_type = "text/html; charset=utf-8"
             elif path == "/health":
                 body = b"OK"
@@ -13282,6 +13323,38 @@ def start_health_server() -> None:
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if path != "/pmt/comments":
+                self._write_json(404, {"ok": False})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 2 <= length <= 4_000:
+                    raise ValueError("invalid body size")
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                key = str(payload.get("key", ""))
+                comment = str(payload.get("comment", "")).strip()
+                from pmt_page import beneficiary_keys
+                if key not in beneficiary_keys() or len(comment) > 1000:
+                    raise ValueError("invalid comment")
+                supabase.table("pmt_beneficiary_comments").upsert(
+                    {
+                        "beneficiary_key": key,
+                        "comment": comment,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    on_conflict="beneficiary_key",
+                ).execute()
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                self._write_json(400, {"ok": False})
+                return
+            except Exception:
+                logger.exception("Could not save PMT comment")
+                self._write_json(503, {"ok": False})
+                return
+            self._write_json(200, {"ok": True})
 
         def log_message(self, format, *args):
             pass  # تجاهل لوغات HTTP الروتينية عشان ما تغرق لوغات البوت
