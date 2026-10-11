@@ -13287,9 +13287,9 @@ def start_health_server() -> None:
                             .execute().data or []
                         )
                     }
-                except Exception as exc:
+                except Exception:
                     logger.exception("Could not load PMT comments")
-                    self._write_json(503, {"ok": False, "error": "comments_storage_unavailable", "detail": str(exc)[:300]})
+                    self._write_json(503, {"ok": False, "error": "comments_storage_unavailable"})
                     return
                 self._write_json(200, {"ok": True, "comments": comments})
                 return
@@ -13366,9 +13366,9 @@ def start_health_server() -> None:
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
                 self._write_json(400, {"ok": False})
                 return
-            except Exception as exc:
+            except Exception:
                 logger.exception("Could not save PMT comment")
-                self._write_json(503, {"ok": False, "error": "comments_storage_unavailable", "detail": str(exc)[:300]})
+                self._write_json(503, {"ok": False, "error": "comments_storage_unavailable"})
                 return
             self._write_json(200, {"ok": True})
 
