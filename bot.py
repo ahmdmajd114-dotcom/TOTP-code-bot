@@ -25,6 +25,7 @@ import asyncio
 import logging
 import json
 from html import escape
+from payment_link_logic import find_current_paid_delivery_row
 from types import SimpleNamespace
 import pyotp
 import httpx
@@ -2755,43 +2756,27 @@ def get_latest_customer_payment(chat_id: int) -> tuple[int, list[str]] | None:
     return None
 
 
-def has_current_chatgpt_delivery_payment(chat_id: int) -> bool:
-    """هل سطر تسليم ChatGPT الحالي مدفوع فعلاً؟
-
-    الربط يكمّل أحدث سطر ChatGPT خلال أسبوع أو ينشئ سطراً جديداً فارغاً.
-    لذلك نفحص أحدث سطر نفسه، لا أي دفعة قديمة للزبون؛ الاشتراك القديم
-    الفعّال لا يعني أن التسليم الجديد مدفوع.
-    """
+def get_current_chatgpt_delivery_payment(chat_id: int) -> tuple[int, list[str]] | None:
+    """يرجع دفعة تسليم ChatGPT الحديثة قبل ربط الحساب، إن وجدت."""
     sheet = get_google_sheet()
     if sheet is None:
-        return False
+        return None
     try:
         rows = sheet.get_all_values()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=CHATGPT_ROW_MATCH_WINDOW_DAYS)
-        for row in reversed(rows[1:]):
-            if len(row) < SHEET_COL_CHAT_ID:
-                continue
-            if row[SHEET_COL_CHAT_ID - 1].strip() != str(chat_id):
-                continue
-            product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
-            if not is_chatgpt_product_name(product):
-                continue
-            try:
-                row_date = datetime.strptime(
-                    row[SHEET_COL_DATE - 1].strip(), "%Y-%m-%d %H:%M"
-                ).replace(tzinfo=timezone.utc)
-            except (ValueError, IndexError):
-                return False
-            if row_date < cutoff:
-                return False
-            total = parse_sheet_amount(
-                row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None
-            )
-            payments = row[SHEET_COL_PAYMENTS - 1].strip() if len(row) >= SHEET_COL_PAYMENTS else ""
-            return total > 0 and bool(payments) and payments != "ملغاة"
+        return find_current_paid_delivery_row(
+            rows,
+            chat_id,
+            is_chatgpt_product_name,
+            max_age_days=CHATGPT_ROW_MATCH_WINDOW_DAYS,
+        )
     except Exception:
         logger.exception("Failed to inspect current ChatGPT delivery payment for %s", chat_id)
-    return False
+    return None
+
+
+def has_current_chatgpt_delivery_payment(chat_id: int) -> bool:
+    """هل سطر تسليم ChatGPT الحالي مدفوع فعلاً؟"""
+    return get_current_chatgpt_delivery_payment(chat_id) is not None
 
 
 def parse_payment_vault_amounts(payments_text: str) -> dict[str, int]:
@@ -7716,20 +7701,24 @@ def has_previous_chatgpt_subscription_for_delivery_choice(chat_id: int) -> bool:
         return True
 
 
-def recover_paid_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
+def recover_paid_chatgpt_subscription_on_delivery(
+    chat_id: int, *, payment_total: int | None = None,
+) -> dict | None:
     """يعيد إنشاء تنبيه باقة فات حفظه بعد دفعة ChatGPT ناجحة.
 
     لا نخمن الباقة: نسترجعها فقط حين يطابق مجموع الدفعة باقة ChatGPT فعالة
     واحدة في الكاتالوج. الاستدعاء يحصل بعد /link، لذلك يبدأ العد من التسليم.
     """
-    payment = get_latest_customer_payment(chat_id)
-    if payment is None:
-        return None
-    _row_number, row = payment
-    product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
-    if not is_chatgpt_product_name(product):
-        return None
-    total = parse_sheet_amount(row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None)
+    total = int(payment_total or 0)
+    if total <= 0:
+        payment = get_latest_customer_payment(chat_id)
+        if payment is None:
+            return None
+        _row_number, row = payment
+        product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
+        if not is_chatgpt_product_name(product):
+            return None
+        total = parse_sheet_amount(row[SHEET_COL_TOTAL - 1] if len(row) >= SHEET_COL_TOTAL else None)
     if total <= 0:
         return None
 
@@ -8318,7 +8307,19 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # نلتقط وجود الدفعة قبل أن يكتب /link الحساب في Google Sheet.
         # كتابة الحساب قد تكمل أو تنشئ سطراً جديداً، فلا يصح أن نفحص
         # الدفعة بعدها ونعتبر السطر الجديد الفارغ دليلاً على وجود دين.
-        delivery_payment_recorded = has_current_chatgpt_delivery_payment(chat_id)
+        delivery_payment = get_current_chatgpt_delivery_payment(chat_id)
+        delivery_payment_recorded = delivery_payment is not None
+        delivery_payment_total = (
+            parse_sheet_amount(delivery_payment[1][SHEET_COL_TOTAL - 1])
+            if delivery_payment else 0
+        )
+        logger.info(
+            "ChatGPT /link payment match chat_id=%s matched=%s row=%s total=%s",
+            chat_id,
+            delivery_payment_recorded,
+            delivery_payment[0] if delivery_payment else None,
+            delivery_payment_total,
+        )
 
         # نحتفظ بالحساب السابق قبل أن يحدث /link الحساب الأساسي. السؤال
         # يظهر فقط لمن لديه اشتراك ChatGPT فعّال وحساب مختلف فعلاً.
@@ -8378,6 +8379,8 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "previous_account_id": str(old_account_id) if old_account_id else None,
             "new_account_id": str(account_id),
             "delivery_payment_recorded": delivery_payment_recorded,
+            "delivery_payment_row_number": delivery_payment[0] if delivery_payment else None,
+            "delivery_payment_total": delivery_payment_total,
         }
         previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
         if previous_subscription:
@@ -8394,7 +8397,9 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             # تسليم الحساب، من دون أي سؤال إضافي.
             activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
             if activated is None:
-                activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
+                activated = recover_paid_chatgpt_subscription_on_delivery(
+                    chat_id, payment_total=delivery_payment_total,
+                )
             if activated:
                 scheduled = await schedule_subscription_feedback(activated)
                 invite_scheduled = schedule_continuity_invite(
@@ -9482,7 +9487,10 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         # زبون بلا حساب سابق: نفعّل الدفعة مباشرة عند التسليم الفعلي.
         activated = activate_pending_chatgpt_subscription_on_delivery(customer_chat_id)
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(customer_chat_id)
+            activated = recover_paid_chatgpt_subscription_on_delivery(
+                customer_chat_id,
+                payment_total=state.get("delivery_payment_total"),
+            )
         if activated is None:
             payment_recorded = bool(state.get("delivery_payment_recorded"))
             context.user_data.pop("pending_link_delivery", None)
@@ -9628,7 +9636,10 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
     if state.get("activate_subscription_after_choice"):
         activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(chat_id)
+            activated = recover_paid_chatgpt_subscription_on_delivery(
+                chat_id,
+                payment_total=state.get("delivery_payment_total"),
+            )
         if activated is None:
             # لا نعتبر الاشتراك القديم دليلاً على دفع التسليم الجديد.
             # سطر التسليم الحالي في الشيت هو الفيصل: إن كان مدفوعاً نطلب
