@@ -13264,6 +13264,10 @@ def start_health_server() -> None:
             if path in {"/", "/catalog", "/terms"}:
                 body = build_public_catalog_html().encode("utf-8")
                 content_type = "text/html; charset=utf-8"
+            elif path in {"/propmt", "/prompt"}:
+                from prompt_page import build_prompt_page_html
+                body = build_prompt_page_html().encode("utf-8")
+                content_type = "text/html; charset=utf-8"
             elif path == "/health":
                 body = b"OK"
                 content_type = "text/plain; charset=utf-8"
