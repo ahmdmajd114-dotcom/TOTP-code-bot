@@ -3827,8 +3827,11 @@ CHATGPT_ROW_MATCH_WINDOW_DAYS = 7
 
 def is_chatgpt_product_name(product_name: str | None) -> bool:
     """اسم ChatGPT في الكاتالوج الجديد أو الاسم الإرثي في الشيت."""
-    normalized = str(product_name or "").strip().lower()
-    return normalized in {"chatgpt", CHATGPT_PRODUCT_NAME}
+    normalized = " ".join(normalize_style_text(str(product_name or "")))
+    return normalized in {
+        "chatgpt", "chat gpt", "جات", "چات", "شات", "تشات",
+        "جي بي تي", "شات جي بي تي", "چات جي بي تي", "شات جيبيتي",
+    }
 
 
 def is_chatgpt_payment_state(state: dict) -> bool:
@@ -7678,7 +7681,9 @@ def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
             supabase.table("subscription_reminders")
             .select("product_name, plan_name")
             .eq("customer_chat_id", chat_id)
-            .in_("status", ["active", "pending_delivery"])
+            # الاشتراك القديم الفعّال ليس دليلاً على أن تسليم الحساب
+            # الجديد مدفوع. فقط دفعة تنتظر التسليم تمنع سؤال الدين.
+            .eq("status", "pending_delivery")
             .limit(20)
             .execute().data or []
         )
@@ -7687,14 +7692,9 @@ def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
     except Exception:
         logger.exception("Failed to check recorded subscription for account link %s", chat_id)
 
-    # شبكة أمان للدفعات التي حفظت في الشيت لكن لم يُنشأ لها تنبيه بسبب
-    # إعداد قاعدة بيانات قديم. نتحقق من أن السطر نفسه يخص ChatGPT فقط.
-    payment = get_latest_customer_payment(chat_id)
-    if payment is None:
-        return False
-    _row_number, row = payment
-    product = row[SHEET_COL_PRODUCT - 1] if len(row) >= SHEET_COL_PRODUCT else ""
-    return is_chatgpt_product_name(product)
+    # شبكة أمان للدفعات التي حفظت في الشيت لكن لم يُنشأ لها تنبيه. يجب أن
+    # تكون دفعة تسليم حديثة، لا أي دفعة قديمة للزبون.
+    return has_current_chatgpt_delivery_payment(chat_id)
 
 
 def has_previous_chatgpt_subscription_for_delivery_choice(chat_id: int) -> bool:
@@ -8315,6 +8315,11 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         account_id = acc_res.data[0]["id"]
         label = acc_res.data[0].get("label") or ""
 
+        # نلتقط وجود الدفعة قبل أن يكتب /link الحساب في Google Sheet.
+        # كتابة الحساب قد تكمل أو تنشئ سطراً جديداً، فلا يصح أن نفحص
+        # الدفعة بعدها ونعتبر السطر الجديد الفارغ دليلاً على وجود دين.
+        delivery_payment_recorded = has_current_chatgpt_delivery_payment(chat_id)
+
         # نحتفظ بالحساب السابق قبل أن يحدث /link الحساب الأساسي. السؤال
         # يظهر فقط لمن لديه اشتراك ChatGPT فعّال وحساب مختلف فعلاً.
         old_link = (supabase.table("totp_links").select("account_id")
@@ -8372,6 +8377,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "business_connection_id": bm.business_connection_id if bm is not None else get_customer_business_connection_id(chat_id),
             "previous_account_id": str(old_account_id) if old_account_id else None,
             "new_account_id": str(account_id),
+            "delivery_payment_recorded": delivery_payment_recorded,
         }
         previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
         if previous_subscription:
@@ -8405,7 +8411,8 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                           f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"),
                 )
             else:
-                if has_recorded_paid_subscription_for_link(chat_id):
+                if (delivery_payment_recorded
+                        or has_recorded_paid_subscription_for_link(chat_id)):
                     # الدفعة موجودة فعلاً، لكن لم نستطع استرجاع الباقة
                     # تلقائياً (مثل الدفع الزائد). لا نسأل عن دين.
                     context.user_data["pending_link_debt"] = {
@@ -9477,10 +9484,22 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         if activated is None:
             activated = recover_paid_chatgpt_subscription_on_delivery(customer_chat_id)
         if activated is None:
-            await query.edit_message_text(
-                "⚠️ ما لكيت دفعة ChatGPT غير مفعلة لهذا الزبون. "
-                "سجّل الدفع أولاً، أو اختَر «تعويض» إذا هي مدة تعويض."
-            )
+            payment_recorded = bool(state.get("delivery_payment_recorded"))
+            context.user_data.pop("pending_link_delivery", None)
+            context.user_data["pending_link_debt"] = {
+                **state, "is_debt": not payment_recorded,
+            }
+            if payment_recorded:
+                await query.edit_message_text(
+                    "✅ الدفعة مسجلة، لكن تعذر تحديد الباقة تلقائياً.\n"
+                    "اختَر باقة ChatGPT التي دفعها الزبون:",
+                    reply_markup=build_link_debt_plan_keyboard(customer_chat_id),
+                )
+            else:
+                await query.edit_message_text(
+                    "⚠️ ماكو دفعة جديدة مسجلة لهذا التسليم.\nهل هذا الزبون دين؟",
+                    reply_markup=build_link_debt_keyboard(customer_chat_id),
+                )
             return
         scheduled = await schedule_subscription_feedback(activated)
         invite_scheduled = schedule_continuity_invite(
@@ -9617,7 +9636,10 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
             relationship_state = {
                 **state,
                 "customer_chat_id": chat_id,
-                "is_debt": not has_current_chatgpt_delivery_payment(chat_id),
+                "is_debt": not (
+                    state.get("delivery_payment_recorded")
+                    or has_current_chatgpt_delivery_payment(chat_id)
+                ),
             }
             context.user_data["pending_link_debt"] = relationship_state
             if relationship_state["is_debt"]:
