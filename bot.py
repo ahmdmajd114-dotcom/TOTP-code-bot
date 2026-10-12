@@ -3812,7 +3812,10 @@ CHATGPT_ROW_MATCH_WINDOW_DAYS = 7
 
 def is_chatgpt_product_name(product_name: str | None) -> bool:
     """اسم ChatGPT في الكاتالوج الجديد أو الاسم الإرثي في الشيت."""
-    normalized = " ".join(normalize_style_text(str(product_name or "")))
+    normalized = str(product_name or "").strip().casefold()
+    normalized = re.sub(r"[أإآٱ]", "ا", normalized)
+    normalized = normalized.replace("ى", "ي").replace("ة", "ه")
+    normalized = re.sub(r"[^\w\u0600-\u06ff]+", " ", normalized).strip()
     return normalized in {
         "chatgpt", "chat gpt", "جات", "چات", "شات", "تشات",
         "جي بي تي", "شات جي بي تي", "چات جي بي تي", "شات جيبيتي",
@@ -3988,8 +3991,7 @@ def save_subscription_reminder(
         return False
 
     start = started_at or datetime.now(timezone.utc)
-    try:
-        supabase.table("subscription_reminders").insert({
+    payload = {
             "customer_chat_id": chat_id,
             "business_connection_id": state.get("business_connection_id"),
             "customer_name": state["customer_name"],
@@ -4002,10 +4004,29 @@ def save_subscription_reminder(
             "is_debt": bool(state.get("is_debt", False)), "status": status,
             "started_at": start.isoformat(),
             "expires_at": (start + timedelta(days=duration_days)).isoformat(),
-        }).execute()
+        }
+    try:
+        supabase.table("subscription_reminders").insert(payload).execute()
         return True
     except Exception:
-        logger.exception("Failed to save subscription reminder")
+        logger.exception("Failed to save subscription reminder with status=%s", status)
+        if status != "pending_delivery":
+            return False
+
+    # بعض قواعد الإنتاج القديمة ما زال قيد status فيها لا يقبل
+    # pending_delivery. نحفظ الحالة بشكل متوافق داخل status المسموح
+    # ونميزها بـ feedback_status؛ عند /link تتحول فوراً إلى active.
+    legacy_payload = {
+        **payload,
+        "status": "cancelled",
+        "feedback_status": "pending_delivery",
+    }
+    try:
+        supabase.table("subscription_reminders").insert(legacy_payload).execute()
+        logger.warning("Saved pending delivery using legacy-compatible marker for chat %s", chat_id)
+        return True
+    except Exception:
+        logger.exception("Failed to save legacy-compatible pending delivery")
         return False
 
 
@@ -4175,15 +4196,18 @@ def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | No
     try:
         rows = (
             supabase.table("subscription_reminders")
-            .select("id, product_name, duration_days, feedback_only")
+            .select("id, product_name, duration_days, feedback_only, status, feedback_status")
             .eq("customer_chat_id", chat_id)
-            .eq("status", "pending_delivery")
+            .in_("status", ["pending_delivery", "cancelled"])
             .order("created_at", desc=True)
             .limit(10)
             .execute().data or []
         )
         reminder = next(
-            (row for row in rows if is_chatgpt_product_name(row.get("product_name"))),
+            (row for row in rows
+             if is_chatgpt_product_name(row.get("product_name"))
+             and (row.get("status") == "pending_delivery"
+                  or row.get("feedback_status") == "pending_delivery")),
             None,
         )
         if reminder is None:
@@ -4196,6 +4220,7 @@ def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | No
         started_at = datetime.now(timezone.utc)
         supabase.table("subscription_reminders").update({
             "status": "active",
+            "feedback_status": "none",
             "started_at": started_at.isoformat(),
             "expires_at": (started_at + timedelta(days=duration_days)).isoformat(),
         }).eq("id", reminder["id"]).execute()
@@ -7664,15 +7689,18 @@ def has_recorded_paid_subscription_for_link(chat_id: int) -> bool:
     try:
         rows = (
             supabase.table("subscription_reminders")
-            .select("product_name, plan_name")
+            .select("product_name, plan_name, status, feedback_status")
             .eq("customer_chat_id", chat_id)
-            # الاشتراك القديم الفعّال ليس دليلاً على أن تسليم الحساب
-            # الجديد مدفوع. فقط دفعة تنتظر التسليم تمنع سؤال الدين.
-            .eq("status", "pending_delivery")
+            .in_("status", ["pending_delivery", "cancelled"])
             .limit(20)
             .execute().data or []
         )
-        if any(is_chatgpt_product_name(row.get("product_name")) for row in rows):
+        if any(
+            is_chatgpt_product_name(row.get("product_name"))
+            and (row.get("status") == "pending_delivery"
+                 or row.get("feedback_status") == "pending_delivery")
+            for row in rows
+        ):
             return True
     except Exception:
         logger.exception("Failed to check recorded subscription for account link %s", chat_id)
@@ -7687,13 +7715,17 @@ def has_previous_chatgpt_subscription_for_delivery_choice(chat_id: int) -> bool:
     try:
         rows = (
             supabase.table("subscription_reminders")
-            .select("product_name")
+            .select("product_name, status, feedback_status")
             .eq("customer_chat_id", chat_id)
-            .neq("status", "pending_delivery")
             .limit(50)
             .execute().data or []
         )
-        return any(is_chatgpt_product_name(row.get("product_name")) for row in rows)
+        return any(
+            is_chatgpt_product_name(row.get("product_name"))
+            and row.get("status") != "pending_delivery"
+            and row.get("feedback_status") != "pending_delivery"
+            for row in rows
+        )
     except Exception:
         logger.exception("Failed to check previous ChatGPT subscriptions for %s", chat_id)
         # لا نُخفي سؤال التمييز عند تعذر القراءة؛ هذا أكثر أماناً من البدء
