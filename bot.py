@@ -8066,7 +8066,7 @@ async def add_private_account(
     secret: str,
     label: str | None = None,
 ) -> None:
-    """ينشئ حساباً خاصاً ويربطه بزبون محدد."""
+    """ينشئ حساباً خاصاً ويطبّق عليه فلو الدفع/الدين نفسه مال /link."""
     try:
         # Secret الـTOTP عادة Base32 (حروف وأرقام)، وليس كوداً من 6 أرقام.
         normalized_secret = normalize_totp_secret(secret)
@@ -8079,10 +8079,27 @@ async def add_private_account(
         }).execute().data
         if not account:
             raise RuntimeError("لم تُرجع قاعدة البيانات الحساب المضاف")
+
+        account_id = str(account[0]["id"])
+        # إثبات الدفع لازم ينقرأ قبل كتابة الحساب في الشيت؛ نفس قاعدة /link.
+        delivery_payment = get_current_chatgpt_delivery_payment(target_chat_id)
+        delivery_payment_recorded = delivery_payment is not None
+        delivery_payment_total = (
+            parse_sheet_amount(delivery_payment[1][SHEET_COL_TOTAL - 1])
+            if delivery_payment else 0
+        )
+        old_links = (
+            supabase.table("totp_links").select("account_id")
+            .eq("chat_id", target_chat_id).limit(1).execute().data or []
+        )
+        old_account_id = old_links[0].get("account_id") if old_links else None
+        if old_account_id:
+            remember_customer_totp_account(target_chat_id, str(old_account_id), primary=True)
         supabase.table("totp_links").upsert({
             "chat_id": target_chat_id,
-            "account_id": account[0]["id"],
+            "account_id": account_id,
         }).execute()
+        remember_customer_totp_account(target_chat_id, account_id, primary=True)
 
         state = get_interactive_sale_state(target_chat_id)
         if state.get("workflow_state") == "private_activation_pending":
@@ -8097,46 +8114,96 @@ async def add_private_account(
             create_if_missing=False,
         )
 
-        # الحساب الخاص هو أيضاً تسليم فعلي لـ ChatGPT؛ لذلك يبدأ عدّ
-        # الباقة المعلقة من لحظة /addprivate تماماً مثل /link. وإذا كانت
-        # الدفعة محفوظة قبل إضافة حقل التنبيه نحاول استرجاع باقتها بأمان.
+        customer_name, customer_username = get_telegram_customer_identity(target_chat_id)
+        delivery_state = {
+            "customer_chat_id": target_chat_id,
+            "customer_name": customer_name,
+            "customer_username": customer_username,
+            "account_label": f"{account_name} (خاص)",
+            "business_connection_id": get_customer_business_connection_id(target_chat_id),
+            "previous_account_id": str(old_account_id) if old_account_id else None,
+            "new_account_id": account_id,
+            "delivery_payment_recorded": delivery_payment_recorded,
+            "delivery_payment_row_number": delivery_payment[0] if delivery_payment else None,
+            "delivery_payment_total": delivery_payment_total,
+        }
+
+        base_text = (
+            "✅ تمت إضافة الحساب الخاص وربطه بالزبون.\n"
+            f"chat_id: {target_chat_id}\n"
+            f"اسم الحساب: {account_name} (خاص)\n"
+            + ("✅ تم تسجيله في Google Sheet."
+               if sheet_account_saved else "⚠️ تعذر تسجيله في Google Sheet.")
+        )
+
+        # إذا عنده اشتراك سابق، نستخدم نفس تمييز /link: جديد، تعويض، دين.
+        if has_previous_chatgpt_subscription_for_delivery_choice(target_chat_id):
+            context.user_data["pending_link_delivery"] = delivery_state
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=base_text + "\nعنده اشتراك سابق؛ حدد نوع هذا التسليم:",
+                reply_markup=build_link_delivery_keyboard(target_chat_id),
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=NOTIFICATIONS_GROUP_ID,
+                    message_thread_id=TOPIC_CHATGPT_ACCOUNTS,
+                    text=("➕ حساب خاص جديد مربوط تلقائياً\n"
+                          f"الزبون: {target_chat_id}\n"
+                          f"اسم الحساب: {account_name} (خاص)"),
+                )
+            except Exception:
+                logger.exception("Failed to notify private account link")
+            return
+
+        # الزبون الجديد المدفوع يبدأ عدّه من لحظة /addprivate.
         activated = activate_pending_chatgpt_subscription_on_delivery(target_chat_id)
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(target_chat_id)
+            activated = recover_paid_chatgpt_subscription_on_delivery(
+                target_chat_id, payment_total=delivery_payment_total,
+            )
 
-        schedule_lines: list[str] = []
         if activated:
             scheduled = await schedule_subscription_feedback(activated)
-            connection_id = get_customer_business_connection_id(target_chat_id)
-            invite_scheduled = schedule_continuity_invite(target_chat_id, connection_id)
+            invite_scheduled = schedule_continuity_invite(
+                target_chat_id, delivery_state.get("business_connection_id"),
+            )
             end = datetime.now(timezone(timedelta(hours=3))) + timedelta(
                 days=activated["duration_days"]
             )
-            schedule_lines.extend([
-                f"✅ تم تفعيل الباقة لمدة {activated['duration_days']} يوم.",
-                f"ينتهي: {end.strftime('%Y-%m-%d %H:%M')}",
+            schedule_text = (
                 "✅ تم حجز رسالة المتابعة."
-                if scheduled else
-                "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة.",
-            ])
+                if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
+            )
             if invite_scheduled:
-                schedule_lines.append("🎁 تم حجز دعوة بوت المكافآت.")
-        elif has_recorded_paid_subscription_for_link(target_chat_id):
-            schedule_lines.append(
-                "⚠️ الدفعة موجودة، لكن ما كدرت أحدد باقة واحدة مطابقة لإنشاء المدة."
+                schedule_text += "\n🎁 تم حجز دعوة بوت المكافآت."
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(base_text
+                      + f"\n✅ تم تفعيل الباقة لمدة {activated['duration_days']} يوم."
+                      + f"\nينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
+                      + "\nمن هسه إذا يطلب كود، ينرسل له تلقائياً."),
+            )
+        elif delivery_payment_recorded or has_recorded_paid_subscription_for_link(target_chat_id):
+            context.user_data["pending_link_debt"] = {
+                **delivery_state, "is_debt": False,
+            }
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=(base_text
+                      + "\n✅ الدفعة مسجلة، لكن ما كدرت أحدد باقة واحدة من المبلغ."
+                      + "\nاختَر الباقة التي اشتراها الزبون:"),
+                reply_markup=build_link_debt_plan_keyboard(target_chat_id),
             )
         else:
-            schedule_lines.append("ℹ️ ماكو دفعة ChatGPT مسجلة لتفعيل مدتها.")
-
-        await context.bot.send_message(
-            chat_id=OWNER_USER_ID,
-            text=(f"✅ تمت إضافة الحساب الخاص وربطه بالزبون.\n"
-                  f"chat_id: {target_chat_id}\n"
-                  f"اسم الحساب: {account_name} (خاص)\n"
-                  + ("✅ تم تسجيله في Google Sheet.\n" if sheet_account_saved else "⚠️ تعذر تسجيله في Google Sheet.\n")
-                  + "\n".join(schedule_lines)
-                  + "\nمن هسه إذا يطلب كود، ينرسل له تلقائياً."),
-        )
+            context.user_data["pending_link_debt"] = {
+                **delivery_state, "is_debt": True,
+            }
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text=base_text + "\nماكو دفعة ChatGPT جديدة مسجلة. هل هذا الزبون دين؟",
+                reply_markup=build_link_debt_keyboard(target_chat_id),
+            )
         try:
             await context.bot.send_message(
                 chat_id=NOTIFICATIONS_GROUP_ID,
