@@ -1273,6 +1273,7 @@ BTN_PAYMENT_METHODS = "💳 طرق الدفع"
 BTN_CHATGPT_VAULT = "🤖 خزينة حسابات ChatGPT"
 BTN_SUBSCRIPTION_REMINDER = "🔔 إضافة تنبيه اشتراك"
 BTN_PERSONAL_REMINDER = "⏰ تذكير شخصي"
+BTN_SUBSCRIPTION_FOLLOWUPS = "📋 متابعات الاشتراكات"
 BTN_INSTAGRAM_SALE = "📲 تسجيل بيع إنستغرام"
 BTN_INSTAGRAM_ADMIN = "📲 إدارة عمولات الإنستغرام"
 BTN_CAMPAIGNS = "📣 إرسال رسالة للعملاء"
@@ -1307,7 +1308,10 @@ def _submenu_keyboard(rows: list[list[str]]) -> ReplyKeyboardMarkup:
 
 REPORTS_REPLY_KEYBOARD = _submenu_keyboard([[BTN_INCOME, BTN_STATS], [BTN_CONTINUITY_STATS]])
 FINANCE_REPLY_KEYBOARD = _submenu_keyboard([[BTN_EXPENSE, BTN_ADD_ACCOUNT], [BTN_PAYMENT_METHODS, BTN_DEBT]])
-FOLLOW_UP_REPLY_KEYBOARD = _submenu_keyboard([[BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER]])
+FOLLOW_UP_REPLY_KEYBOARD = _submenu_keyboard([
+    [BTN_SUBSCRIPTION_FOLLOWUPS],
+    [BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER],
+])
 CUSTOMERS_REPLY_KEYBOARD = _submenu_keyboard([[BTN_CAMPAIGNS], [BTN_INSTAGRAM_ADMIN]])
 ADMIN_REPLY_KEYBOARD = _submenu_keyboard([[BTN_CHATGPT_VAULT], [BTN_AUTO_REPLY]])
 
@@ -7124,13 +7128,12 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
 
 
 async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يرسل رسالة Feedback للزبون مرة واحدة عند انتهاء أي اشتراك."""
+    """يسجل انتهاء الاشتراك؛ رسالة الزبون ترسلها جدولة Telegram وحدها."""
     now = datetime.now(timezone.utc)
-    await retry_expired_reminders_missing_chat(context, now)
     try:
         reminders = (
             supabase.table("subscription_reminders")
-            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only, source, instagram_sale_id, instagram_account")
+            .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only, source, instagram_sale_id, instagram_account, scheduled_message_id, scheduled_message_status")
             .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
         )
     except Exception:
@@ -7156,34 +7159,16 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
                 unlinked = True
 
-            feedback_text = (
-                "السلام عليكم.\n\n"
-                "إن شاء الله كانت تجربتك ويانا ممتعة ومفيدة.\n\n"
-                "حابين نعرف شلون كانت تجربتك؟ وإذا واجهتك أي مشكلة أو قصّرنا وياك بشي، خبرنا."
+            # لا نرسل من Business هنا إطلاقاً؛ هذا كان سبب الرسالة الثانية.
+            # عند وجود scheduled_message_id نفترض أن Telegram نفذ الجدولة،
+            # ونبقي السجل مفتوحاً لفهم رد الزبون. وإلا يظهر ضمن المتابعة
+            # اليدوية حتى لا يضيع لو تعطلت الجلسة أو حُذف حساب الدعم.
+            scheduled = bool(reminder.get("scheduled_message_id")) and (
+                reminder.get("scheduled_message_status") == "scheduled"
             )
-
-            chat_id, connection_id = resolve_reminder_delivery_target(reminder)
-            customer_send_error = False
-            delivery_missing_chat = chat_id is None
-            reply_markup = None
-            if chat_id is not None and connection_id:
-                try:
-                    await send_business_message_with_current_fallback(
-                        context, chat_id, feedback_text, connection_id,
-                    )
-                except Exception:
-                    customer_send_error = True
-                    logger.exception("Failed to send expiry feedback to customer %s", chat_id)
-            elif chat_id is not None:
-                customer_send_error = True
-                logger.warning("No Business connection available for expiry feedback to %s", chat_id)
             supabase.table("subscription_reminders").update({
-                # لا ننتظر رداً ما لم تصل رسالة المتابعة فعلاً.
-                "feedback_status": (
-                    "awaiting_reply" if chat_id is not None and not customer_send_error
-                    else "delivery_missing_chat" if delivery_missing_chat else "delivery_failed"
-                ),
-                "feedback_requested_at": now.isoformat() if chat_id is not None and not customer_send_error else None,
+                "feedback_status": "awaiting_reply" if scheduled else "needs_owner",
+                "feedback_requested_at": now.isoformat() if scheduled else None,
             }).eq("id", reminder["id"]).execute()
             source_text = "\n📲 المصدر: Instagram" if reminder.get("source") == "instagram" else ""
             sale_text = f"\nرقم العملية: {reminder.get('instagram_sale_id')}" if reminder.get("instagram_sale_id") else ""
@@ -7197,9 +7182,9 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
                 text=(owner_event
                       + source_text + sale_text + "\n"
                       + ("✅ تم فك ربطه من الحساب.\n" if unlinked else "")
-                      + ("⚠️ فشل إرسال رسالة المتابعة للزبون." if customer_send_error
-                         else "✅ أُرسلت رسالة المتابعة وننتظر رده." if chat_id is not None
-                         else "⚠️ ماكو chat_id له في Telegram؛ لا يمكن مراسلته بيوزر إنستغرام وحده.")),
+                      + ("📅 رسالة المتابعة كانت مجدولة في Telegram؛ النظام سجل الانتهاء فقط ولم يرسل رسالة ثانية."
+                         if scheduled else
+                         "⚠️ ماكو رسالة Telegram مجدولة مؤكدة؛ أُضيف الزبون إلى قائمة المتابعة اليدوية.")),
             )
         except Exception:
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
@@ -7255,6 +7240,138 @@ async def retry_expired_reminders_missing_chat(
                 }).eq("id", reminder["id"]).execute()
             except Exception:
                 logger.exception("Failed to mark reminder %s as failed", reminder.get("id"))
+
+
+def _subscription_followup_label(reminder: dict, now: datetime) -> str:
+    customer = reminder.get("customer_name") or reminder.get("customer_username") or reminder.get("customer_chat_id") or "زبون"
+    product = reminder.get("product_name") or "اشتراك"
+    if reminder.get("status") == "expired":
+        timing = "منتهي"
+    else:
+        try:
+            expires_at = datetime.fromisoformat(str(reminder.get("expires_at")).replace("Z", "+00:00"))
+            days = max(0, (expires_at - now).days)
+            timing = f"باقي {days} يوم"
+        except Exception:
+            timing = "قريب"
+    return f"{customer} — {product} ({timing})"[:60]
+
+
+def build_subscription_followups_keyboard(reminders: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        _subscription_followup_label(reminder, datetime.now(timezone.utc)),
+        callback_data=f"subfollow_open_{reminder['id']}",
+    )] for reminder in reminders]
+    rows.append([InlineKeyboardButton("🔄 تحديث", callback_data="subfollow_list")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_subscription_followups(limit: int = 30) -> list[dict]:
+    """المنتهية غير المغلقة ثم الاشتراكات التي تنتهي خلال 7 أيام."""
+    now = datetime.now(timezone.utc)
+    soon = now + timedelta(days=7)
+    fields = (
+        "id, customer_chat_id, customer_name, customer_username, product_name, "
+        "plan_name, plan_duration, expires_at, status, feedback_status, "
+        "scheduled_message_id, scheduled_message_status"
+    )
+    try:
+        expired = (
+            supabase.table("subscription_reminders").select(fields)
+            .eq("status", "expired")
+            .in_("feedback_status", ["awaiting_reply", "needs_owner", "snoozed", "delivery_failed", "delivery_missing_chat"])
+            .order("expires_at", desc=True).limit(limit).execute().data or []
+        )
+        active = (
+            supabase.table("subscription_reminders").select(fields)
+            .eq("status", "active").gte("expires_at", now.isoformat())
+            .lte("expires_at", soon.isoformat())
+            .order("expires_at").limit(limit).execute().data or []
+        )
+        return (expired + active)[:limit]
+    except Exception:
+        logger.exception("Failed to load subscription followups")
+        return []
+
+
+async def show_subscription_followups(message) -> None:
+    reminders = get_subscription_followups()
+    if not reminders:
+        await message.reply_text("📋 ماكو اشتراكات منتهية تحتاج متابعة ولا اشتراكات تنتهي خلال 7 أيام.")
+        return
+    await message.reply_text(
+        "📋 متابعات الاشتراكات\n\nالمنتهية التي تحتاج متابعة، وبعدها الاشتراكات القريبة:",
+        reply_markup=build_subscription_followups_keyboard(reminders),
+    )
+
+
+async def handle_subscription_followup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.from_user.id != OWNER_USER_ID:
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "subfollow_list":
+        reminders = get_subscription_followups()
+        text = ("📋 متابعات الاشتراكات:" if reminders else
+                "📋 ماكو اشتراكات منتهية تحتاج متابعة ولا اشتراكات تنتهي خلال 7 أيام.")
+        await query.edit_message_text(
+            text,
+            reply_markup=build_subscription_followups_keyboard(reminders) if reminders else None,
+        )
+        return
+    match = re.fullmatch(r"subfollow_(open|done|snooze|data)_(\d+)", data)
+    if not match:
+        return
+    action, reminder_id_text = match.groups()
+    reminder_id = int(reminder_id_text)
+    rows = (
+        supabase.table("subscription_reminders")
+        .select("id, customer_chat_id, customer_name, customer_username, product_name, plan_name, plan_duration, expires_at, status, feedback_status, scheduled_message_status")
+        .eq("id", reminder_id).limit(1).execute().data or []
+    )
+    if not rows:
+        await query.edit_message_text("⚠️ هذا السجل لم يعد موجوداً.")
+        return
+    reminder = rows[0]
+    customer = reminder.get("customer_name") or "غير معروف"
+    username = reminder.get("customer_username")
+    details = (
+        f"الزبون: {customer}" + (f" (@{username})" if username else "")
+        + f"\nchat_id: {reminder.get('customer_chat_id') or '—'}"
+        + f"\nالمنتج: {reminder.get('product_name') or '—'}"
+        + f"\nالباقة: {reminder.get('plan_name') or reminder.get('plan_duration') or '—'}"
+        + f"\nالانتهاء: {reminder.get('expires_at') or '—'}"
+        + f"\nحالة الجدولة: {reminder.get('scheduled_message_status') or '—'}"
+    )
+    if action == "done":
+        supabase.table("subscription_reminders").update({
+            "feedback_status": "manual_done",
+            "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", reminder_id).execute()
+        await query.edit_message_text("✅ تم إغلاق المتابعة.\n\n" + details)
+        return
+    if action == "snooze":
+        due = datetime.now(timezone.utc) + timedelta(days=1)
+        saved = save_personal_reminder(due, f"متابعة اشتراك:\n{details}")
+        if saved:
+            supabase.table("subscription_reminders").update({"feedback_status": "snoozed"}).eq("id", reminder_id).execute()
+        await query.edit_message_text(
+            ("⏰ تم تأجيل المتابعة ليوم واحد.\n\n" if saved else "⚠️ تعذر حفظ التأجيل.\n\n") + details
+        )
+        return
+    if action == "data":
+        await query.message.reply_text("📋 بيانات الزبون للنسخ:\n\n" + details)
+        return
+    await query.edit_message_text(
+        "📋 تفاصيل المتابعة\n\n" + details,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تمت المتابعة", callback_data=f"subfollow_done_{reminder_id}"),
+             InlineKeyboardButton("⏰ تأجيل يوم", callback_data=f"subfollow_snooze_{reminder_id}")],
+            [InlineKeyboardButton("📋 إرسال البيانات للنسخ", callback_data=f"subfollow_data_{reminder_id}")],
+            [InlineKeyboardButton("◀️ رجوع", callback_data="subfollow_list")],
+        ]),
+    )
 
 
 async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text: str) -> bool:
@@ -10849,7 +10966,8 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
     if text in {
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_EXPENSE, BTN_INCOME,
         BTN_ADD_ACCOUNT, BTN_STATS, BTN_DEBT, BTN_TEACH, BTN_CHATGPT_VAULT,
-        BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
+        BTN_SUBSCRIPTION_REMINDER, BTN_PERSONAL_REMINDER, BTN_SUBSCRIPTION_FOLLOWUPS,
+        BTN_INSTAGRAM_ADMIN, BTN_CAMPAIGNS,
         BTN_CONTINUITY_STATS, BTN_AUTO_REPLY, BTN_REPORTS, BTN_FINANCE,
         BTN_FOLLOW_UP, BTN_CUSTOMERS, BTN_ADMIN, BTN_MAIN_MENU,
     }:
@@ -10875,6 +10993,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
             "اختَر نوع ومدة الاشتراك اللي تريد تضيفه يدوياً:",
             reply_markup=build_manual_subscription_keyboard(),
         )
+        return True
+
+    if text == BTN_SUBSCRIPTION_FOLLOWUPS:
+        await show_subscription_followups(message)
         return True
 
     if text == BTN_PERSONAL_REMINDER:
@@ -13540,6 +13662,7 @@ def main() -> None:
     # زر إضافة تنبيه اشتراك يدوي من لوحة الأونر.
     app.add_handler(CallbackQueryHandler(handle_manual_subscription_callback, pattern=r"^subrem_"))
     app.add_handler(CallbackQueryHandler(handle_personal_reminder_callback, pattern=r"^personal_reminder_ack_"))
+    app.add_handler(CallbackQueryHandler(handle_subscription_followup_callback, pattern=r"^subfollow_"))
 
     # سؤال الدين والباقته بعد ربط زبون بحساب /link.
     app.add_handler(CallbackQueryHandler(handle_link_debt_callback, pattern=r"^link(?:debt|plan|delivery)_"))
