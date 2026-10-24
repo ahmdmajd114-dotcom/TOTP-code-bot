@@ -5164,9 +5164,11 @@ def calculate_income_report() -> str:
         date_str, amount_str = row[0], row[1]
         try:
             row_date = parse_sheet_datetime(date_str).date()
-            amount = int(float(amount_str))
         except (ValueError, IndexError):
             continue  # صف فيه بيانات غير متوقعة — نتجاهله بدل ما نكرش
+        amount = parse_sheet_amount(amount_str)
+        if amount is None:
+            continue
 
         if row_date == today:
             total_today += amount
@@ -5202,7 +5204,11 @@ STATS_TIMEZONE = timezone(timedelta(hours=3))
 
 
 def parse_stats_datetime(value: str) -> datetime:
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+    ):
         try:
             return datetime.strptime(value.strip(), fmt).replace(tzinfo=STATS_TIMEZONE)
         except ValueError:
@@ -5212,7 +5218,13 @@ def parse_stats_datetime(value: str) -> datetime:
 
 def parse_sheet_datetime(value: str) -> datetime:
     """يقرأ أوقات Google Sheet المحفوظة كـ UTC ويحوّلها إلى توقيت بغداد."""
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    # Google Sheets قد يرجّع نفس الخلية بصيغة العرض المحلية (يوم/شهر/سنة)
+    # بدل الصيغة التي كتبناها. دعم الصيغتين يمنع إسقاط صفوف الدخل بصمت.
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+    ):
         try:
             return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc).astimezone(STATS_TIMEZONE)
         except ValueError:
@@ -5395,10 +5407,9 @@ def calculate_totals_summary(period_key: str) -> str:
         if is_debt_payment_row(row):
             continue
         if len(row) >= 2 and row[1].strip():
-            try:
-                total_income += int(float(row[1]))
-            except ValueError:
-                continue
+            amount = parse_sheet_amount(row[1])
+            if amount is not None:
+                total_income += amount
 
     instagram_income = sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
     total_income += instagram_income
@@ -5406,10 +5417,9 @@ def calculate_totals_summary(period_key: str) -> str:
     total_expense = 0
     for row in expense_rows:
         if len(row) >= 2 and row[1].strip():
-            try:
-                total_expense += int(float(row[1]))
-            except ValueError:
-                continue
+            amount = parse_sheet_amount(row[1])
+            if amount is not None:
+                total_expense += amount
 
     net = total_income - total_expense
     label = format_period_label(period_key)
@@ -5492,10 +5502,7 @@ def calculate_product_breakdown(period_key: str) -> str:
         if not product:
             continue
         amount_str = row[1].strip() if len(row) >= 2 else ""
-        try:
-            amount = int(float(amount_str)) if amount_str else 0
-        except ValueError:
-            amount = 0
+        amount = parse_sheet_amount(amount_str) or 0
         if amount <= 0:
             continue
 
