@@ -3837,10 +3837,14 @@ def format_customer_line(customer_name: str, customer_username: str | None) -> s
     return line
 
 
-def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
+def find_completable_chatgpt_row(
+    sheet, chat_id: int, *, missing: str = "any",
+) -> int | None:
     """
     يدور عن آخر سطر ChatGPT بالشيت لنفس chat_id، خلال آخر
-    أسبوع، وفيه خانة مهمة فاضية (مبلغ/طرق الدفع/حسابات جات). يرجع رقم
+    أسبوع، وفيه الخانة المطلوبة فاضية. ``missing=payment`` لا يطابق
+    سطراً مدفوعاً لمجرد أن الحساب فارغ، حتى لا تكتب دفعة جديدة فوق
+    دفعة قديمة. يرجع رقم
     الصف (1-indexed كما تتوقعه gspread) لو لقى، أو None لو لازم سطر جديد.
     """
     try:
@@ -3883,7 +3887,14 @@ def find_completable_chatgpt_row(sheet, chat_id: int) -> int | None:
         if len(row) >= SHEET_COL_PAYMENTS and row[SHEET_COL_PAYMENTS - 1].strip() == "ملغاة":
             continue
 
-        if total_empty or payments_empty or account_empty:
+        if missing == "payment":
+            is_completable = total_empty or payments_empty
+        elif missing == "account":
+            is_completable = account_empty
+        else:
+            is_completable = total_empty or payments_empty or account_empty
+
+        if is_completable:
             return i + 1  # gspread صفوف 1-indexed
 
     return None
@@ -3914,10 +3925,11 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
     try:
         target_row = None
         if not force_new and is_chatgpt_product_name(product) and chat_id is not None:
-            target_row = find_completable_chatgpt_row(sheet, chat_id)
+            target_row = find_completable_chatgpt_row(sheet, chat_id, missing="payment")
 
         if target_row is not None:
-            # نكمل السطر الناقص — نعبي بس الخانات الفاضية (مبلغ/طرق الدفع)
+            # نسجل وقت استلام الدفع الفعلي، مو وقت ربط الحساب السابق.
+            sheet.update_cell(target_row, SHEET_COL_DATE, date_time_str)
             sheet.update_cell(target_row, SHEET_COL_TOTAL, total)
             sheet.update_cell(target_row, SHEET_COL_PAYMENTS, payments_text)
         else:
@@ -3930,7 +3942,44 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
                 "",  # حسابات جات — تُعبى لاحقاً عن طريق accept/link
                 str(chat_id) if chat_id is not None else "",
             ]
-            sheet.append_row(row, value_input_option="USER_ENTERED")
+            response = sheet.append_row(row, value_input_option="USER_ENTERED")
+            updated_range = str((response or {}).get("updates", {}).get("updatedRange", ""))
+            match = re.search(r"![A-Z]+(\d+):", updated_range)
+            if match:
+                target_row = int(match.group(1))
+
+        # لا نعلن النجاح قبل أن نقرأ السطر ونتأكد أن Google Sheets حفظه.
+        if target_row is None:
+            target_row = len(sheet.get_all_values())
+        saved_row = sheet.row_values(target_row)
+        saved_total = parse_sheet_amount(
+            saved_row[SHEET_COL_TOTAL - 1] if len(saved_row) >= SHEET_COL_TOTAL else None
+        )
+        saved_payments = (
+            saved_row[SHEET_COL_PAYMENTS - 1].strip()
+            if len(saved_row) >= SHEET_COL_PAYMENTS else ""
+        )
+        saved_chat_id = (
+            saved_row[SHEET_COL_CHAT_ID - 1].strip()
+            if len(saved_row) >= SHEET_COL_CHAT_ID else ""
+        )
+        if saved_total != total or saved_payments != payments_text:
+            logger.error(
+                "Payment sheet verification failed row=%s expected_total=%s actual_total=%s",
+                target_row, total, saved_total,
+            )
+            return False
+        if chat_id is not None and saved_chat_id != str(chat_id):
+            logger.error(
+                "Payment sheet chat-id verification failed row=%s expected=%s actual=%s",
+                target_row, chat_id, saved_chat_id,
+            )
+            return False
+        logger.info(
+            "Payment saved and verified worksheet=%s row=%s chat_id=%s total=%s",
+            getattr(sheet, "title", GOOGLE_SHEET_WORKSHEET_NAME),
+            target_row, chat_id, total,
+        )
         return True
     except Exception:
         logger.exception("Failed to append/update payment row in Google Sheet")
@@ -3955,7 +4004,7 @@ def upsert_chatgpt_account(
     customer_line = format_customer_line(customer_name, customer_username)
 
     try:
-        target_row = find_completable_chatgpt_row(sheet, chat_id)
+        target_row = find_completable_chatgpt_row(sheet, chat_id, missing="account")
 
         if target_row is not None:
             sheet.update_cell(target_row, SHEET_COL_CHATGPT_ACCOUNT, account_text)
@@ -12252,6 +12301,37 @@ async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(report)
 
 
+async def cmd_sheet_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يشخّص ملف وتبويب المدفوعات الفعليين وآخر سطر محفوظ."""
+    if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
+        return
+    sheet = get_google_sheet()
+    if sheet is None:
+        await update.message.reply_text(
+            "❌ تعذر الاتصال بـ Google Sheet. راجع سجل Render وملف خدمة Google."
+        )
+        return
+    try:
+        rows = sheet.get_all_values()
+        last_row_number = len(rows)
+        last_row = rows[-1] if len(rows) > 1 else []
+        last_date = last_row[SHEET_COL_DATE - 1] if len(last_row) >= SHEET_COL_DATE else "—"
+        last_total = last_row[SHEET_COL_TOTAL - 1] if len(last_row) >= SHEET_COL_TOTAL else "—"
+        spreadsheet_title = getattr(getattr(sheet, "spreadsheet", None), "title", "—")
+        await update.message.reply_text(
+            "✅ اتصال Google Sheet شغال\n"
+            f"الملف: {spreadsheet_title}\n"
+            f"التبويب: {getattr(sheet, 'title', GOOGLE_SHEET_WORKSHEET_NAME)}\n"
+            f"عدد الصفوف: {last_row_number}\n"
+            f"آخر تاريخ: {last_date}\n"
+            f"آخر مبلغ: {last_total}\n"
+            f"الرابط: https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
+        )
+    except Exception:
+        logger.exception("Failed to inspect Google Sheet status")
+        await update.message.reply_text("❌ الاتصال موجود، لكن فشلت قراءة صفوف المدفوعات.")
+
+
 async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """يعرض رقم الگروب ورقم الـTopic الذي كُتب داخله الأمر.
 
@@ -13722,6 +13802,7 @@ def main() -> None:
     # أمر /income لعرض تقرير الدخل — بمحادثتك الخاصة مع البوت
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
+    app.add_handler(CommandHandler("sheetstatus", cmd_sheet_status))
 
     # تصحيح دفعة حُفظت كعملية جديدة بدل تسديد دين، من دون تكرار الدخل.
     app.add_handler(CommandHandler("fixdebt", cmd_fix_existing_debt_payment))
