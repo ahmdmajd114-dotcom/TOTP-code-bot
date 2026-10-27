@@ -520,6 +520,14 @@ DEBT_COL_PRODUCT = 4
 DEBT_COL_AMOUNT = 5  # المبلغ المتبقي من الدين (يتحدث لأقل عند تسديد جزئي)
 DEBT_COL_STATUS = 6  # "غير مدفوع" أو "مدفوع"
 DEBT_COL_PAID_DATE = 7  # يتحدث بتاريخ آخر تسديد (جزئي أو نهائي)
+DEBT_COL_ID = 8
+DEBT_COL_PRODUCT_ID = 9
+DEBT_COL_PLAN_ID = 10
+DEBT_COL_PLAN_NAME = 11
+DEBT_COL_ORIGINAL_AMOUNT = 12
+DEBT_COL_PAID_TOTAL = 13
+DEBT_COL_UPDATED_AT = 14
+DEBT_OPEN_STATUSES = {"غير مدفوع", "جزئي"}
 
 
 def get_customer_credits_worksheet():
@@ -611,27 +619,54 @@ def get_debts_worksheet():
             _debts_sheet = spreadsheet.worksheet(DEBTS_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
             _debts_sheet = spreadsheet.add_worksheet(
-                title=DEBTS_WORKSHEET_NAME, rows=1000, cols=7
+                title=DEBTS_WORKSHEET_NAME, rows=1000, cols=14
             )
             _debts_sheet.append_row(
-                ["التاريخ", "Chat ID", "الزبون", "المنتج", "المبلغ المتبقي", "الحالة", "تاريخ آخر تسديد"],
+                [
+                    "التاريخ", "Chat ID", "الزبون", "المنتج", "المبلغ المتبقي",
+                    "الحالة", "تاريخ آخر تسديد", "رقم الدين", "معرف المنتج",
+                    "معرف الباقة", "الباقة", "المبلغ الأصلي", "المسدد الكلي", "آخر تحديث",
+                ],
                 value_input_option="USER_ENTERED",
             )
             logger.info(f"Created new debts worksheet: {DEBTS_WORKSHEET_NAME}")
+        if getattr(_debts_sheet, "col_count", 0) < 14:
+            _debts_sheet.resize(
+                rows=max(getattr(_debts_sheet, "row_count", 1000), 1000), cols=14
+            )
+        header = _debts_sheet.row_values(1)
+        if len(header) < 14:
+            _debts_sheet.update("H1:N1", [[
+                "رقم الدين", "معرف المنتج", "معرف الباقة", "الباقة",
+                "المبلغ الأصلي", "المسدد الكلي", "آخر تحديث",
+            ]])
         return _debts_sheet
     except Exception:
         logger.exception("Failed to connect to debts worksheet")
         return None
 
 
-def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int) -> bool:
+def append_debt_row(
+    chat_id: int,
+    customer_line: str,
+    product: str,
+    amount: int,
+    *,
+    product_id: str | None = None,
+    plan_id: str | None = None,
+    plan_name: str | None = None,
+) -> bool:
     """يضيف سطر دين جديد (غير مدفوع، المبلغ المتبقي = المبلغ الكامل). يرجع True لو نجح الحفظ."""
     sheet = get_debts_worksheet()
     if sheet is None:
         return False
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    row = [date_str, str(chat_id), customer_line, product, amount, "غير مدفوع", ""]
+    debt_id = f"DEBT-{uuid.uuid4().hex[:10].upper()}"
+    row = [
+        date_str, str(chat_id), customer_line, product, amount, "غير مدفوع", "",
+        debt_id, product_id or "", plan_id or "", plan_name or "", amount, 0, date_str,
+    ]
 
     try:
         sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -641,6 +676,66 @@ def append_debt_row(chat_id: int, customer_line: str, product: str, amount: int)
         return False
 
 
+def list_open_debts(chat_id: int) -> list[dict]:
+    """يرجع كل ديون الزبون المفتوحة، الأحدث أولاً، مع هوية مستقلة."""
+    sheet = get_debts_worksheet()
+    if sheet is None:
+        return []
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        logger.exception("Failed to list open debts for %s", chat_id)
+        return []
+    debts = []
+    for index, row in enumerate(rows[1:], start=2):
+        if len(row) < DEBT_COL_STATUS:
+            continue
+        if row[DEBT_COL_CHAT_ID - 1].strip() != str(chat_id):
+            continue
+        status = row[DEBT_COL_STATUS - 1].strip()
+        if status not in DEBT_OPEN_STATUSES:
+            continue
+        remaining = parse_sheet_amount(
+            row[DEBT_COL_AMOUNT - 1] if len(row) >= DEBT_COL_AMOUNT else None
+        ) or 0
+        if remaining <= 0:
+            continue
+        original = parse_sheet_amount(
+            row[DEBT_COL_ORIGINAL_AMOUNT - 1]
+            if len(row) >= DEBT_COL_ORIGINAL_AMOUNT else None
+        ) or remaining
+        paid_total = parse_sheet_amount(
+            row[DEBT_COL_PAID_TOTAL - 1]
+            if len(row) >= DEBT_COL_PAID_TOTAL else None
+        ) or max(0, original - remaining)
+        debts.append({
+            "row_number": index,
+            "debt_id": (
+                row[DEBT_COL_ID - 1].strip()
+                if len(row) >= DEBT_COL_ID and row[DEBT_COL_ID - 1].strip()
+                else f"LEGACY-{index}"
+            ),
+            "created_at": row[DEBT_COL_DATE - 1].strip(),
+            "customer_line": row[DEBT_COL_CUSTOMER - 1].strip(),
+            "product": row[DEBT_COL_PRODUCT - 1].strip(),
+            "product_id": row[DEBT_COL_PRODUCT_ID - 1].strip() if len(row) >= DEBT_COL_PRODUCT_ID else "",
+            "plan_id": row[DEBT_COL_PLAN_ID - 1].strip() if len(row) >= DEBT_COL_PLAN_ID else "",
+            "plan_name": row[DEBT_COL_PLAN_NAME - 1].strip() if len(row) >= DEBT_COL_PLAN_NAME else "",
+            "original_amount": original,
+            "paid_total": paid_total,
+            "remaining": remaining,
+            "status": status,
+        })
+    return list(reversed(debts))
+
+
+def get_open_debt_by_row(chat_id: int, row_number: int) -> dict | None:
+    return next(
+        (debt for debt in list_open_debts(chat_id) if debt["row_number"] == row_number),
+        None,
+    )
+
+
 def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
     """
     يدور عن أول دين غير مدفوع لنفس الزبون ونفس المنتج بصفحة الديون.
@@ -648,24 +743,8 @@ def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
     و«ChatGPT» لا يصيران دينين مختلفين.
     يرجع (رقم الصف 1-indexed لـ gspread، المبلغ المتبقي الحالي) لو لقى، أو None.
     """
-    sheet = get_debts_worksheet()
-    if sheet is None:
-        return None
-
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read debts rows while searching for unpaid debt")
-        return None
-
-    chat_id_str = str(chat_id)
-    for i in range(1, len(rows)):  # نتجاوز صف العناوين
-        row = rows[i]
-        if len(row) < DEBT_COL_STATUS:
-            continue
-        row_chat_id = row[DEBT_COL_CHAT_ID - 1].strip()
-        row_product = row[DEBT_COL_PRODUCT - 1].strip()
-        row_status = row[DEBT_COL_STATUS - 1].strip()
+    for debt in reversed(list_open_debts(chat_id)):
+        row_product = debt["product"]
         same_product = row_product == product
         if not same_product:
             row_catalog_product = catalog_product_for_payment_name(row_product)
@@ -675,12 +754,8 @@ def find_unpaid_debt(chat_id: int, product: str) -> tuple[int, int] | None:
                 and requested_catalog_product
                 and row_catalog_product.get("id") == requested_catalog_product.get("id")
             )
-        if row_chat_id == chat_id_str and same_product and row_status == "غير مدفوع":
-            try:
-                remaining = int(float(row[DEBT_COL_AMOUNT - 1]))
-            except (ValueError, IndexError):
-                remaining = 0
-            return i + 1, remaining
+        if same_product:
+            return debt["row_number"], debt["remaining"]
 
     return None
 
@@ -700,10 +775,24 @@ def process_debt_repayment(row_number: int, remaining_before: int, paid_amount: 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
     try:
+        current = sheet.row_values(row_number)
+        original = parse_sheet_amount(
+            current[DEBT_COL_ORIGINAL_AMOUNT - 1]
+            if len(current) >= DEBT_COL_ORIGINAL_AMOUNT else None
+        ) or remaining_before
+        already_paid = parse_sheet_amount(
+            current[DEBT_COL_PAID_TOTAL - 1]
+            if len(current) >= DEBT_COL_PAID_TOTAL else None
+        ) or max(0, original - remaining_before)
+        applied_amount = min(remaining_before, paid_amount)
         sheet.update_cell(row_number, DEBT_COL_AMOUNT, new_remaining)
         sheet.update_cell(row_number, DEBT_COL_PAID_DATE, date_str)
+        sheet.update_cell(row_number, DEBT_COL_PAID_TOTAL, already_paid + applied_amount)
+        sheet.update_cell(row_number, DEBT_COL_UPDATED_AT, date_str)
         if new_remaining <= 0:
             sheet.update_cell(row_number, DEBT_COL_STATUS, "مدفوع")
+        else:
+            sheet.update_cell(row_number, DEBT_COL_STATUS, "جزئي")
         return True, new_remaining
     except Exception:
         logger.exception("Failed to process debt repayment")
@@ -3564,6 +3653,34 @@ def build_catalog_payment_ready_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+def build_payment_purpose_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 تسديد دين", callback_data="pay_purpose_debt")],
+        [InlineKeyboardButton("🛍️ شراء جديد", callback_data="pay_purpose_purchase")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="pay_cancel")],
+    ])
+
+
+def build_open_debts_keyboard(debts: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for debt in debts:
+        label = debt["product"]
+        if debt.get("plan_name"):
+            label += f" — {debt['plan_name']}"
+        label += f" — المتبقي {format_iqd(debt['remaining'])} د.ع"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"pay_debt_select_{debt['row_number']}")])
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="pay_debt_select_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_debt_payment_ready_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="pay_amount_manual")],
+        [InlineKeyboardButton("✅ تثبيت تسديد الدين", callback_data="pay_debt_repay")],
+        [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_catalog_payment")],
+    ])
+
+
 def payment_state_has_matching_debt(state: dict) -> bool:
     """هل للزبون دين مفتوح يطابق المنتج المحدد في عملية الدفع؟"""
     customer_chat_id = state.get("customer_chat_id")
@@ -4428,7 +4545,7 @@ def format_expense_summary(expense: dict) -> str:
 
 
 def build_debt_product_keyboard() -> InlineKeyboardMarkup:
-    """شاشة اختيار منتج الدين — نفس كاتالوج الدفع، بلا أسماء حرة."""
+    """شاشة اختيار منتج الدين من الكاتالوج مع إدخال حر."""
     products = get_active_catalog_payment_products()
     rows = [
         [InlineKeyboardButton(product["name"], callback_data=f"debt_catalog_{product['id']}")]
@@ -4436,7 +4553,18 @@ def build_debt_product_keyboard() -> InlineKeyboardMarkup:
     ]
     if not rows:
         rows.append([InlineKeyboardButton("⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="debt_noop")])
+    rows.append([InlineKeyboardButton("✏️ كتابة حرة", callback_data="debt_product_manual")])
     rows.append([InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_debt_plan_keyboard(product_id: str) -> InlineKeyboardMarkup:
+    plans = [plan for plan in get_catalog_plans(product_id) if plan.get("is_active")]
+    rows = [[InlineKeyboardButton(
+        f"{plan['name']} — {format_iqd(int(plan.get('price') or 0))} د.ع",
+        callback_data=f"debt_plan_{plan['id']}",
+    )] for plan in plans]
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -4459,15 +4587,12 @@ def build_debt_product_list_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_debt_amount_keyboard() -> InlineKeyboardMarkup:
-    """شاشة تحديد مبلغ الدين — نفس أزرار مبلغ الدفع، بس callback_data مختلف."""
+    """الملخص الأخير: السعر يأتي من الباقة ولا يحتاج ضغطات زائدة."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="debt_amount_add_small"),
-            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_LARGE}", callback_data="debt_amount_add_large"),
-        ],
-        [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="debt_amount_manual")],
+        [InlineKeyboardButton("✏️ تعديل المبلغ", callback_data="debt_amount_manual")],
         [InlineKeyboardButton("✅ تثبيت الدين", callback_data="debt_amount_commit")],
         [InlineKeyboardButton(BTN_BACK, callback_data="debt_back_to_product")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data="debt_cancel")],
     ])
 
 
@@ -4485,6 +4610,9 @@ async def start_debt_for_customer(
         "chat_id": chat_id,
         "customer_line": format_customer_line(customer_name, customer_username),
         "product": None,
+        "product_id": None,
+        "plan_id": None,
+        "plan_name": None,
         "amount": 0,
         "awaiting_manual_product": False,
         "awaiting_manual_amount": False,
@@ -4503,9 +4631,11 @@ def format_debt_summary(debt: dict) -> str:
     lines = ["تسجيل دين"]
     customer_line = debt.get("customer_line")
     product = debt.get("product")
+    plan_name = debt.get("plan_name")
     amount = debt.get("amount", 0)
     lines.append(f"الزبون: {customer_line if customer_line else '— لم يُحدد بعد —'}")
     lines.append(f"المنتج: {product if product else '— لم يُحدد بعد —'}")
+    lines.append(f"الباقة: {plan_name if plan_name else '—'}")
     lines.append(f"المبلغ: {amount if amount else '— لم يُحدد بعد —'}")
     return "\n".join(lines)
 
@@ -8399,6 +8529,29 @@ async def add_private_account(
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
     """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
 
+    if text.strip() == "دين":
+        if bm is not None:
+            try:
+                await context.bot.delete_business_messages(
+                    business_connection_id=bm.business_connection_id,
+                    message_ids=[bm.message_id],
+                )
+            except Exception:
+                logger.warning("Could not delete debt shortcut for %s", chat_id)
+        fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
+        customer_name = ((bm.chat.full_name or bm.chat.first_name or fallback_name)
+                         if bm is not None else fallback_name)
+        customer_username = bm.chat.username if bm is not None else fallback_username
+        try:
+            await start_debt_for_customer(context, chat_id, customer_name, customer_username)
+        except Exception:
+            logger.exception("Failed to start debt shortcut for %s", chat_id)
+            await context.bot.send_message(
+                chat_id=OWNER_USER_ID,
+                text="⚠️ انحذفت كلمة «دين»، لكن تعذر فتح شاشة التسجيل. جرّب زر الديون.",
+            )
+        return True
+
     if text.strip().lower() in {"راضي", "/satisfied"}:
         if bm is not None:
             try:
@@ -9194,9 +9347,71 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     # -------------------- تأكيد أولي: يفتح شاشة اختيار المنتج --------------------
     if data == "pay_confirm":
+        open_debts = list_open_debts(state.get("customer_chat_id")) if state.get("customer_chat_id") is not None else []
+        if open_debts:
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nهذا الزبون عليه دين مفتوح. هذه الدفعة شنو غرضها؟",
+                reply_markup=build_payment_purpose_keyboard(),
+            )
+            return
         await query.edit_message_caption(
             caption=format_payment_summary(state),
             reply_markup=build_product_keyboard(),
+        )
+        return
+
+    if data == "pay_purpose_purchase":
+        state["payment_purpose"] = "purchase"
+        state.pop("selected_debt_row", None)
+        await query.edit_message_caption(
+            caption=format_payment_summary(state) + "\n\nتم اختيار شراء جديد؛ الدين يبقى كما هو.",
+            reply_markup=build_product_keyboard(),
+        )
+        return
+
+    if data == "pay_purpose_debt":
+        debts = list_open_debts(state.get("customer_chat_id"))
+        if not debts:
+            await query.answer("ماكو دين مفتوح لهذا الزبون حالياً.", show_alert=True)
+            return
+        if len(debts) == 1:
+            data = f"pay_debt_select_{debts[0]['row_number']}"
+        else:
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر الدين الذي تريد تسديده:",
+                reply_markup=build_open_debts_keyboard(debts),
+            )
+            return
+
+    if data == "pay_debt_select_back":
+        await query.edit_message_caption(
+            caption=format_payment_summary(state) + "\n\nهذه الدفعة شنو غرضها؟",
+            reply_markup=build_payment_purpose_keyboard(),
+        )
+        return
+
+    if data.startswith("pay_debt_select_"):
+        try:
+            debt_row = int(data[len("pay_debt_select_"):])
+        except ValueError:
+            await query.answer("اختيار الدين غير صحيح.", show_alert=True)
+            return
+        debt = get_open_debt_by_row(state.get("customer_chat_id"), debt_row)
+        if not debt:
+            await query.answer("هذا الدين مسدد أو لم يعد متاحاً.", show_alert=True)
+            return
+        state.update({
+            "payment_purpose": "debt", "selected_debt_row": debt_row,
+            "selected_debt_id": debt["debt_id"], "product": debt["product"],
+            "catalog_product_id": debt.get("product_id") or None,
+            "plan_id": debt.get("plan_id") or None, "plan_name": debt.get("plan_name") or None,
+            "plan_price": debt["remaining"], "selected_debt_remaining": debt["remaining"],
+            "manual_product": False,
+        })
+        await query.edit_message_caption(
+            caption=(format_payment_summary(state)
+                     + f"\n\nالدين المحدد: {debt['product']}\nالمتبقي: {debt['remaining']}\nاختَر طريقة الدفع:"),
+            reply_markup=build_summary_keyboard(has_product=True, has_payment=False),
         )
         return
 
@@ -9315,6 +9530,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         if isinstance(editing_index, int) and 0 <= editing_index < len(state.get("payments", [])):
             state["payments"].pop(editing_index)
         state["awaiting_manual_amount"] = False
+        if state.get("payment_purpose") == "debt":
+            await query.edit_message_caption(
+                caption=format_payment_summary(state) + "\n\nاختَر طريقة الدفع:",
+                reply_markup=build_summary_keyboard(has_product=True, has_payment=False),
+            )
+            return
         customer_chat_id = state.get("customer_chat_id")
         has_debt = (
             state.get("product") and customer_chat_id is not None
@@ -9333,9 +9554,10 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state["awaiting_manual_amount"] = False
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_catalog_payment_ready_keyboard(
-                show_debt_repayment=payment_state_has_matching_debt(state),
-            ),
+            reply_markup=(build_debt_payment_ready_keyboard()
+                          if state.get("payment_purpose") == "debt"
+                          else build_catalog_payment_ready_keyboard(
+                              show_debt_repayment=payment_state_has_matching_debt(state))),
         )
         return
 
@@ -9353,9 +9575,10 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             state["pending_amount"] = 0
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + f"\n\nتم اعتماد مبلغ الباقة تلقائياً لطريقة: {method}",
-                reply_markup=build_catalog_payment_ready_keyboard(
-                    show_debt_repayment=payment_state_has_matching_debt(state),
-                ),
+                reply_markup=(build_debt_payment_ready_keyboard()
+                              if state.get("payment_purpose") == "debt"
+                              else build_catalog_payment_ready_keyboard(
+                                  show_debt_repayment=payment_state_has_matching_debt(state))),
             )
             return
 
@@ -9599,7 +9822,11 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("تعذر تحديد الزبون لهذي العملية.", show_alert=True)
             return
 
-        debt_info = find_unpaid_debt(customer_chat_id, state["product"])
+        selected_debt = None
+        if state.get("selected_debt_row") is not None:
+            selected_debt = get_open_debt_by_row(customer_chat_id, int(state["selected_debt_row"]))
+        debt_info = ((selected_debt["row_number"], selected_debt["remaining"])
+                     if selected_debt else find_unpaid_debt(customer_chat_id, state["product"]))
         if debt_info is None:
             await query.answer("ماكو دين غير مدفوع مطابق لهذا الزبون والمنتج حالياً.", show_alert=True)
             return
@@ -9820,7 +10047,7 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
     try:
         rows = (
             supabase.table("catalog_plans")
-            .select("id, product_id, name, duration, is_active")
+            .select("id, product_id, name, price, duration, is_active")
             .eq("id", plan_id).limit(1).execute().data or []
         )
         plan = rows[0] if rows else None
@@ -9847,6 +10074,18 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         "reminder_disabled": is_permanent,
         "is_debt": bool(state.get("is_debt", True)),
     }
+    if reminder_state["is_debt"]:
+        debt_saved = append_debt_row(
+            customer_chat_id,
+            format_customer_line(reminder_state.get("customer_name"), reminder_state.get("customer_username")),
+            product["name"], int(plan.get("price") or 0),
+            product_id=str(product["id"]), plan_id=str(plan["id"]), plan_name=plan["name"],
+        )
+        if not debt_saved:
+            await query.edit_message_text(
+                "⚠️ لم أسجل الاشتراك لأن حفظ الدين في Google Sheet فشل. أعد المحاولة بعد فحص الاتصال."
+            )
+            return
     saved = save_subscription_reminder(reminder_state)
     if saved:
         await schedule_subscription_feedback(reminder_state)
@@ -10222,9 +10461,10 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
                 chat_id=OWNER_USER_ID,
                 message_id=replied_id,
                 caption=format_payment_summary(state) + f"\n\n✅ تم تعديل مبلغ {method} إلى {amount}.",
-                reply_markup=build_catalog_payment_ready_keyboard(
-                    show_debt_repayment=payment_state_has_matching_debt(state),
-                ),
+                reply_markup=(build_debt_payment_ready_keyboard()
+                              if state.get("payment_purpose") == "debt"
+                              else build_catalog_payment_ready_keyboard(
+                                  show_debt_repayment=payment_state_has_matching_debt(state))),
             )
         except Exception:
             logger.exception("Failed to update catalog payment amount")
@@ -10308,6 +10548,9 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "chat_id": None,
             "customer_line": None,
             "product": None,
+            "product_id": None,
+            "plan_id": None,
+            "plan_name": None,
             "amount": 0,
             "awaiting_manual_product": False,
             "awaiting_manual_amount": False,
@@ -10327,6 +10570,11 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("💳 الدين", reply_markup=build_debt_main_keyboard())
         return
 
+    if data == "debt_cancel":
+        _pending_debt = None
+        await query.edit_message_text("❌ تم إلغاء تسجيل الدين.")
+        return
+
     if _pending_debt is None or _pending_debt.get("message_id") != query.message.message_id:
         await query.answer("انتهت صلاحية هذي العملية أو تم التعامل معها.", show_alert=True)
         return
@@ -10339,9 +10587,50 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if not product or not product.get("is_active"):
             await query.answer("هذا المنتج غير متاح حالياً في الكاتالوج.", show_alert=True)
             return
-        debt["product"] = product["name"]
-        debt["step"] = "amount"
-        await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard())
+        debt.update({
+            "product": product["name"], "product_id": str(product["id"]),
+            "plan_id": None, "plan_name": None, "amount": 0,
+        })
+        plans = [plan for plan in get_catalog_plans(str(product["id"])) if plan.get("is_active")]
+        if len(plans) == 1:
+            plan = plans[0]
+            debt.update({
+                "plan_id": str(plan["id"]), "plan_name": plan["name"],
+                "amount": int(plan.get("price") or 0), "step": "amount",
+            })
+            await query.edit_message_text(
+                text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard()
+            )
+        elif plans:
+            debt["step"] = "plan"
+            await query.edit_message_text(
+                text=format_debt_summary(debt) + "\n\nاختَر الباقة:",
+                reply_markup=build_debt_plan_keyboard(str(product["id"])),
+            )
+        else:
+            debt["step"] = "amount"
+            await query.edit_message_text(
+                text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard()
+            )
+        return
+
+    if data.startswith("debt_plan_"):
+        plan_id = data[len("debt_plan_"):]
+        plans = [
+            plan for plan in get_catalog_plans(str(debt.get("product_id") or ""))
+            if str(plan.get("id")) == plan_id and plan.get("is_active")
+        ]
+        if not plans:
+            await query.answer("هذه الباقة لم تعد مفعلة.", show_alert=True)
+            return
+        plan = plans[0]
+        debt.update({
+            "plan_id": str(plan["id"]), "plan_name": plan["name"],
+            "amount": int(plan.get("price") or 0), "step": "amount",
+        })
+        await query.edit_message_text(
+            text=format_debt_summary(debt), reply_markup=build_debt_amount_keyboard()
+        )
         return
 
     if data.startswith("debt_product_") and data not in ("debt_product_list", "debt_product_manual"):
@@ -10356,6 +10645,9 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "debt_product_manual":
+        debt.update({
+            "product_id": None, "plan_id": None, "plan_name": None, "amount": 0,
+        })
         debt["awaiting_manual_product"] = True
         await query.edit_message_text(
             text=format_debt_summary(debt) + "\n\nاكتب اسم المنتج بالرسالة الجاية (كـ رد على هذي الرسالة):",
@@ -10366,6 +10658,11 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "debt_back_to_product":
+        debt.update({
+            "step": "product", "product": None, "product_id": None,
+            "plan_id": None, "plan_name": None, "amount": 0,
+            "awaiting_manual_product": False, "awaiting_manual_amount": False,
+        })
         await query.edit_message_text(text=format_debt_summary(debt), reply_markup=build_debt_product_keyboard())
         return
 
@@ -10394,7 +10691,11 @@ async def handle_debt_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("لازم تحدد الزبون والمنتج والمبلغ قبل التثبيت.", show_alert=True)
             return
 
-        saved_debt = append_debt_row(debt["chat_id"], debt["customer_line"], debt["product"], debt["amount"])
+        saved_debt = append_debt_row(
+            debt["chat_id"], debt["customer_line"], debt["product"], debt["amount"],
+            product_id=debt.get("product_id"), plan_id=debt.get("plan_id"),
+            plan_name=debt.get("plan_name"),
+        )
 
         if saved_debt:
             final_text = format_debt_summary(debt) + "\n\n✅ تم تسجيل الدين بنجاح."
