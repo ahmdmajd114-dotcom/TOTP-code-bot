@@ -28,6 +28,55 @@ from html import escape
 from payment_link_logic import find_current_paid_delivery_row
 from payment_sheet_logic import choose_payment_worksheet_title
 from payment_storage import PaymentWorksheet, payment_datetime
+from income_manager import (
+    find_completable_chatgpt_row,
+    append_payment_row
+)
+from expense_manager import (
+    get_expenses_worksheet,
+    append_expense_row,
+    build_compensation_confirmation_keyboard,
+    build_expense_photo_confirm_keyboard,
+    build_expense_amount_keyboard,
+    build_expense_vault_keyboard,
+    build_expense_reason_keyboard,
+    build_expense_reason_list_keyboard,
+    format_expense_summary,
+    send_expense_notification
+)
+from vault_manager import (
+    get_vaults_worksheet,
+    get_vault_balances,
+    adjust_vault_balance,
+    set_vault_balance,
+    format_vault_balances
+)
+from reports_manager import (
+    calculate_income_report,
+    parse_stats_datetime,
+    parse_sheet_datetime,
+    parse_stats_period,
+    get_payment_rows_in_period,
+    get_expense_rows_in_period,
+    get_instagram_sales_rows_in_period,
+    payment_stats_date_warning,
+    format_period_label,
+    calculate_totals_summary,
+    _stats_catalog_product_for_name,
+    _stats_expense_product,
+    calculate_product_breakdown
+)
+from finance_integration import (
+    StoreFinance, configure_store_finance, active as finance_active,
+    financial_shortcut, intercept_payment, intercept_expense_photo,
+    finance_owner_input, active_report, financial_debt_records, post_debt, financial_repay,
+    require_legacy_write, record_instagram_finance, record_instagram_commission,
+)
+from financial_ledger import FinanceError, ledger, source_id, money as financial_money
+from finance_ui import show_finance, handle_finance_callback, handle_finance_menu, finance_worker, suspend_finance_inputs
+from finance_subscription import (configure_subscription_projection, save_financial_subscription, notify_financial_operation,
+    financial_delivery_payment, ensure_pending_financial_delivery)
+from finance_instagram import configure_instagram_projection, project_financial_instagram
 from debt_manager import (
     BTN_DEBT,
     DebtServices,
@@ -48,6 +97,9 @@ from debt_manager import (
     is_debt_payment_row,
     is_debt_repayment_row,
     payment_state_has_matching_debt,
+    configure_financial_debts,
+    list_debts as list_store_debts,
+    get_debts_worksheet,
 )
 from types import SimpleNamespace
 import pyotp
@@ -470,12 +522,17 @@ def save_instagram_subscription_reminder(sale: dict, state: dict) -> bool:
     duration_months = state.get("duration_months")
     if sale.get("product") != CHATGPT_PRODUCT_NAME or duration_months not in {1, 2}:
         return True
+    if sale.get('financial_operation_id'):
+        existing = supabase.table('subscription_reminders').select('id').eq('financial_operation_id', sale['financial_operation_id']).limit(1).execute().data or []
+        if existing:
+            return True
     now = datetime.now(timezone.utc)
     telegram_contact = find_telegram_contact_by_username(sale.get("instagram_account"))
     telegram_chat_id = telegram_contact.get("chat_id") if telegram_contact else None
     business_connection_id = telegram_contact.get("business_connection_id") if telegram_contact else None
     try:
         supabase.table("subscription_reminders").insert({
+            **({'financial_operation_id': sale['financial_operation_id']} if sale.get('financial_operation_id') else {}),
             "customer_chat_id": telegram_chat_id,
             "business_connection_id": business_connection_id,
             "customer_name": sale["instagram_account"],
@@ -503,75 +560,11 @@ def save_instagram_subscription_reminder(sale: dict, state: dict) -> bool:
 _expenses_sheet = None
 
 
-def get_expenses_worksheet():
-    """
-    يرجع كائن صفحة (Tab) المصروفات، وينشئها تلقائياً لو مو موجودة أصلاً
-    (بعنوان: التاريخ والوقت — المبلغ — السبب). يرجع None لو فشل الاتصال.
-    """
-    global _expenses_sheet
-    if _expenses_sheet is not None:
-        return _expenses_sheet
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
-        )
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            _expenses_sheet = spreadsheet.worksheet(EXPENSES_WORKSHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            _expenses_sheet = spreadsheet.add_worksheet(
-                title=EXPENSES_WORKSHEET_NAME, rows=1000, cols=3
-            )
-            _expenses_sheet.append_row(
-                ["التاريخ والوقت", "المبلغ", "السبب"], value_input_option="USER_ENTERED"
-            )
-            logger.info(f"Created new expenses worksheet: {EXPENSES_WORKSHEET_NAME}")
-        return _expenses_sheet
-    except Exception:
-        logger.exception("Failed to connect to expenses worksheet")
-        return None
 
 
 _vaults_sheet = None
 
 
-def get_vaults_worksheet():
-    """
-    يرجع كائن صفحة (Tab) خزائن الرصيد، وينشئها تلقائياً لو مو موجودة —
-    صف عناوين (ماستر، زين كاش، رصيد اثير، رصيد اسيا) + صف واحد للأرصدة
-    الحالية (يبدأ بأصفار، يتحدث لاحقاً). يرجع None لو فشل الاتصال.
-    """
-    global _vaults_sheet
-    if _vaults_sheet is not None:
-        return _vaults_sheet
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes
-        )
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        try:
-            _vaults_sheet = spreadsheet.worksheet(VAULTS_WORKSHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            _vaults_sheet = spreadsheet.add_worksheet(
-                title=VAULTS_WORKSHEET_NAME, rows=10, cols=len(VAULT_NAMES)
-            )
-            _vaults_sheet.append_row(VAULT_NAMES, value_input_option="USER_ENTERED")
-            _vaults_sheet.append_row([0] * len(VAULT_NAMES), value_input_option="USER_ENTERED")
-            logger.info(f"Created new vaults worksheet: {VAULTS_WORKSHEET_NAME}")
-        return _vaults_sheet
-    except Exception:
-        logger.exception("Failed to connect to vaults worksheet")
-        return None
 
 
 _customer_credits_sheet = None
@@ -608,6 +601,8 @@ def get_customer_credits_worksheet():
 
 
 def get_customer_credit_balance(chat_id: int) -> int:
+    if finance_active():
+        return ledger().accounts().get('credit:'+str(chat_id), 0)
     sheet = get_customer_credits_worksheet()
     if sheet is None:
         return 0
@@ -625,6 +620,7 @@ def append_customer_credit(
     chat_id: int, customer_line: str, amount: int, product: str, note: str,
 ) -> tuple[bool, int]:
     """يضيف فرق الدفع لرصيد الزبون ويرجع الرصيد الجديد."""
+    require_legacy_write()
     if amount <= 0:
         return False, get_customer_credit_balance(chat_id)
     sheet = get_customer_credits_worksheet()
@@ -677,14 +673,18 @@ async def cmd_add_customer_credit(
         return
     try:
         customer_chat_id = int(context.args[0])
-        amount = int(re.sub(r"[^\d]", "", context.args[1]))
-    except (ValueError, TypeError):
+        amount = financial_money(context.args[1])
+    except (ValueError, TypeError, FinanceError):
         await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ chat_id أو المبلغ غير صحيح.")
         return
     if amount <= 0:
         await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ المبلغ يجب أن يكون أكبر من صفر.")
         return
     note = " ".join(context.args[2:]).strip() or "تصحيح فرق دفعة سابقة"
+    if finance_active():
+        from customer_balance_manager import start_credit_adjustment
+        await start_credit_adjustment(context, customer_chat_id, amount, note)
+        return
     customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
     saved, balance = append_customer_credit(
         customer_chat_id,
@@ -2629,6 +2629,8 @@ def get_latest_customer_payment(chat_id: int) -> tuple[int, list[str]] | None:
 
 def get_current_chatgpt_delivery_payment(chat_id: int) -> tuple[int, list[str]] | None:
     """يرجع دفعة تسليم ChatGPT الحديثة قبل ربط الحساب، إن وجدت."""
+    if finance_active():
+        return financial_delivery_payment(chat_id)
     sheet = get_google_sheet()
     if sheet is None:
         return None
@@ -2909,6 +2911,9 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         )
         return
     if query.data.startswith("vault_cancel_confirm_"):
+        if finance_active():
+            await query.edit_message_text('الإلغاء المالي أصبح من المالية ← سجل العمليات، ثم اختر العملية والاسترجاع؛ حتى لا يتكرر الخصم أو تُلغى حسابات أخرى.')
+            return
         parts = query.data[len("vault_cancel_confirm_"):].split("_", 3)
         if len(parts) != 4:
             await query.edit_message_text("⚠️ بيانات الإلغاء غير صحيحة.")
@@ -3210,24 +3215,8 @@ def build_confirm_cancel_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def build_compensation_confirmation_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تأكيد التعويض وإنهاء الخدمة", callback_data="exp_comp_confirm")],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="exp_cancel")],
-    ])
 
 
-def build_expense_photo_confirm_keyboard(can_compensate_customer: bool = False) -> InlineKeyboardMarkup:
-    """زرين يطلعون تحت صورة أرسلتها أنت (owner) — هل هذي إثبات مصروف؟"""
-    rows = [
-        [
-            InlineKeyboardButton("✅ مصروف", callback_data="expphoto_yes"),
-            InlineKeyboardButton("❌ ليس مصروف", callback_data="expphoto_no"),
-        ],
-    ]
-    if can_compensate_customer:
-        rows.insert(0, [InlineKeyboardButton("💸 تعويض هذا الزبون", callback_data="expphoto_refund")])
-    return InlineKeyboardMarkup(rows)
 
 
 def get_active_catalog_payment_products() -> list[dict]:
@@ -3661,204 +3650,8 @@ def format_customer_line(customer_name: str, customer_username: str | None) -> s
     return line
 
 
-def find_completable_chatgpt_row(
-    sheet, chat_id: int, *, missing: str = "any",
-) -> int | None:
-    """
-    يدور عن آخر سطر ChatGPT بالشيت لنفس chat_id، خلال آخر
-    أسبوع، وفيه الخانة المطلوبة فاضية. ``missing=payment`` لا يطابق
-    سطراً مدفوعاً لمجرد أن الحساب فارغ، حتى لا تكتب دفعة جديدة فوق
-    دفعة قديمة. يرجع رقم
-    الصف (1-indexed كما تتوقعه gspread) لو لقى، أو None لو لازم سطر جديد.
-    """
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read rows while searching for completable ChatGPT row")
-        return None
-
-    if len(rows) <= 1:
-        return None
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=CHATGPT_ROW_MATCH_WINDOW_DAYS)
-    chat_id_str = str(chat_id)
-
-    # نفحص من الأسفل للأعلى (الأحدث أول) عشان نلقى أقرب سطر مطابق بسرعة
-    for i in range(len(rows) - 1, 0, -1):  # نتجاوز صف العناوين (index 0)
-        row = rows[i]
-        if len(row) < SHEET_COL_CHAT_ID:
-            continue
-        if is_debt_repayment_row(row):
-            continue
-
-        row_chat_id = row[SHEET_COL_CHAT_ID - 1].strip()
-        row_product = row[SHEET_COL_PRODUCT - 1].strip()
-
-        if row_chat_id != chat_id_str or not is_chatgpt_product_name(row_product):
-            continue
-
-        try:
-            row_date = datetime.strptime(row[SHEET_COL_DATE - 1].split(" ")[0], "%Y-%m-%d")
-            row_date = row_date.replace(tzinfo=timezone.utc)
-        except (ValueError, IndexError):
-            continue
-
-        if row_date < cutoff:
-            break  # وصلنا لصفوف أقدم من أسبوع، ما فيه فايدة نكمل الفحص
-
-        total_empty = not row[SHEET_COL_TOTAL - 1].strip() if len(row) >= SHEET_COL_TOTAL else True
-        payments_empty = not row[SHEET_COL_PAYMENTS - 1].strip() if len(row) >= SHEET_COL_PAYMENTS else True
-        account_empty = not row[SHEET_COL_CHATGPT_ACCOUNT - 1].strip() if len(row) >= SHEET_COL_CHATGPT_ACCOUNT else True
-
-        if len(row) >= SHEET_COL_PAYMENTS and row[SHEET_COL_PAYMENTS - 1].strip() == "ملغاة":
-            continue
-
-        if missing == "payment":
-            is_completable = total_empty or payments_empty
-        elif missing == "account":
-            is_completable = account_empty
-        else:
-            is_completable = total_empty or payments_empty or account_empty
-
-        if is_completable:
-            return i + 1  # gspread صفوف 1-indexed
-
-    return None
 
 
-def append_payment_row(state: dict, force_new: bool = False) -> bool:
-    """
-    يضيف سطر جديد بـ Google Sheet لعملية دفع مكتملة، أو يكمل سطر ناقص
-    موجود لنفس الزبون لو المنتج جات (خلال آخر أسبوع). يرجع True لو نجح
-    الحفظ، False لو فشل. force_new مخصص لتسديد الدين حتى ينحسب كدخل
-    جديد بتاريخ التسديد، ولا يكتب فوق سطر الدين/العملية الأصلية.
-    """
-    sheet = get_google_sheet()
-    if sheet is None:
-        return False
-
-    now = datetime.now(timezone.utc)
-    date_time_str = now.strftime("%Y-%m-%d %H:%M")
-
-    payments = state.get("payments", [])
-    total = sum(amount for _, amount in payments)
-    payments_text = " + ".join(f"{method} {amount}" for method, amount in payments)
-
-    customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
-    product = state.get("product") or ""
-    chat_id = state.get("customer_chat_id")
-    operation_id = state.setdefault("payment_operation_id", f"PAY-{uuid.uuid4().hex.upper()}")
-
-    try:
-        # مفتاح العملية يجعل إعادة المحاولة آمنة: إذا نجح الإرسال للشيت
-        # وانقطع الرد قبل التحقق، لن نضيف الدخل مرة ثانية.
-        existing_rows = sheet.get_all_values()
-        for existing in existing_rows[1:]:
-            if (len(existing) >= SHEET_COL_OPERATION_ID
-                    and existing[SHEET_COL_OPERATION_ID - 1].strip() == operation_id):
-                return True
-        target_row = None
-        previously_delivered_account = ""
-        if not force_new and is_chatgpt_product_name(product) and chat_id is not None:
-            target_row = find_completable_chatgpt_row(sheet, chat_id, missing="payment")
-        if target_row is not None and sheet.payment_column_offset(target_row):
-            # الدفعة الجديدة تُكتب في A:H حتى لو سُلّم حسابها سابقاً
-            # بسطر ذي أعمدة مزاحة. نحفظ الحساب معها ولا نغيّر السجل القديم.
-            previously_delivered_account = sheet.row_values(target_row)[SHEET_COL_CHATGPT_ACCOUNT - 1]
-            target_row = None
-
-        if target_row is not None:
-            # نسجل وقت استلام الدفع الفعلي، مو وقت ربط الحساب السابق.
-            sheet.update_cell(target_row, SHEET_COL_DATE, date_time_str)
-            sheet.update_cell(target_row, SHEET_COL_TOTAL, total)
-            sheet.update_cell(target_row, SHEET_COL_PAYMENTS, payments_text)
-            sheet.update_cell(target_row, SHEET_COL_OPERATION_ID, operation_id)
-        else:
-            row = [
-                date_time_str,
-                total,
-                payments_text,
-                product,
-                customer_line,
-                previously_delivered_account,
-                str(chat_id) if chat_id is not None else "",
-                operation_id,
-            ]
-            response = sheet.append_row(row, value_input_option="USER_ENTERED")
-            response_data = response if isinstance(response, dict) else {}
-            updated_range = str(response_data.get("updates", {}).get("updatedRange", ""))
-            match = re.search(r"![^!]*?\$?[A-Z]+\$?(\d+):", updated_range)
-            if match:
-                target_row = int(match.group(1))
-
-        # لا نعلن النجاح قبل أن نقرأ السطر ونتأكد أن Google Sheets حفظه.
-        if target_row is None:
-            all_rows = sheet.get_all_values()
-            for index in range(len(all_rows) - 1, 0, -1):
-                candidate = all_rows[index]
-                if len(candidate) < SHEET_COL_PAYMENTS:
-                    continue
-                candidate_total = parse_sheet_amount(candidate[SHEET_COL_TOTAL - 1])
-                candidate_payments = candidate[SHEET_COL_PAYMENTS - 1].strip()
-                candidate_chat_id = (
-                    candidate[SHEET_COL_CHAT_ID - 1].strip()
-                    if len(candidate) >= SHEET_COL_CHAT_ID else ""
-                )
-                candidate_operation_id = (
-                    candidate[SHEET_COL_OPERATION_ID - 1].strip()
-                    if len(candidate) >= SHEET_COL_OPERATION_ID else ""
-                )
-                if (candidate_total == total and candidate_payments == payments_text
-                        and (chat_id is None or candidate_chat_id == str(chat_id))
-                        and candidate_operation_id == operation_id):
-                    target_row = index + 1
-                    break
-        if target_row is None:
-            logger.error("Payment was appended but its row could not be resolved for verification")
-            return False
-        saved_row = sheet.row_values(target_row)
-        saved_total = parse_sheet_amount(
-            saved_row[SHEET_COL_TOTAL - 1] if len(saved_row) >= SHEET_COL_TOTAL else None
-        )
-        saved_payments = (
-            saved_row[SHEET_COL_PAYMENTS - 1].strip()
-            if len(saved_row) >= SHEET_COL_PAYMENTS else ""
-        )
-        saved_chat_id = (
-            saved_row[SHEET_COL_CHAT_ID - 1].strip()
-            if len(saved_row) >= SHEET_COL_CHAT_ID else ""
-        )
-        saved_operation_id = (
-            saved_row[SHEET_COL_OPERATION_ID - 1].strip()
-            if len(saved_row) >= SHEET_COL_OPERATION_ID else ""
-        )
-        if saved_total != total or saved_payments != payments_text:
-            logger.error(
-                "Payment sheet verification failed row=%s expected_total=%s actual_total=%s",
-                target_row, total, saved_total,
-            )
-            return False
-        if chat_id is not None and saved_chat_id != str(chat_id):
-            logger.error(
-                "Payment sheet chat-id verification failed row=%s expected=%s actual=%s",
-                target_row, chat_id, saved_chat_id,
-            )
-            return False
-        if saved_operation_id != operation_id:
-            logger.error(
-                "Payment sheet operation-id verification failed row=%s expected=%s actual=%s",
-                target_row, operation_id, saved_operation_id,
-            )
-            return False
-        logger.info(
-            "Payment saved and verified worksheet=%s row=%s chat_id=%s total=%s",
-            getattr(sheet, "title", GOOGLE_SHEET_WORKSHEET_NAME),
-            target_row, chat_id, total,
-        )
-        return True
-    except Exception:
-        logger.exception("Failed to append/update payment row in Google Sheet")
-        return False
 
 
 def upsert_chatgpt_account(
@@ -3934,6 +3727,8 @@ def save_subscription_reminder(
             "expires_at": (start + timedelta(days=duration_days)).isoformat(),
         }
     try:
+        if state.get('financial_operation_id'):
+            payload['financial_operation_id'] = state['financial_operation_id']
         supabase.table("subscription_reminders").insert(payload).execute()
         return True
     except Exception:
@@ -4121,6 +3916,8 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
 
 def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | None:
     """يبدأ عدّ اشتراك ChatGPT عند إرسال الحساب فعلياً عبر /link."""
+    if finance_active():
+        ensure_pending_financial_delivery(chat_id)
     try:
         rows = (
             supabase.table("subscription_reminders")
@@ -4246,60 +4043,14 @@ async def handle_personal_reminder_callback(update: Update, context: ContextType
     except Exception:
         logger.exception("Failed to acknowledge personal reminder %s", reminder_id)
         await query.answer("تعذر تأكيد التذكير، حاول مرة ثانية.", show_alert=True)
-def build_expense_amount_keyboard() -> InlineKeyboardMarkup:
-    """شاشة تحديد مبلغ المصروف — نفس أزرار مبلغ الدفع، بس callback_data مختلف."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_SMALL}", callback_data="exp_amount_add_small"),
-            InlineKeyboardButton(f"+{PAYMENT_AMOUNT_STEP_LARGE}", callback_data="exp_amount_add_large"),
-        ],
-        [InlineKeyboardButton("✏️ إدخال يدوي", callback_data="exp_amount_manual")],
-        [InlineKeyboardButton("✅ تثبيت المبلغ", callback_data="exp_amount_commit")],
-        [InlineKeyboardButton("❌ إلغاء العملية", callback_data="exp_cancel")],
-    ])
 
 
-def build_expense_vault_keyboard() -> InlineKeyboardMarkup:
-    """شاشة اختيار الخزنة اللي ينسحب منها مبلغ المصروف."""
-    rows = [[InlineKeyboardButton(v, callback_data=f"exp_vault_{v}")] for v in VAULT_NAMES]
-    rows.append([InlineKeyboardButton("بدون خزنة محددة", callback_data="exp_vault_none")])
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_amount")])
-    return InlineKeyboardMarkup(rows)
 
 
-def build_expense_reason_keyboard() -> InlineKeyboardMarkup:
-    """يعرض كل منتجات الكاتالوج المفعلة كأسباب مصروف، مع إدخال حر."""
-    products = get_active_catalog_payment_products()
-    rows = [
-        [InlineKeyboardButton(
-            product["name"], callback_data=f"exp_reason_catalog_{product['id']}"
-        )]
-        for product in products
-    ]
-    if not rows:
-        rows.append([InlineKeyboardButton(
-            "⚠️ ماكو منتجات مفعلة بالكاتالوج", callback_data="exp_reason_noop"
-        )])
-    rows.append([InlineKeyboardButton("✏️ إدخال حر", callback_data="exp_reason_manual")])
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="exp_back_to_vault")])
-    return InlineKeyboardMarkup(rows)
 
 
-def build_expense_reason_list_keyboard() -> InlineKeyboardMarkup:
-    """توافق مع رسائل قديمة كانت تفتح شاشة «بقية المنتجات»."""
-    return build_expense_reason_keyboard()
 
 
-def format_expense_summary(expense: dict) -> str:
-    """يبني نص الملخص المعروض فوق أزرار تسجيل المصروف."""
-    lines = ["تسجيل مصروف"]
-    amount = expense.get("amount", 0)
-    vault = expense.get("vault")
-    reason = expense.get("reason")
-    lines.append(f"المبلغ: {amount if amount else '— لم يُحدد بعد —'}")
-    lines.append(f"الخزنة: {vault if vault else '— لم تُحدد بعد —'}")
-    lines.append(f"السبب: {reason if reason else '— لم يُحدد بعد —'}")
-    return "\n".join(lines)
 
 
 
@@ -4820,38 +4571,8 @@ async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
         logger.exception("Failed to save updated conversation summary")
 
 
-async def send_expense_notification(context: ContextTypes.DEFAULT_TYPE, expense: dict) -> None:
-    """يبعث إشعار مصروف مكتمل لفرع 'مصروفات' بقروب الإشعارات."""
-    vault_line = expense.get("vault") or "بدون خزنة محددة"
-    notification = (
-        f"💸 مصروف جديد\n"
-        f"السبب: {expense.get('reason')}\n"
-        f"المبلغ: {expense.get('amount')}\n"
-        f"الخزنة: {vault_line}"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=NOTIFICATIONS_GROUP_ID, message_thread_id=TOPIC_EXPENSES, text=notification
-        )
-    except Exception:
-        logger.exception("Failed to send expense notification to topic")
 
 
-def append_expense_row(amount: int, reason: str) -> bool:
-    """يضيف سطر مصروف جديد لصفحة المصروفات. يرجع True لو نجح الحفظ."""
-    sheet = get_expenses_worksheet()
-    if sheet is None:
-        return False
-
-    date_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    row = [date_time_str, amount, reason]
-
-    try:
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-        return True
-    except Exception:
-        logger.exception("Failed to append expense row to Google Sheet")
-        return False
 
 
 def parse_sheet_amount(value: object) -> int | None:
@@ -4908,140 +4629,14 @@ async def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
         return False, "حدث خطأ أثناء تنفيذ التعويض؛ راجع الشيت والخزنة قبل إعادة المحاولة."
 
 
-def get_vault_balances() -> dict[str, int] | None:
-    """يرجع الأرصدة الحالية لكل الخزائن كـ dict، أو None لو فشل الاتصال."""
-    sheet = get_vaults_worksheet()
-    if sheet is None:
-        return None
-
-    try:
-        values = sheet.row_values(2)  # الصف الثاني (بعد صف العناوين)
-    except Exception:
-        logger.exception("Failed to read vault balances")
-        return None
-
-    balances = {}
-    for i, name in enumerate(VAULT_NAMES):
-        try:
-            balances[name] = int(float(values[i])) if i < len(values) and values[i].strip() else 0
-        except (ValueError, IndexError):
-            balances[name] = 0
-    return balances
 
 
-def adjust_vault_balance(vault_name: str, delta: int) -> bool:
-    """يضيف (أو يطرح لو delta سالب) مبلغ من رصيد خزنة معينة. يرجع True لو نجح."""
-    sheet = get_vaults_worksheet()
-    if sheet is None or vault_name not in VAULT_NAMES:
-        return False
-
-    try:
-        balances = get_vault_balances()
-        if balances is None:
-            return False
-        new_value = balances[vault_name] + delta
-        col_index = VAULT_NAMES.index(vault_name) + 1  # gspread أعمدة 1-indexed
-        sheet.update_cell(2, col_index, new_value)
-        return True
-    except Exception:
-        logger.exception("Failed to adjust vault balance")
-        return False
 
 
-def set_vault_balance(vault_name: str, new_value: int) -> bool:
-    """يحدد رصيد خزنة معينة برقم مطلق (يستبدل القديم بالكامل). يرجع True لو نجح."""
-    sheet = get_vaults_worksheet()
-    if sheet is None or vault_name not in VAULT_NAMES:
-        return False
-
-    try:
-        col_index = VAULT_NAMES.index(vault_name) + 1
-        sheet.update_cell(2, col_index, new_value)
-        return True
-    except Exception:
-        logger.exception("Failed to set vault balance")
-        return False
 
 
-def format_vault_balances() -> str:
-    """يبني نص عرض أرصدة كل الخزائن."""
-    balances = get_vault_balances()
-    if balances is None:
-        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
-
-    lines = ["أرصدة الخزائن\n"]
-    for name in VAULT_NAMES:
-        lines.append(f"{name}: {balances.get(name, 0)}")
-    return "\n".join(lines)
 
 
-def calculate_income_report() -> str:
-    """
-    يقرأ كل صفوف الشيت ويحسب دخل اليوم، الأسبوع الحالي، والشهر الحالي.
-    يرجع نص جاهز للعرض، أو رسالة خطأ واضحة لو فشل الاتصال بالشيت.
-    """
-    sheet = get_google_sheet()
-    if sheet is None:
-        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
-
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read rows from Google Sheet for income report")
-        return "صار خطأ أثناء قراءة الشيت — حاول مرة ثانية بعد شوي."
-
-    if len(rows) <= 1:
-        return "ماكو أي عمليات دفع مسجلة لحد الحين."
-
-    now = datetime.now(STATS_TIMEZONE)
-    today = now.date()
-    week_start = today - timedelta(days=today.weekday())  # الاثنين هو بداية الأسبوع
-    month_start = today.replace(day=1)
-
-    total_today = 0
-    total_week = 0
-    total_month = 0
-
-    # نتجاوز صف العناوين (index 0)
-    for row in rows[1:]:
-        if len(row) < 2:
-            continue
-        if is_debt_payment_row(row):
-            continue
-        date_str, amount_str = row[0], row[1]
-        try:
-            row_date = parse_sheet_datetime(date_str).date()
-        except (ValueError, IndexError):
-            continue  # صف فيه بيانات غير متوقعة — نتجاهله بدل ما نكرش
-        amount = parse_sheet_amount(amount_str)
-        if amount is None:
-            continue
-
-        if row_date == today:
-            total_today += amount
-        if row_date >= week_start:
-            total_week += amount
-        if row_date >= month_start:
-            total_month += amount
-
-    instagram_rows = get_instagram_sales_rows_in_period("today")
-    if instagram_rows is not None:
-        total_today += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
-    instagram_rows = get_instagram_sales_rows_in_period("week")
-    if instagram_rows is not None:
-        total_week += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
-    instagram_rows = get_instagram_sales_rows_in_period("month")
-    if instagram_rows is not None:
-        total_month += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
-
-    date_warning = payment_stats_date_warning("today")
-    return (
-        "تقرير الدخل\n\n"
-        f"اليوم: {total_today}\n"
-        f"هذا الأسبوع: {total_week}\n"
-        f"هذا الشهر: {total_month}"
-        + date_warning
-    )
 
 
 # ------------------------------------------------------------------
@@ -5052,234 +4647,27 @@ def calculate_income_report() -> str:
 STATS_TIMEZONE = timezone(timedelta(hours=3))
 
 
-def parse_stats_datetime(value: str) -> datetime:
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
-        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
-    ):
-        try:
-            return datetime.strptime(value.strip(), fmt).replace(tzinfo=STATS_TIMEZONE)
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized date/time: {value!r}")
-
-
-def parse_sheet_datetime(value: str) -> datetime:
-    """يقرأ أوقات Google Sheet المحفوظة كـ UTC ويحوّلها إلى توقيت بغداد."""
-    return payment_datetime(value).astimezone(STATS_TIMEZONE)
 
 
 
 
-def parse_stats_period(period_key: str) -> tuple[datetime, datetime] | None:
-    """
-    يحول مفتاح فترة (جاهز أو نص يدوي) إلى (start_date, end_date) شامل
-    الطرفين. يرجع None لو الفترة "كل الوقت" (بدون حدود)، أو يرمي
-    ValueError لو نص يدوي غير مفهوم.
-    """
-    now = datetime.now(STATS_TIMEZONE)
-    today = now.date()
-    day_start = datetime.combine(today, datetime.min.time(), tzinfo=STATS_TIMEZONE)
-    day_end = datetime.combine(today, datetime.max.time(), tzinfo=STATS_TIMEZONE)
-
-    if period_key == "today":
-        return day_start, day_end
-    if period_key == "week":
-        week_start = today - timedelta(days=today.weekday())
-        return datetime.combine(week_start, datetime.min.time(), tzinfo=STATS_TIMEZONE), day_end
-    if period_key == "month":
-        month_start = today.replace(day=1)
-        return datetime.combine(month_start, datetime.min.time(), tzinfo=STATS_TIMEZONE), day_end
-    if period_key == "all":
-        return None
-
-    # نطاق يدوي: YYYY-MM-DD HH:MM إلى YYYY-MM-DD HH:MM
-    range_parts = re.split(r"\s+(?:إلى|الى|to)\s+", period_key, maxsplit=1, flags=re.IGNORECASE)
-    if len(range_parts) == 2:
-        start = parse_stats_datetime(range_parts[0])
-        end = parse_stats_datetime(range_parts[1])
-        if end < start:
-            raise ValueError("نهاية الفترة أقدم من بدايتها")
-        return start, end
-
-    # نص يدوي: YYYY-MM-DD (يوم محدد) أو YYYY-MM (شهر محدد)
-    if len(period_key) == 10:
-        d = datetime.strptime(period_key, "%Y-%m-%d").date()
-        return datetime.combine(d, datetime.min.time(), tzinfo=STATS_TIMEZONE), datetime.combine(d, datetime.max.time(), tzinfo=STATS_TIMEZONE)
-    if len(period_key) == 7:
-        d = datetime.strptime(period_key + "-01", "%Y-%m-%d").date()
-        if d.month == 12:
-            next_month = d.replace(year=d.year + 1, month=1)
-        else:
-            next_month = d.replace(month=d.month + 1)
-        month_end = next_month - timedelta(days=1)
-        return datetime.combine(d, datetime.min.time(), tzinfo=STATS_TIMEZONE), datetime.combine(month_end, datetime.max.time(), tzinfo=STATS_TIMEZONE)
-
-    raise ValueError(f"Unrecognized period format: {period_key!r}")
 
 
-def get_payment_rows_in_period(period_key: str) -> list[list[str]] | None:
-    """
-    يرجع كل صفوف الدفعات (بدون صف العناوين) اللي تقع بالفترة المحددة.
-    يرجع None لو فشل الاتصال بالشيت.
-    """
-    sheet = get_google_sheet()
-    if sheet is None:
-        return None
-
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read payment rows for stats")
-        return None
-
-    if len(rows) <= 1:
-        return []
-
-    date_range = parse_stats_period(period_key)
-    filtered = []
-
-    for row in rows[1:]:
-        if not any(row):
-            continue
-        if date_range is None:
-            filtered.append(row)
-            continue
-        try:
-            row_date = parse_sheet_datetime(row[0])
-        except (ValueError, IndexError):
-            continue
-
-        if date_range is not None:
-            start, end = date_range
-            if not (start <= row_date <= end):
-                continue
-
-        filtered.append(row)
-
-    return filtered
 
 
-def get_expense_rows_in_period(period_key: str) -> list[list[str]] | None:
-    """نفس get_payment_rows_in_period بس لصفحة المصروفات."""
-    sheet = get_expenses_worksheet()
-    if sheet is None:
-        return None
-
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read expense rows for stats")
-        return None
-
-    if len(rows) <= 1:
-        return []
-
-    date_range = parse_stats_period(period_key)
-    filtered = []
-
-    for row in rows[1:]:
-        if len(row) < 1 or not row[0].strip():
-            continue
-        try:
-            row_date = parse_sheet_datetime(row[0])
-        except (ValueError, IndexError):
-            continue
-
-        if date_range is not None:
-            start, end = date_range
-            if not (start <= row_date <= end):
-                continue
-
-        filtered.append(row)
-
-    return filtered
 
 
-def get_instagram_sales_rows_in_period(period_key: str) -> list[list[str]] | None:
-    """يرجع مبيعات إنستغرام المؤكدة ضمن الفترة، حسب وقت البيع."""
-    sheet = get_instagram_sales_worksheet()
-    if sheet is None:
-        return None
-    try:
-        rows = sheet.get_all_values()
-    except Exception:
-        logger.exception("Failed to read Instagram sales for stats")
-        return None
-    date_range = parse_stats_period(period_key)
-    filtered = []
-    for row in rows[1:]:
-        if len(row) < 10 or row[9].strip() != "مؤكدة":
-            continue
-        try:
-            row_datetime = parse_stats_datetime(row[1])
-        except (ValueError, IndexError):
-            continue
-        if date_range is not None and not (date_range[0] <= row_datetime <= date_range[1]):
-            continue
-        filtered.append(row)
-    return filtered
+
+
 
 
 PERIOD_LABELS = {"today": "اليوم", "week": "هذا الأسبوع", "month": "هذا الشهر", "all": "كل الوقت"}
 
 
-def payment_stats_date_warning(period_key: str) -> str:
-    sheet = get_google_sheet()
-    count = getattr(sheet, "last_undated_paid_rows", 0)
-    if not count:
-        return ""
-    treatment = "محسوبة بالإجمالي" if period_key == "all" else "غير داخلة بهذه الفترة"
-    return (f"\n\n⚠️ توجد {count} دفعة بلا تاريخ صالح؛ {treatment}. "
-            "يلزم تصحيح تاريخها حتى تُنسب للفترة الصحيحة.")
 
 
-def format_period_label(period_key: str) -> str:
-    if period_key in PERIOD_LABELS:
-        return PERIOD_LABELS[period_key]
-    return period_key  # نص تاريخ يدوي، نعرضه كما هو
 
 
-def calculate_totals_summary(period_key: str) -> str:
-    """يحسب دخل/مصروف/صافي إجمالي لفترة معينة. يرجع نص جاهز للعرض."""
-    payment_rows = get_payment_rows_in_period(period_key)
-    expense_rows = get_expense_rows_in_period(period_key)
-    instagram_rows = get_instagram_sales_rows_in_period(period_key)
-
-    if payment_rows is None or expense_rows is None or instagram_rows is None:
-        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
-
-    total_income = 0
-    for row in payment_rows:
-        if is_debt_payment_row(row):
-            continue
-        if len(row) >= 2 and row[1].strip():
-            amount = parse_sheet_amount(row[1])
-            if amount is not None:
-                total_income += amount
-
-    instagram_income = sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
-    total_income += instagram_income
-
-    total_expense = 0
-    for row in expense_rows:
-        if len(row) >= 2 and row[1].strip():
-            amount = parse_sheet_amount(row[1])
-            if amount is not None:
-                total_expense += amount
-
-    net = total_income - total_expense
-    label = format_period_label(period_key)
-
-    return (
-        f"إحصائيات {label}\n\n"
-        f"الدخل: {total_income}\n"
-        f"منه مبيعات إنستغرام: {instagram_income}\n"
-        f"المصروف: {total_expense}\n"
-        f"الصافي: {net}"
-        + payment_stats_date_warning(period_key)
-    )
 
 
 STATS_PRODUCT_EXPENSE_ALIASES = {
@@ -5293,111 +4681,10 @@ STATS_PRODUCT_EXPENSE_ALIASES = {
 }
 
 
-def _stats_catalog_product_for_name(name: str, products: list[dict]) -> dict | None:
-    normalized_name = normalize_arabic_text(name)
-    for product in products:
-        candidates = [str(product.get("name") or "")]
-        candidates.extend(str(alias) for alias in (product.get("aliases") or []))
-        if normalized_name in {normalize_arabic_text(candidate) for candidate in candidates}:
-            return product
-    return None
 
 
-def _stats_expense_product(reason: str, products: list[dict]) -> dict | None:
-    """ينسب المصروف فقط إذا دل السبب على منتج واحد بوضوح."""
-    matches = list(match_catalog_products(reason, products))
-    if len(matches) == 1:
-        return matches[0]
-    if matches:
-        return None
-    normalized_reason = normalize_arabic_text(reason)
-    fallback_matches = []
-    for product in products:
-        product_key = public_catalog_product_key(product.get("name"))
-        aliases = STATS_PRODUCT_EXPENSE_ALIASES.get(product_key, ())
-        if any(re.search(rf"(?<!\w){re.escape(normalize_arabic_text(alias))}(?!\w)", normalized_reason)
-               for alias in aliases):
-            fallback_matches.append(product)
-    return fallback_matches[0] if len(fallback_matches) == 1 else None
 
 
-def calculate_product_breakdown(period_key: str) -> str:
-    """يحسب مبيعات ومصروفات وصافي وعدد عمليات كل منتج."""
-    payment_rows = get_payment_rows_in_period(period_key)
-    expense_rows = get_expense_rows_in_period(period_key)
-    instagram_rows = get_instagram_sales_rows_in_period(period_key)
-    if payment_rows is None or expense_rows is None or instagram_rows is None:
-        return "تعذر الاتصال بـ Google Sheet — تأكد من إعدادات الاتصال."
-
-    label = format_period_label(period_key)
-    if not payment_rows and not expense_rows and not instagram_rows:
-        return f"ماكو أي عمليات دفع أو مصروفات مسجلة لفترة {label}."
-
-    products = get_catalog_products()
-    product_totals: dict[str, int] = {}
-    product_expenses: dict[str, int] = {}
-    product_counts: dict[str, int] = {}
-
-    def product_label(raw_name: str) -> str:
-        product = _stats_catalog_product_for_name(raw_name, products)
-        return str(product.get("name")) if product else (raw_name.strip() or "غير محدد")
-
-    for row in payment_rows:
-        if is_debt_payment_row(row):
-            continue
-        if len(row) < 4:
-            continue
-        product = product_label(row[3])
-        if not product:
-            continue
-        amount_str = row[1].strip() if len(row) >= 2 else ""
-        amount = parse_sheet_amount(amount_str) or 0
-        if amount <= 0:
-            continue
-
-        product_totals[product] = product_totals.get(product, 0) + amount
-        product_counts[product] = product_counts.get(product, 0) + 1
-
-    for row in instagram_rows:
-        if len(row) < 7:
-            continue
-        product = product_label(row[3])
-        amount = parse_amount(row[6]) or 0
-        product_totals[product] = product_totals.get(product, 0) + amount
-        product_counts[product] = product_counts.get(product, 0) + 1
-
-    unmatched_expenses = 0
-    for row in expense_rows:
-        if len(row) < 3:
-            continue
-        amount = parse_sheet_amount(row[1]) or 0
-        if amount <= 0:
-            continue
-        matched_product = _stats_expense_product(row[2], products)
-        if matched_product is None:
-            unmatched_expenses += amount
-            continue
-        product = str(matched_product.get("name") or "غير محدد")
-        product_expenses[product] = product_expenses.get(product, 0) + amount
-
-    lines = [f"تفصيل المنتجات — {label}\n"]
-    product_names = set(product_totals) | set(product_expenses)
-    for product in sorted(product_names, key=lambda p: product_totals.get(p, 0), reverse=True):
-        income = product_totals.get(product, 0)
-        expense = product_expenses.get(product, 0)
-        lines.append(
-            f"{product}\n"
-            f"المبيعات: {income} ({product_counts.get(product, 0)} عملية)\n"
-            f"المصروف: {expense}\n"
-            f"الصافي: {income - expense}"
-        )
-    if unmatched_expenses:
-        lines.append(
-            f"مصروفات غير مرتبطة بمنتج واضح: {unmatched_expenses}\n"
-            "لتدخل بحساب منتج، اكتب اسم المنتج ضمن سبب المصروف."
-        )
-
-    return "\n\n".join(lines) + payment_stats_date_warning(period_key)
 
 
 def calculate_chatgpt_account_stats() -> tuple[int, int]:
@@ -7714,6 +7001,8 @@ def recover_paid_chatgpt_subscription_on_delivery(
     لا نخمن الباقة: نسترجعها فقط حين يطابق مجموع الدفعة باقة ChatGPT فعالة
     واحدة في الكاتالوج. الاستدعاء يحصل بعد /link، لذلك يبدأ العد من التسليم.
     """
+    if finance_active():
+        return activate_pending_chatgpt_subscription_on_delivery(chat_id)
     total = int(payment_total or 0)
     if total <= 0:
         payment = get_latest_customer_payment(chat_id)
@@ -8199,6 +7488,8 @@ async def add_private_account(
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
     """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
 
+    if bm is not None and await financial_shortcut(context, bm, chat_id, text):
+        return True
     if text.strip() == "دين":
         await handle_debt_shortcut(context, bm, chat_id)
         return True
@@ -8791,6 +8082,7 @@ async def handle_incoming_payment_photo(
         "customer_username": customer_username,
         "customer_chat_id": customer_chat_id,
         "business_connection_id": bm.business_connection_id,
+        "proof_id": bm.photo[-1].file_id,
         "product": None,
         "payments": [],
         "pending_method": None,
@@ -8917,6 +8209,8 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
 
     data = query.data
     # لا نجاوب مسبقاً؛ بعض مسارات التثبيت تحتاج عرض تنبيه رفض لاحقاً.
+    if await intercept_payment(update, context, state):
+        return
     if await handle_payment_debt_callback(update, context, state, _pending_payments):
         return
     # Telegram يسمح بإجابة واحدة فقط لكل ضغطة، والجواب المسبق كان يخفي التنبيه.
@@ -9942,6 +9236,8 @@ async def handle_expense_photo_callback(update: Update, context: ContextTypes.DE
         return
 
     data = query.data
+    if await intercept_expense_photo(update, context, pending):
+        return
     await query.answer()
     del _pending_expense_photo_confirm[message_id]
 
@@ -10021,6 +9317,10 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     if query.from_user.id != OWNER_USER_ID:
         await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
+        return
+    if finance_active():
+        await query.answer()
+        await query.message.reply_text('هذه بطاقة بالنظام السابق. افتح مصروفاً جديداً من المالية؛ لم أثبت هذه البطاقة.')
         return
 
     if _pending_expense is None or _pending_expense.get("message_id") != query.message.message_id:
@@ -10426,6 +9726,9 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
     حسب أي خطوة بانتظار إدخال. يرجع True لو عالج الرسالة.
     """
     global _pending_expense
+    if finance_active():
+        _pending_expense = None
+        return False
 
     message = update.message
     if not message or not message.text:
@@ -10508,12 +9811,30 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return False
 
     text = message.text.strip()
+    if text == BTN_FINANCE:
+        cancel_debt_input(context)
+        await show_finance(message)
+        return True
+    if text == BTN_EXPENSE:
+        try:
+            if finance_active():
+                cancel_debt_input(context)
+                from expense_manager import start_expense
+                await start_expense(context)
+                return True
+        except FinanceError as exc:
+            await message.reply_text(f'⚠️ {exc}')
+            return True
     if text in {
         BTN_MAIN_MENU, BTN_FINANCE, BTN_REPORTS, BTN_FOLLOW_UP, BTN_CUSTOMERS,
         BTN_ADMIN, BTN_DEBT, "دين 💳", BTN_EXPENSE, BTN_ADD_ACCOUNT,
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_INCOME, BTN_STATS,
     }:
         cancel_debt_input(context)
+        try:
+            suspend_finance_inputs()
+        except Exception:
+            logger.warning('Could not suspend financial text input while navigating')
 
     if text == BTN_MAIN_MENU:
         await message.reply_text("القائمة الرئيسية:", reply_markup=MAIN_REPLY_KEYBOARD)
@@ -11191,6 +10512,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
     # أزرار الإدارة الرئيسية تأخذ الأولوية على أي وضع إدخال قديم.
     if await handle_reply_keyboard_button(update, context):
         return
+    if await finance_owner_input(update, context):
+        return
     if await handle_debt_search_or_repayment_input(update, context):
         return
     if await handle_payment_method_input(update, context):
@@ -11288,8 +10611,8 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text("انتهت جلسة التسجيل. ابدأ عملية جديدة.")
             return
         sale = {
-            "sale_id": "IG-" + uuid.uuid4().hex[:10].upper(),
-            "created_at": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "sale_id": state.setdefault('sale_id', "IG-" + uuid.uuid4().hex[:10].upper()),
+            "created_at": state.setdefault('created_at', datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
             "instagram_account": state["instagram_account"],
             "product": state["product"],
             "chat_type": state.get("chat_type"),
@@ -11314,15 +10637,20 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
                 await query.edit_message_text("⚠️ هذا الحساب امتلأ أثناء التسجيل. ابدأ العملية واختر حساباً آخر.")
                 return
         # مبيعات إنستغرام تدخل مباشرة إلى الخزنة التي اختارها المدير.
-        wallet_added = adjust_vault_balance(sale["wallet"], sale["amount"])
+        try:
+            financial_saved = record_instagram_finance(sale, state)
+        except FinanceError as exc:
+            await query.message.reply_text(f'⚠️ {exc}')
+            return
+        wallet_added = financial_saved or adjust_vault_balance(sale["wallet"], sale["amount"])
         if not wallet_added:
             await query.edit_message_text("⚠️ تعذر تحديث الخزنة. لم يتم حفظ عملية البيع.")
             return
-        saved = append_instagram_sale(sale)
+        saved = financial_saved or append_instagram_sale(sale)
         if not saved:
             # إذا فشل سجل المبيعات، نرجع الزيادة حتى لا يبقى الرصيد خاطئاً.
             adjust_vault_balance(sale["wallet"], -sale["amount"])
-        reminder_saved = save_instagram_subscription_reminder(sale, state) if saved else False
+        reminder_saved = bool(financial_saved) or (save_instagram_subscription_reminder(sale, state) if saved else False)
         if saved and sale.get("instagram_account"):
             # هذا الحقل هو المعرف الذي يدخله مدير مبيعات الإنستغرام.
             # إذا كان يوزر الزبون، يبقى محفوظاً ضمن سجل العملاء للرسائل المستقبلية.
@@ -11649,6 +10977,9 @@ async def handle_instagram_commission_paid_callback(update: Update, context: Con
         commission = parse_amount(row[8]) if len(row) > 8 else None
         if wallet not in VAULT_NAMES or commission is None:
             await query.edit_message_text("⚠️ بيانات الخزنة أو العمولة غير صالحة لهذه العملية.")
+            return
+        if record_instagram_commission(sale_id, wallet, commission):
+            await query.edit_message_text('✅ تم حفظ تسديد العمولة بالسجل المالي. مزامنة الشيت تلقائية.')
             return
         if not adjust_vault_balance(wallet, -commission):
             await query.edit_message_text("⚠️ تعذر خصم العمولة من الخزنة. لم يتم تأكيد الدفع.")
@@ -12431,6 +11762,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         # اختصار الأونر «دين» داخل نفس محادثة الزبون يفتح بطاقة دين
         # جاهزة باسمه؛ لا يحتاج ينسخ chat_id أو يخرج لمحادثة البوت.
+        if await financial_shortcut(context, bm, chat_id, text, customer_name):
+            return
         if text.strip() == "دين":
             await handle_debt_shortcut(context, bm, chat_id, customer_name, customer_username)
             return
@@ -13114,6 +12447,30 @@ async def on_bot_initialized(app: Application) -> None:
 
 
 def main() -> None:
+    import income_manager as legacy_income_manager
+    legacy_income_manager.configure_legacy(globals())
+    import expense_manager as legacy_expense_manager
+    legacy_expense_manager.configure_legacy(globals())
+    import vault_manager as legacy_vault_manager
+    legacy_vault_manager.configure_legacy(globals())
+    import reports_manager as legacy_reports_manager
+    legacy_reports_manager.configure_legacy(globals())
+    configure_instagram_projection(sheet=get_instagram_sales_worksheet, append=append_instagram_sale, reminder=save_instagram_subscription_reminder)
+    configure_subscription_projection(client=supabase, save=save_subscription_reminder, schedule=schedule_subscription_feedback,
+        duration=duration_to_days, permanent=is_permanent_duration, is_chatgpt=is_chatgpt_product_name)
+    configure_store_finance(StoreFinance(
+        client=supabase, owner_id=OWNER_USER_ID, products=get_catalog_products,
+        plans=get_catalog_plans, wallets=lambda: PAYMENT_METHODS,
+        identity=get_telegram_customer_identity, button=InlineKeyboardButton, markup=InlineKeyboardMarkup,
+        spreadsheet=open_store_spreadsheet, payment_sheet=get_google_sheet,
+        expense_sheet=get_expenses_worksheet, instagram_sheet=get_instagram_sales_worksheet,
+        credit_sheet=get_customer_credits_worksheet, wallet_sheet=get_vaults_worksheet,
+        wallet_balances=get_vault_balances, debt_sheet=get_debts_worksheet,
+        legacy_debts=lambda: list_store_debts(legacy_only=True), subscription=save_financial_subscription,
+        notify=notify_financial_operation,
+        instagram=project_financial_instagram,
+    ))
+    configure_financial_debts(active=finance_active, records=financial_debt_records, post=post_debt, repay=financial_repay)
     configure_debts(DebtServices(
         owner_id=OWNER_USER_ID,
         open_spreadsheet=open_store_spreadsheet,
@@ -13139,6 +12496,7 @@ def main() -> None:
     if app.job_queue is None:
         logger.error("JobQueue غير متوفر: ثبّت python-telegram-bot[job-queue] لتفعيل تنبيهات الاشتراكات.")
     else:
+        app.job_queue.run_repeating(finance_worker, interval=30, first=40)
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
         # عامل طابور الحملات: محاولة واحدة عند موعدها، لا burst جماعي.
@@ -13160,6 +12518,8 @@ def main() -> None:
 
     # أزرار تسجيل الدفع — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
+    app.add_handler(CallbackQueryHandler(handle_finance_callback, pattern=r"^f[iev]:"))
+    app.add_handler(CallbackQueryHandler(handle_finance_menu, pattern=r"^finance_"))
 
     # تسجيل مبيعات الإنستغرام — متاح فقط لمعرف المدير المحدد بالبيئة.
     app.add_handler(CallbackQueryHandler(handle_instagram_callback, pattern=r"^ig_"))

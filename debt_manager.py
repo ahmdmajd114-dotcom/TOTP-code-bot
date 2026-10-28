@@ -38,6 +38,17 @@ _pending_debt = None
 _pending_repayments = {}
 _busy_payments = set()
 _storage_lock = RLock()
+_financial = None
+
+
+def configure_financial_debts(*, active, records, post, repay):
+    """Inject the shared ledger without importing the bot or its clients."""
+    global _financial
+    _financial = dict(active=active, records=records, post=post, repay=repay)
+
+
+def _ledger_active():
+    return _financial is not None and _financial['active']()
 
 
 @dataclass
@@ -127,7 +138,9 @@ def _debt_record(row: list, row_number: int) -> dict | None:
     }
 
 
-def list_debts(chat_id: int | None = None, *, open_only=False) -> list[dict]:
+def list_debts(chat_id: int | None = None, *, open_only=False, legacy_only=False) -> list[dict]:
+    if not legacy_only and _ledger_active():
+        return _financial['records'](chat_id, open_only)
     rows = get_debts_worksheet().get_all_values()
     debts = []
     for index, row in enumerate(rows[1:], 2):
@@ -167,6 +180,8 @@ def append_debt_row(chat_id, customer_line, product, amount, *, product_id=None,
     if not isinstance(amount, int) or amount <= 0:
         return False
     debt_id = debt_id or f"DEBT-{uuid.uuid4().hex[:12].upper()}"
+    if _ledger_active():
+        return _financial['post'](chat_id, customer_line, product, amount, debt_id=debt_id, product_id=product_id, plan_id=plan_id, plan_name=plan_name)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     row = [now, str(chat_id), customer_line, product, amount, "غير مدفوع", "",
            debt_id, product_id or "", plan_id or "", plan_name or "", amount, 0, now, ""]
@@ -189,6 +204,8 @@ def append_debt_row(chat_id, customer_line, product, amount, *, product_id=None,
 
 
 def process_debt_repayment(row_number, remaining_before, paid_amount, *, operation_id=None) -> tuple[bool, int]:
+    if _ledger_active():
+        raise RuntimeError('Use the shared financial repayment transaction')
     if paid_amount <= 0:
         return False, remaining_before
     try:
@@ -234,6 +251,9 @@ async def cmd_fix_existing_debt_payment(
     """
     message = update.effective_message
     if message is None or update.effective_user is None or update.effective_user.id != _services.owner_id:
+        return
+    if _ledger_active():
+        await message.reply_text('صحح العملية من المالية ← سجل العمليات؛ لا يُعاد تطبيق دفعة قديمة على دين جديد.')
         return
     if len(context.args) < 2:
         await message.reply_text("الاستخدام: /fixdebt CHAT_ID PRODUCT")
@@ -523,7 +543,7 @@ def is_debt_payment_row(row: list[str]) -> bool:
 
 def is_debt_repayment_row(row: list[str]) -> bool:
     """Collected repayments count as income, but cannot fund another delivery."""
-    return len(row) > 7 and str(row[7]).startswith("PAY-DEBT-")
+    return len(row) > 7 and str(row[7]).startswith(("PAY-DEBT-", "PAY-CREDIT-"))
 
 
 
@@ -956,6 +976,8 @@ async def _edit_payment(query, content, markup=None):
 
 async def settle_debt_payment(query, context, state, *, direct=False):
     """Shared settlement for receipts/AC and the debt dashboard."""
+    if _ledger_active():
+        return await _financial['repay'](query, context, state)
     confirm = "debt_payment_confirm" if direct else "pay_debt_repay"
     if not state.get("payments"):
         await query.answer("اختَر طريقة الدفع والمبلغ أولاً.", show_alert=True)

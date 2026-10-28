@@ -67,10 +67,17 @@ def bot_functions(sheet):
         "calculate_product_breakdown",
         "get_current_chatgpt_delivery_payment", "find_completable_chatgpt_row",
     }
-    tree = ast.parse((Path(__file__).resolve().parents[1] / "bot.py").read_text())
-    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    root = Path(__file__).resolve().parents[1]
+    selected = []
+    for filename in ('bot.py','income_manager.py','reports_manager.py'):
+        tree = ast.parse((root / filename).read_text())
+        selected.extend(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted)
     ns = {
         "get_google_sheet": lambda: sheet,
+        "active_report": lambda *args, **kwargs: None,
+        "require_legacy_write": lambda: None,
+        "finance_active": lambda: False,
+        "FinanceError": RuntimeError,
         "is_debt_payment_row": is_debt_payment_row,
         "is_debt_repayment_row": is_debt_repayment_row,
         "find_current_paid_delivery_row": find_current_paid_delivery_row,
