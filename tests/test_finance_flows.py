@@ -44,6 +44,7 @@ class FakeLedger:
     def mode(self,**kwargs):return 'active'
     def active(self):return True
     def require_active(self):pass
+    def rpc(self,*args,**kwargs):return SimpleNamespace(execute=lambda:SimpleNamespace(data=self.snapshot()))
     def save_draft(self,state):self.states[state['draft_id']]=deepcopy(state)
     def draft(self,key):return deepcopy(self.states[key])
     def operation(self,key):return self.records.get(key)
@@ -253,7 +254,7 @@ class FinancialFlowTests(unittest.IsolatedAsyncioTestCase):
         await ui.handle_finance_callback(update,self.context)
         self.assertEqual(self.db.posts,[])
         self.assertEqual(self.db.draft(s['draft_id'])['step'],'product')
-        self.assertIn('المالية',update.callback_query.message.reply_text.call_args.args[0])
+        self.assertIn('الإحصائيات',update.callback_query.message.reply_text.call_args.args[0])
 
     async def test_back_preserves_expense_amount_and_wallet(self):
         s=await start_expense(self.context,customer_id=123)

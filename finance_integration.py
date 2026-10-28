@@ -115,6 +115,7 @@ async def intercept_payment(update,context,state):
         if not active():return False
         from debt_manager import cancel_debt_input
         cancel_debt_input(context)
+        context.user_data.pop('statistics_input',None)
         if query.data=='pay_cancel':
             await query.answer();await query.edit_message_caption(caption='أُلغيت البطاقة قبل التثبيت.',reply_markup=None);return True
         from income_manager import start_income,render_income
@@ -168,6 +169,7 @@ async def financial_shortcut(context,bm,chat_id,text,customer_name=None):
         ledger().require_active()
         from debt_manager import cancel_debt_input
         cancel_debt_input(context)
+        context.user_data.pop('statistics_input',None)
         if command=='قبض':
             from income_manager import start_income
             await start_income(context,customer_id=chat_id,customer_name=customer_name)
@@ -187,9 +189,14 @@ async def finance_owner_input(update,context):
         if any(context.user_data.get(key) for key in ('pending_catalog_input','pending_payment_input','pending_shared_account','campaign_draft','pending_manual_subscription','pending_personal_reminder')):
             return False
         text=message.text.strip()
+        if text.startswith(('قبض ','مصروف ')):
+            context.user_data.pop('statistics_input',None)
+            context.user_data.pop('finance_report_input',None)
         if ledger().mode()!='active':
             if not text.startswith(('قبض ','مصروف ')):return False
             ledger().require_active()
+        from statistics_manager import statistics_input
+        if await statistics_input(update,context):return True
         from reports_manager import report_input
         if await report_input(update,context):return True
         if await handle_finance_input(update,context):return True
@@ -231,11 +238,15 @@ async def finance_owner_input(update,context):
 
 def active_report(period,*,products=False):
     if not active():return None
-    from reports_manager import financial_report
+    from statistics_data import read_snapshot
+    from statistics_engine import build_report
+    from statistics_manager import summary_text
+    report=build_report(read_snapshot(),{'period':period})
     if products:
-        names=sorted({r.get('product') for r in ledger().operations() if r.get('product')})
-        return '\n\n'.join(financial_report(period,name) for name in names)[:4000] or 'لا توجد حركات منتجات.'
-    return financial_report(period)
+        # Old callbacks return a compact entry point. Full lists are paged in
+        # the unified statistics UI, never sliced mid-product at 4000 chars.
+        return f"منتجات الفترة: {len(report['products'])}\nافتح الإحصائيات ← المنتجات لعرض جميع الصفحات والتصدير."
+    return summary_text(report)
 
 
 def financial_debt_records(chat_id=None,open_only=False):

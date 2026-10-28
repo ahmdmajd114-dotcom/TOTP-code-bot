@@ -57,16 +57,13 @@ def totals(operations,period='all',product=None):
 
 
 def financial_report(period='today',product=None):
-    ledger().require_active(); rows=ledger().snapshot()['operations'];t=totals(rows,period,product)
-    label={'today':'اليوم','week':'هذا الأسبوع','month':'هذا الشهر','all':'كل الوقت'}.get(period,period)
-    text=(f"📊 المالية — {label}\n"+(f"المنتج: {product}\n" if product else '')+
-          f"المقبوضات: {t['received']:,}\nالمدفوعات الخارجة: {t['spent']:,}\n"
-          f"صافي حركة الأموال: {t['received']-t['spent']:,}\n\n"
-          f"المبيعات المسجلة: {t['sales']:,}\nالمصاريف: {t['expenses']:,}\nالمسترجعات: {t['refunds']:,}")
-    if t['sales_unknown']:text+='\n⚠️ المبيعات التاريخية غير مكتملة؛ المحفوظ سابقاً هو المقبوض فقط.'
-    if t['undated']:text+=f"\n⚠️ {t['undated']} حركة بلا تاريخ صالح؛ داخلة بالإجمالي فقط."
-    text+='\nالربح غير معروض حتى تُطابق تكاليف المبيعات؛ صافي الأموال ليس الربح.'
-    return text
+    from statistics_data import read_snapshot
+    from statistics_engine import build_report,product_key
+    from statistics_manager import summary_text
+    snapshot=read_snapshot();filters={'period':period}
+    if product is not None:
+        filters['product']=product_key({},product,snapshot.get('operational',{}).get('catalog_products',[]))
+    return summary_text(build_report(snapshot,filters))
 
 
 def _record_label(row):
@@ -83,7 +80,8 @@ async def show_record_search(message,context,text):
 async def handle_report_menu(data,query,context):
     ledger().require_active()
     if data=='finance_reports':
-        await query.message.reply_text('اختَر الفترة:',reply_markup=menu_keyboard([[('اليوم','finance_period_today'),('الأسبوع','finance_period_week')],[('الشهر','finance_period_month'),('كل الوقت','finance_period_all')],[('فترة مخصصة','finance_period_custom')],[('حسب المنتج','finance_period_product')]]))
+        from statistics_manager import open_statistics
+        await open_statistics(query.message,context)
     elif data=='finance_period_custom':
         context.user_data['finance_report_input']='period'
         await query.message.reply_text('اكتب يوماً مثل 2026-10-28، أو فترة:\n2026-10-16 20:20 إلى 2026-10-23 20:20',reply_markup=menu_keyboard([],back='finance_reports'))

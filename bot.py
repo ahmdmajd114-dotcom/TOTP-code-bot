@@ -9484,6 +9484,12 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     await query.answer()
 
+    if finance_active():
+        from statistics_manager import open_statistics
+        page = 'products:0' if 'products' in data else 'subscriptions' if 'chatgpt' in data or 'account_' in data else 'wallets:0' if 'vault' in data else 'home'
+        await open_statistics(query.message, context, page=page)
+        return
+
     if data == "stats_noop":
         return
 
@@ -9811,6 +9817,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return False
 
     text = message.text.strip()
+    if text in {BTN_MAIN_MENU, BTN_FINANCE, BTN_REPORTS, BTN_FOLLOW_UP, BTN_CUSTOMERS,
+                BTN_ADMIN, BTN_DEBT, BTN_EXPENSE, BTN_ADD_ACCOUNT, BTN_CATALOG,
+                BTN_PAYMENT_METHODS, BTN_INCOME, BTN_STATS, BTN_CONTINUITY_STATS}:
+        context.user_data.pop('statistics_input', None)
     if text == BTN_FINANCE:
         cancel_debt_input(context)
         await show_finance(message)
@@ -9830,6 +9840,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         BTN_ADMIN, BTN_DEBT, "دين 💳", BTN_EXPENSE, BTN_ADD_ACCOUNT,
         BTN_CATALOG, BTN_PAYMENT_METHODS, BTN_INCOME, BTN_STATS,
     }:
+        context.user_data.pop('statistics_input', None)
         cancel_debt_input(context)
         try:
             suspend_finance_inputs()
@@ -9910,6 +9921,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_CONTINUITY_STATS:
+        if finance_active():
+            from statistics_manager import open_statistics
+            await open_statistics(message, context, page='rewards')
+            return True
         await message.reply_text(get_continuity_bot_stats())
         return True
 
@@ -9948,6 +9963,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_INCOME:
+        if finance_active():
+            from statistics_manager import open_statistics
+            await open_statistics(message, context)
+            return True
         report = calculate_income_report()
         await message.reply_text(report)
         return True
@@ -9962,6 +9981,10 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_STATS:
+        if finance_active():
+            from statistics_manager import open_statistics
+            await open_statistics(message, context)
+            return True
         await message.reply_text("الإحصائيات", reply_markup=build_stats_main_keyboard())
         return True
 
@@ -12543,6 +12566,8 @@ def main() -> None:
 
     # أزرار الإحصائيات — تشتغل بمحادثتك الخاصة مع البوت نفسه
     app.add_handler(CallbackQueryHandler(handle_stats_callback, pattern=r"^stats_"))
+    from statistics_manager import handle_statistics_callback
+    app.add_handler(CallbackQueryHandler(handle_statistics_callback, pattern=r"^stats2:"))
 
     # أزرار فلو تسجيل الدين
     app.add_handler(CallbackQueryHandler(handle_debt_callback, pattern=r"^debt_"))
