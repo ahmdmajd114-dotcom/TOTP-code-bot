@@ -9,6 +9,11 @@ from financial_ledger import FinanceError
 
 
 class TemplateTests(unittest.TestCase):
+    def test_postgres_fractional_timestamp_precision_is_supported(self):
+        for fraction in ('1','12','123','1234','12345','123456'):
+            value=ad.parse_time('2026-10-28T23:44:03.'+fraction+'+03:00')
+            self.assertEqual(value.microsecond,int(fraction.ljust(6,'0')))
+            self.assertIn('بغداد',ad.display_date('2026-10-28T23:44:03.'+fraction+'+03:00'))
     def test_compact_ids_keep_telegram_callback_under_64_bytes(self):
         value=str(uuid.uuid4());self.assertEqual(ad.expanded(ad.compact(value)),value)
         from finance_ui import configure_finance_ui

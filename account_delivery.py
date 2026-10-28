@@ -43,9 +43,16 @@ def expanded(value):
 def funding_token(value):return source_id('F',value)[2:22]
 
 
+def parse_time(value):
+    # Python 3.9 accepts 3/6 fractional digits, while PostgreSQL can emit any
+    # precision from 1 to 6. Preserve the instant before parsing its timezone.
+    text=re.sub(r'\.(\d+)(?=Z$|[+-]\d{2}:\d{2}$)',lambda m:'.'+m[1].ljust(6,'0')[:6],value)
+    return datetime.fromisoformat(text.replace('Z','+00:00'))
+
+
 def display_date(value):
     if not value:return '—'
-    return datetime.fromisoformat(value.replace('Z','+00:00')).astimezone(BAGHDAD).strftime('%Y-%m-%d %H:%M')+' بغداد'
+    return parse_time(value).astimezone(BAGHDAD).strftime('%Y-%m-%d %H:%M')+' بغداد'
 
 
 def rpc(action,**payload):
@@ -127,7 +134,7 @@ async def show_card(message,context,data):
     rows=[]
     if status=='complete':
         result=r.get('result') or {};text+=f"\n✅ التسليم والربط مثبتان.\nمعرف العملية: {r['id']}\nينتهي: {display_date(result.get('ends_at'))}"
-        active=[c for c in data.get('contracts',[]) if c['status']=='active' and datetime.fromisoformat(c['ends_at'].replace('Z','+00:00'))>datetime.now(timezone.utc)]
+        active=[c for c in data.get('contracts',[]) if c['status']=='active' and parse_time(c['ends_at'])>datetime.now(timezone.utc)]
         if data.get('contracts') is not None:text+=f"\nلهذا الزبون: {len(active)} اشتراك فعال على {len({c['account_id'] for c in active})} حساب مختلف."
         if result.get('undone'):text+='\n↩️ تم التراجع عن تغيير الاشتراك، والأموال محفوظة كما هي.'
         elif state.get('mode')=='adopt':text+='\nاعتماد رابط قديم بمدته الموجودة؛ لم تُرسل رسالة حساب جديدة.'
@@ -141,7 +148,7 @@ async def show_card(message,context,data):
         text+='\n✅ إرسال البيانات مؤكد؛ بقي إكمال التسجيل دون إرسال جديد.';rows=[[('إكمال التسجيل','finish')]]
     elif status=='reserved':
         text+=f"\nنوع العملية: {state.get('mode')}\nالتمويل: {state.get('funding_id') or 'لا تغيير مالي'}\nالأيام: {state.get('days','تُحفظ المدة')}\nالمقاعد: {state.get('seats')}\nالحجز صالح 15 دقيقة."
-        expired=datetime.fromisoformat(r['hold_until'].replace('Z','+00:00'))<=datetime.now(timezone.utc)
+        expired=parse_time(r['hold_until'])<=datetime.now(timezone.utc)
         rows=[[('🔄 انتهى الحجز: راجع واحجز مجدداً','reserve')]] if expired else [[('✅ تسليم وتثبيت','send')]]
         rows += [[('◀️ رجوع وتحرير الحجز','release'),('إلغاء','cancel')]]
     elif status=='cancelled':text+='\nأُلغيت العملية قبل التسليم.'
