@@ -50,6 +50,7 @@ class FakeLedger:
     def claim_outbox(self,oid=None):return {'id':oid,'token':1,'payload':self.records[oid]}
     def ack_outbox(self,*args,**kwargs):pass
     def accounts(self):return deepcopy(self.balances)
+    def snapshot(self):return {'operations':[{'id':'OPEN','kind':'opening','sales':0,'occurred_at':fl.now_iso(),'recorded_at':fl.now_iso(),'posting_index':0,'payload':{'accounts':[{'key':k,'balance':v} for k,v in self.balances.items()]}}]+list(self.records.values()),'accounts':deepcopy(self.balances),'debts':deepcopy(self.debt_rows),'entries':[]}
     def debts(self,cid=None,open_only=False):return [deepcopy(d) for d in self.debt_rows if cid is None or d['customer_id']==cid]
     def operations(self,cid=None):return [r for r in self.records.values() if cid is None or r.get('customer_id')==cid]
     def post(self,payload,**kwargs):
@@ -73,7 +74,8 @@ class FinancialFlowTests(unittest.IsolatedAsyncioTestCase):
             edit_message_text=AsyncMock(),edit_message_caption=AsyncMock(),delete_business_messages=AsyncMock()))
     def tearDown(self):fl._ledger=self.old;ui._services=self.old_ui;integration._config=self.old_config
     def query(self,state,action,owner=99,revision=None):
-        q=SimpleNamespace(from_user=SimpleNamespace(id=owner),data=f"fi:{state['draft_id']}:{revision if revision is not None else state['revision']}:{action}",
+        prefix={'income':'fi','expense':'fe','vault':'fv'}[state['flow']]
+        q=SimpleNamespace(from_user=SimpleNamespace(id=owner),data=f"{prefix}:{state['draft_id']}:{revision if revision is not None else state['revision']}:{action}",
             message=SimpleNamespace(reply_text=AsyncMock()),answer=AsyncMock(),edit_message_text=AsyncMock(),edit_message_caption=AsyncMock())
         return SimpleNamespace(callback_query=q)
 
@@ -170,6 +172,92 @@ class FinancialFlowTests(unittest.IsolatedAsyncioTestCase):
         await integration.financial_shortcut(self.context,bm,123,'صرف','Ali')
         self.assertEqual(sequence[:2],['delete','database'])
         self.assertIn('card',sequence);self.assertEqual(self.db.posts,[])
+
+    async def test_qabd_uses_current_customer_and_deletes_first(self):
+        sequence=[]
+        self.context.bot.delete_business_messages.side_effect=lambda **kwargs:sequence.append('delete')
+        self.db.require_active=lambda:sequence.append('database')
+        bm=SimpleNamespace(business_connection_id='b',message_id=15)
+        self.assertTrue(await integration.financial_shortcut(self.context,bm,123,'قبض','Ali'))
+        self.assertEqual(sequence[:2],['delete','database'])
+        state=next(iter(self.db.states.values()))
+        self.assertEqual(state['flow'],'income');self.assertEqual(state['customer_id'],123)
+        self.assertEqual(state['step'],'product');self.assertEqual(self.db.posts,[])
+
+    async def test_back_at_first_step_returns_menu_without_writing_money(self):
+        s=await start_income(self.context,customer_id=123)
+        update=self.query(s,'back')
+        await ui.handle_finance_callback(update,self.context)
+        self.assertEqual(self.db.posts,[])
+        self.assertEqual(self.db.draft(s['draft_id'])['step'],'product')
+        self.assertIn('المالية',update.callback_query.message.reply_text.call_args.args[0])
+
+    async def test_back_preserves_expense_amount_and_wallet(self):
+        s=await start_expense(self.context,customer_id=123)
+        await handle_expense_action(s,'product0',self.context,None)
+        expense_input(s,'15000')
+        from expense_manager import render_expense
+        await render_expense(s,self.context)
+        self.assertEqual(s['step'],'wallet')
+        await ui.handle_finance_callback(self.query(s,'back'),self.context)
+        after=self.db.draft(s['draft_id'])
+        self.assertEqual(after['step'],'amount');self.assertEqual(after['amount'],15000)
+        self.assertEqual(self.db.posts,[])
+
+    async def test_back_from_manual_report_clears_waiting_input(self):
+        s=await start_income(self.context,customer_id=123)
+        update=self.query(s,'noop');update.callback_query.data='finance_period_custom'
+        await ui.handle_finance_menu(update,self.context)
+        self.assertEqual(self.context.user_data['finance_report_input'],'period')
+        update.callback_query.data='finance_reports'
+        await ui.handle_finance_menu(update,self.context)
+        self.assertNotIn('finance_report_input',self.context.user_data)
+        self.assertEqual(self.db.posts,[])
+
+    async def test_reversal_card_has_back_and_returns_to_original_record(self):
+        self.db.records['PAY-ORIGINAL']={'id':'PAY-ORIGINAL','kind':'expense','historical':False,'occurred_at':fl.now_iso(),'recorded_at':fl.now_iso(),'cash_in':0,'cash_out':3000,'payload':{'description':'server'}}
+        s=ui.draft('vault',kind='reversal',reference_id='PAY-ORIGINAL',description='mistake',step='summary',return_to='finance_view_PAY-ORIGINAL')
+        from vault_manager import render_vault
+        await render_vault(s,self.context)
+        callbacks=[b.callback_data.rsplit(':',1)[1] for line in self.context.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard for b in line]
+        self.assertIn('back',callbacks);self.assertNotIn('amount',callbacks)
+        update=self.query(s,'back');await ui.handle_finance_callback(update,self.context)
+        self.assertIn('PAY-ORIGINAL',update.callback_query.message.reply_text.call_args.args[0])
+        self.assertEqual(self.db.posts,[])
+
+    async def test_transfer_opens_goes_back_and_commits_once(self):
+        from vault_manager import start_vault_action
+        await start_vault_action(self.context,'transfer')
+        key=next(iter(self.db.states))
+        for action in ('wallet0','wallet1'):
+            s=self.db.draft(key)
+            await ui.handle_finance_callback(self.query(s,action),self.context)
+        message=SimpleNamespace(text='5000',reply_to_message=SimpleNamespace(message_id=7),reply_text=AsyncMock())
+        update=SimpleNamespace(message=message,effective_user=SimpleNamespace(id=99))
+        await ui.handle_finance_input(update,self.context)
+        message.text='نقل رصيد';await ui.handle_finance_input(update,self.context)
+        s=self.db.draft(key);self.assertEqual(s['step'],'summary')
+        await ui.handle_finance_callback(self.query(s,'back'),self.context)
+        s=self.db.draft(key)
+        self.assertEqual(s['step'],'reason');self.assertEqual(s['amount'],5000)
+        self.assertEqual(s['wallet'],'ماستر');self.assertEqual(s['to_wallet'],'زين كاش')
+        self.assertEqual(self.db.posts,[])
+        await ui.handle_finance_input(update,self.context)
+        s=self.db.draft(key);await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(len(self.db.posts),1)
+        p=self.db.posts[0];self.assertEqual(p['kind'],'transfer')
+        self.assertEqual(p['payments'],[{'wallet':'ماستر','amount':5000}])
+        self.assertEqual(p['to_wallet'],'زين كاش')
+
+    async def test_credit_adjustment_card_opens_and_cannot_create_cash(self):
+        from customer_balance_manager import start_credit_adjustment
+        self.db.balances['credit:123']=1000
+        await start_credit_adjustment(self.context,123,500,'تصحيح سابق')
+        s=next(iter(self.db.states.values()))
+        await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(self.db.posts[0]['kind'],'credit_adjustment')
+        self.assertEqual(self.db.posts[0]['adjustment'],500)
+        self.assertEqual(self.db.posts[0]['payments'],[])
 
     async def test_refund_stays_linked_to_one_sale_and_never_cancels_other_accounts(self):
         s=await start_expense(self.context,refund={'id':'PAY-OLD','customer_id':123,'product':'ChatGPT','sales':8000})

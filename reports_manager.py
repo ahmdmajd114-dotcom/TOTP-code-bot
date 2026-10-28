@@ -4,7 +4,7 @@ from datetime import datetime,timedelta,timezone
 from copy import deepcopy
 
 from financial_ledger import FinanceError,ledger,BAGHDAD,KINDS,operation_id,now_iso,transaction_date
-from finance_ui import keyboard,services
+from finance_ui import keyboard,menu_keyboard,services
 
 
 def period_bounds(period):
@@ -46,6 +46,7 @@ def totals(operations,period='all',product=None):
             result['spent']+=int(original.get('cash_in',0))
             result['sales']-=int(original.get('sales') or 0)
             result['expenses']-=int(original.get('expense') or 0)
+            result['refunds']-=int(original.get('refunded') or 0)
             continue
         result['received']+=int(row.get('cash_in',0));result['spent']+=int(row.get('cash_out',0))
         result['expenses']+=int(row.get('expense',0));result['refunds']+=int(row.get('refunded',0))
@@ -72,23 +73,34 @@ def _record_label(row):
     return f"{KINDS.get(row['kind'], 'سجل قديم')} | {row.get('product') or row.get('customer_id') or 'عام'} | {max(int(row.get('cash_in',0)),int(row.get('cash_out',0))):,}"
 
 
+async def show_record_search(message,context,text):
+    rows=[r for r in ledger().operations() if text.casefold() in str(r['payload']).casefold() or text in str(r['cash_in']) or text in str(r['cash_out'])]
+    context.user_data['finance_search_text']=text
+    context.user_data['finance_records_return']='finance_records_search_results'
+    await message.reply_text(f'نتائج: {len(rows)}'+('؛ أول 20، ضيّق البحث للمزيد.' if len(rows)>20 else ''),reply_markup=menu_keyboard([[(_record_label(r)[:80],'finance_view_'+r['id'])] for r in rows[:20]],back='finance_records_search'))
+
+
 async def handle_report_menu(data,query,context):
     ledger().require_active()
     if data=='finance_reports':
-        await query.message.reply_text('اختَر الفترة:',reply_markup=keyboard([[('اليوم','finance_period_today'),('الأسبوع','finance_period_week')],[('الشهر','finance_period_month'),('كل الوقت','finance_period_all')],[('فترة مخصصة','finance_period_custom')],[('حسب المنتج','finance_period_product')]]))
+        await query.message.reply_text('اختَر الفترة:',reply_markup=menu_keyboard([[('اليوم','finance_period_today'),('الأسبوع','finance_period_week')],[('الشهر','finance_period_month'),('كل الوقت','finance_period_all')],[('فترة مخصصة','finance_period_custom')],[('حسب المنتج','finance_period_product')]]))
     elif data=='finance_period_custom':
         context.user_data['finance_report_input']='period'
-        await query.message.reply_text('اكتب يوماً مثل 2026-10-28، أو فترة:\n2026-10-16 20:20 إلى 2026-10-23 20:20')
+        await query.message.reply_text('اكتب يوماً مثل 2026-10-28، أو فترة:\n2026-10-16 20:20 إلى 2026-10-23 20:20',reply_markup=menu_keyboard([],back='finance_reports'))
     elif data=='finance_period_product':
         context.user_data['finance_report_input']='product'
-        await query.message.reply_text('اكتب اسم المنتج كما يظهر بالكتالوج:')
+        await query.message.reply_text('اكتب اسم المنتج كما يظهر بالكتالوج:',reply_markup=menu_keyboard([],back='finance_reports'))
     elif data.startswith('finance_period_'):
-        await query.message.reply_text(financial_report(data[len('finance_period_'):]))
+        await query.message.reply_text(financial_report(data[len('finance_period_'):]),reply_markup=menu_keyboard([],back='finance_reports'))
     elif data.startswith('finance_records'):
+        if data=='finance_records_search_results':
+            await show_record_search(query.message,context,context.user_data.get('finance_search_text',''))
+            return
         if data=='finance_records_search':
-            context.user_data['finance_report_input']='search';await query.message.reply_text('اكتب اسم الزبون، chat_id، المبلغ أو رقم العملية:');return
+            context.user_data['finance_report_input']='search';await query.message.reply_text('اكتب اسم الزبون، chat_id، المبلغ أو رقم العملية:',reply_markup=menu_keyboard([],back='finance_records'));return
         page=int(data.split('_')[-1]) if data.split('_')[-1].isdigit() else 0
         rows=sorted(ledger().operations(),key=lambda r:r['recorded_at'],reverse=True)
+        context.user_data['finance_records_return']=f'finance_records_{page}'
         # IDs passed in callbacks remain under Telegram's 64 byte limit.
         buttons=[[(_record_label(r)[:80],'finance_view_'+r['id'])] for r in rows[page*8:(page+1)*8] if len(('finance_view_'+r['id']).encode())<=64]
         nav=[]
@@ -96,21 +108,21 @@ async def handle_report_menu(data,query,context):
         if (page+1)*8<len(rows):nav.append(('التالي',f'finance_records_{page+1}'))
         if nav:buttons.append(nav)
         buttons.append([('بحث بالزبون أو المبلغ أو الرقم','finance_records_search')])
-        await query.message.reply_text(f'سجل العمليات — {len(rows)}',reply_markup=keyboard(buttons))
+        await query.message.reply_text(f'سجل العمليات — {len(rows)}',reply_markup=menu_keyboard(buttons))
     elif data.startswith('finance_view_'):
         oid=data[len('finance_view_'):];r=next((r for r in ledger().operations() if r['id']==oid),None)
         if not r:raise FinanceError('لم أجد العملية.')
         p=r['payload'];text=f"{KINDS.get(r['kind'],'سجل قديم')}\nرقم: {oid}\nالزبون: {p.get('customer_name') or r.get('customer_id') or 'عام'}\nالمنتج: {r.get('product') or '—'}\nقبض: {r['cash_in']:,}\nصرف: {r['cash_out']:,}\nوقت العملية: {r.get('occurred_at') or 'غير معروف'}\nوقت التسجيل: {r['recorded_at']}\nالسبب: {p.get('description') or '—'}"
         buttons=[]
-        if not r['historical'] and r['kind'] not in {'reversal','refund','debt_issue'}:
+        if not r['historical'] and r['kind']!='reversal':
             buttons.append([('إلغاء مالي مرتبط','finance_reverse_'+oid)])
             if r['kind'] in {'sale','expense'}:buttons.append([('تصحيح بعملية بديلة','finance_correct_'+oid)])
         if r['kind']=='sale' and not r['historical']:buttons.append([('استرجاع جزئي أو كامل','finance_refund_'+oid)])
-        await query.message.reply_text(text[:4000],reply_markup=keyboard(buttons))
+        await query.message.reply_text(text[:4000],reply_markup=menu_keyboard(buttons,back=context.user_data.get('finance_records_return','finance_records')))
     elif data.startswith('finance_reverse_'):
         oid=data[len('finance_reverse_'):]
         context.user_data['finance_report_input']='reverse';context.user_data['finance_reverse_id']=oid
-        await query.message.reply_text('اكتب سبب الإلغاء. بعدها يعرض لك النظام أثر الإلغاء قبل التثبيت:')
+        await query.message.reply_text('اكتب سبب التراجع. بعدها يعرض لك النظام أثره قبل التثبيت:',reply_markup=menu_keyboard([],back='finance_view_'+oid))
     elif data.startswith(('finance_refund_','finance_correct_')):
         correction=data.startswith('finance_correct_');oid=data.split('_',2)[2]
         r=next(r for r in ledger().operations() if r['id']==oid)
@@ -121,16 +133,16 @@ async def handle_report_menu(data,query,context):
         else:
             start,render=(start_income,render_income) if r['kind']=='sale' else (start_expense,render_expense)
             state=await start(context,customer_id=r.get('customer_id'),customer_name=r['payload'].get('customer_name'))
-            state.update({k:v for k,v in r['payload'].items() if k not in {'id','kind','occurred_at','proof_id','source'}})
-            state.update(correction_of=oid,step='summary',kind=r['kind']);await render(state,context)
+            state.update({k:v for k,v in r['payload'].items() if k not in {'id','kind','occurred_at','source'}})
+            state.update(correction_of=oid,step='summary',kind=r['kind'],return_to='finance_view_'+oid);await render(state,context)
     elif data=='finance_pending':
         rows=(ledger().client.table('finance_outbox').select('*').eq('owner_id',services().owner_id).neq('status','done').order('next_at').limit(20).execute().data or [])
         text='⏳ تحتاج متابعة\n'+('\n'.join(f"{r['operation_id']} — محاولات: {r['attempts']} — مزامنة بالانتظار" for r in rows) if rows else 'لا توجد مزامنة معلقة.')
         drafts=ledger().client.table('finance_drafts').select('state').eq('owner_id',services().owner_id).order('updated_at',desc=True).limit(50).execute().data or []
         drafts=[r['state'] for r in drafts if not r['state'].get('closed') and not r['state'].get('committed')]
-        await query.message.reply_text(text+'\n\nبطاقات غير مثبتة: '+str(len(drafts)),reply_markup=keyboard([[(f"{s.get('customer_name') or 'عام'} — {s.get('product') or s['flow']}", 'finance_draft_'+s['draft_id'])] for s in drafts[:15]]))
+        await query.message.reply_text(text+'\n\nبطاقات غير مثبتة: '+str(len(drafts)),reply_markup=menu_keyboard([[(f"{s.get('customer_name') or 'عام'} — {s.get('product') or s['flow']}", 'finance_draft_'+s['draft_id'])] for s in drafts[:15]]))
     elif data.startswith('finance_customers'):
-        context.user_data['finance_report_input']='customer';await query.message.reply_text('أرسل chat_id لعرض بطاقة الزبون المالية:')
+        context.user_data['finance_report_input']='customer';await query.message.reply_text('أرسل chat_id لعرض بطاقة الزبون المالية:',reply_markup=menu_keyboard([]))
 
 
 async def report_input(update,context):
@@ -138,21 +150,22 @@ async def report_input(update,context):
     if not key or not message or not message.text:return False
     text=message.text.strip()
     try:
-        if key=='period':await message.reply_text(financial_report(text))
-        elif key=='product':await message.reply_text(financial_report('all',text))
+        if key=='period':await message.reply_text(financial_report(text),reply_markup=menu_keyboard([],back='finance_reports'))
+        elif key=='product':await message.reply_text(financial_report('all',text),reply_markup=menu_keyboard([],back='finance_reports'))
         elif key=='customer':
             cid=int(text);snapshot=ledger().snapshot();rows=[r for r in snapshot['operations'] if r.get('customer_id')==cid];debts=[d for d in snapshot['debts'] if d['customer_id']==cid and int(d['remaining'])>0];a=snapshot['accounts']
             name,_=services().identity(cid)
-            await message.reply_text(f"بطاقة {name} ({cid})\nعليه: {sum(int(d['remaining']) for d in debts):,}\nإله رصيد: {a.get('credit:'+str(cid),0):,}\nالعمليات: {len(rows)}",reply_markup=keyboard([[('تسجيل قبض','finance_income')],[('تسوية رصيد الزبون',f'finance_credit_{cid}')]]))
+            await message.reply_text(f"بطاقة {name} ({cid})\nعليه: {sum(int(d['remaining']) for d in debts):,}\nإله رصيد: {a.get('credit:'+str(cid),0):,}\nالعمليات: {len(rows)}",reply_markup=menu_keyboard([[('تسجيل قبض','finance_income')],[('تسوية رصيد الزبون',f'finance_credit_{cid}')]],back='finance_customers'))
         elif key=='search':
-            rows=[r for r in ledger().operations() if text.casefold() in str(r['payload']).casefold() or text in str(r['cash_in']) or text in str(r['cash_out'])]
-            await message.reply_text(f'نتائج: {len(rows)}'+('؛ أول 20، ضيّق البحث للمزيد.' if len(rows)>20 else ''),reply_markup=keyboard([[(_record_label(r)[:80],'finance_view_'+r['id'])] for r in rows[:20]]))
+            await show_record_search(message,context,text)
         elif key=='reverse':
             oid=context.user_data['finance_reverse_id'];r=next(r for r in ledger().operations() if r['id']==oid)
             # Persist a normal vault-flow card with an explicit inverse summary.
             from finance_ui import draft,display
-            s=draft('vault',kind='reversal',reference_id=oid,description=text,step='summary')
-            await display(context,s,f"إلغاء مالي مرتبط\n{oid}\nسيعكس القبض {r['cash_in']:,} والصرف {r['cash_out']:,} وتأثير الديون والأرصدة للعملية نفسها.\nالسبب: {text}",[[('✅ تثبيت الإلغاء','commit'),('إلغاء','cancel')]])
+            s=draft('vault',kind='reversal',reference_id=oid,description=text,step='summary',return_to='finance_view_'+oid,
+                    reversal_preview=f"سيعكس القبض {r['cash_in']:,} والصرف {r['cash_out']:,} وتأثير الديون والأرصدة للعملية نفسها.")
+            from vault_manager import render_vault
+            await render_vault(s,context)
         context.user_data.pop('finance_report_input',None)
     except (FinanceError,ValueError) as exc:await message.reply_text(f'⚠️ {exc}')
     return True

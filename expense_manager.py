@@ -15,7 +15,7 @@ async def start_expense(context, *, customer_id=None, customer_name=None, photo_
     if photo_message: state.update(photo=True,message_id=photo_message.message_id)
     if refund:
         state.update(kind='refund',reference_id=refund['id'],customer_id=refund.get('customer_id'),
-                     product=refund.get('product'),description='استرجاع من '+refund['id'],amount=refund.get('sales',0),step='amount')
+                     product=refund.get('product'),description='استرجاع من '+refund['id'],amount=refund.get('sales',0),step='amount',return_to='finance_view_'+refund['id'])
     if quick: state.update(quick,step='summary')
     await render_expense(state,context)
     return state

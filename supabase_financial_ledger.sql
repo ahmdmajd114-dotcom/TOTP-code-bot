@@ -21,6 +21,7 @@ create table if not exists public.finance_accounts (
   owner_id bigint not null, key text not null, balance bigint not null default 0,
   primary key(owner_id,key)
 );
+alter table public.finance_operations add column if not exists posting_index bigint generated always as identity;
 create table if not exists public.finance_entries (
   owner_id bigint not null, operation_id text not null, account_key text not null,
   delta bigint not null, primary key(owner_id,operation_id,account_key),
@@ -62,6 +63,30 @@ begin
     on conflict(owner_id,operation_id,account_key) do update set delta=finance_entries.delta+excluded.delta;
 end; $$;
 
+-- Cached balances must always equal reviewed opening balances plus signed
+-- entries. A direct/corrupt balance edit is never adopted as new money.
+create or replace function public.finance_assert_balances(p_owner bigint)
+returns void language plpgsql set search_path=public as $$
+begin
+  if not exists(select 1 from finance_operations where owner_id=p_owner and kind='opening') then
+    raise exception 'Financial opening record missing';
+  end if;
+  if exists(
+    with opening as (
+      select a->>'key' as key,sum((a->>'balance')::bigint) as amount
+      from finance_operations o cross join lateral jsonb_array_elements(coalesce(o.payload->'accounts','[]'::jsonb)) a
+      where o.owner_id=p_owner and o.kind='opening' group by a->>'key'
+    ), movements as (
+      select account_key as key,sum(delta) as amount from finance_entries where owner_id=p_owner group by account_key
+    ), expected as (
+      select coalesce(o.key,m.key) as key,coalesce(o.amount,0)+coalesce(m.amount,0) as amount
+      from opening o full join movements m on m.key=o.key
+    ), actual as (select key,balance from finance_accounts where owner_id=p_owner)
+    select 1 from expected e full join actual a on a.key=e.key
+      where a.key is null or e.key is null or a.balance<>e.amount
+  ) then raise exception 'Financial balance mismatch'; end if;
+end; $$;
+
 create or replace function public.finance_post(p_owner bigint,p jsonb)
 returns jsonb language plpgsql set search_path=public as $$
 declare
@@ -80,10 +105,12 @@ begin
   if coalesce((select mode from finance_settings where owner_id=p_owner),'legacy')<>'active' then
     raise exception 'Financial ledger is not active';
   end if;
+  perform finance_assert_balances(p_owner);
   if oid is null or length(oid)<8 or k not in ('sale','debt_repayment','credit_deposit','expense','refund','transfer','capital','withdrawal','debt_issue','credit_adjustment','vault_adjustment','reversal') then
     raise exception 'Invalid financial operation';
   end if;
-  if coalesce(p->>'proof_id','')<>'' and exists(select 1 from finance_operations where owner_id=p_owner and payload->>'proof_id'=p->>'proof_id') then
+  if coalesce(p->>'proof_id','')<>'' and exists(select 1 from finance_operations r where r.owner_id=p_owner and r.payload->>'proof_id'=p->>'proof_id'
+    and not exists(select 1 from finance_operations v where v.owner_id=p_owner and v.kind='reversal' and v.reference_id=r.id)) then
     raise exception 'Payment proof already used';
   end if;
   stamp:=(p->>'occurred_at')::timestamptz;
@@ -104,10 +131,11 @@ begin
   end loop;
   if k='reversal' then
     select * into ref from finance_operations where owner_id=p_owner and id=refid;
-    if not found or ref.historical or ref.kind not in ('sale','expense','capital','withdrawal','transfer','credit_deposit','debt_repayment','credit_adjustment','vault_adjustment') then
+    if not found or ref.historical or ref.kind not in ('sale','expense','refund','debt_issue','capital','withdrawal','transfer','credit_deposit','debt_repayment','credit_adjustment','vault_adjustment') then
       raise exception 'This operation requires a linked adjustment instead';
     end if;
-    if exists(select 1 from finance_operations where owner_id=p_owner and reference_id=refid and kind in ('refund','reversal')) then
+    if exists(select 1 from finance_operations r where owner_id=p_owner and reference_id=refid and kind in ('refund','reversal')
+      and not exists(select 1 from finance_operations v where v.owner_id=p_owner and v.kind='reversal' and v.reference_id=r.id)) then
       raise exception 'Operation already has a refund or reversal';
     end if;
     if coalesce((ref.payload->>'new_debt')::bigint,0)>0 then
@@ -129,6 +157,7 @@ begin
     end loop;
     update finance_debts set remaining=0,last_operation_id=oid where owner_id=p_owner and source_operation_id=refid;
     insert into finance_outbox(owner_id,operation_id) values(p_owner,oid);
+    perform finance_assert_balances(p_owner);
     return jsonb_build_object('id',oid,'duplicate',false);
   end if;
   for x in select value from jsonb_array_elements(coalesce(p->'settlements','[]')) loop
@@ -165,7 +194,8 @@ begin
     select * into ref from finance_operations where owner_id=p_owner and id=refid;
     if not found or ref.kind<>'sale' or ref.customer_id is distinct from cid or ref.historical then raise exception 'Select the original sale'; end if;
     if exists(select 1 from finance_operations where owner_id=p_owner and reference_id=refid and kind='reversal') then raise exception 'Sale was reversed'; end if;
-    if total+coalesce((select sum(refunded) from finance_operations where owner_id=p_owner and reference_id=refid),0)>ref.sales-coalesce((select sum(remaining) from finance_debts where owner_id=p_owner and source_operation_id=refid),0) then raise exception 'Refund exceeds collected sale'; end if;
+    if total+coalesce((select sum(r.refunded) from finance_operations r where r.owner_id=p_owner and r.reference_id=refid
+      and not exists(select 1 from finance_operations v where v.owner_id=p_owner and v.kind='reversal' and v.reference_id=r.id)),0)>ref.sales-coalesce((select sum(remaining) from finance_debts where owner_id=p_owner and source_operation_id=refid),0) then raise exception 'Refund exceeds collected sale'; end if;
     refund:=total;
   end if;
   if k='transfer' then
@@ -197,6 +227,7 @@ begin
       values(p_owner,'DEBT-'||oid,cid,coalesce(p->>'customer_name',''),coalesce(p->>'product',''),p->>'product_id',p->>'plan_id',p->>'plan_name',owed,owed,stamp,oid,oid);
   end if;
   insert into finance_outbox(owner_id,operation_id) values(p_owner,oid);
+  perform finance_assert_balances(p_owner);
   return jsonb_build_object('id',oid,'duplicate',false);
 end; $$;
 
@@ -223,7 +254,7 @@ begin
   perform pg_advisory_xact_lock(p_owner);
   insert into finance_settings(owner_id) values(p_owner) on conflict do nothing;
   select * into s from finance_settings where owner_id=p_owner for update;
-  if p_action='status' then return jsonb_build_object('mode',s.mode,'cutover_at',s.cutover_at); end if;
+  if p_action='status' then return jsonb_build_object('mode',s.mode,'cutover_at',s.cutover_at,'schema_version',2); end if;
   if s.mode='active' then raise exception 'Ledger already active'; end if;
   if p_action='begin' then
     update finance_settings set mode='review',snapshot=null,updated_at=now() where owner_id=p_owner;
@@ -249,7 +280,7 @@ begin
       values(p_owner,'OPEN-'||p_owner,jsonb_build_object('kind','opening','accounts',s.snapshot->'accounts','warnings',s.snapshot->'warnings'),'opening',now(),true,0);
     update finance_settings set mode='active',cutover_at=now(),snapshot=null,updated_at=now() where owner_id=p_owner;
   else raise exception 'Invalid setup transition'; end if;
-  return jsonb_build_object('mode',(select mode from finance_settings where owner_id=p_owner));
+  return jsonb_build_object('mode',(select mode from finance_settings where owner_id=p_owner),'schema_version',2);
 end; $$;
 
 -- One MVCC snapshot for reports: concurrent sales cannot move rows between
@@ -260,6 +291,7 @@ returns jsonb language sql stable set search_path=public as $$
    'operations',coalesce((select jsonb_agg(to_jsonb(o) order by recorded_at,id) from finance_operations o where owner_id=p_owner),'[]'::jsonb),
    'debts',coalesce((select jsonb_agg(to_jsonb(d) order by id) from finance_debts d where owner_id=p_owner),'[]'::jsonb),
    'accounts',coalesce((select jsonb_object_agg(key,balance) from finance_accounts where owner_id=p_owner),'{}'::jsonb)
+   ,'entries',coalesce((select jsonb_agg(to_jsonb(e) order by operation_id,account_key) from finance_entries e where owner_id=p_owner),'[]'::jsonb)
  );
 $$;
 
@@ -291,6 +323,7 @@ do $$ declare t text; f regprocedure; begin
     execute format('revoke all on public.%I from anon, authenticated',t);
     execute format('grant all on public.%I to service_role',t);
   end loop;
+  execute 'grant usage, select on sequence ' || pg_get_serial_sequence('public.finance_operations','posting_index') || ' to service_role';
   for f in select oid::regprocedure from pg_proc where pronamespace='public'::regnamespace and proname like 'finance_%' loop
     execute format('revoke all on function %s from public, anon, authenticated',f);
     execute format('grant execute on function %s to service_role',f);

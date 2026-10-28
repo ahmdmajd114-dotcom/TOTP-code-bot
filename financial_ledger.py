@@ -120,11 +120,28 @@ class Ledger:
         self.client, self.owner_id = client, int(owner_id)
         self._mode = None
 
+    @staticmethod
+    def require_current_schema(result):
+        if int(result.get('schema_version',0))<2:
+            raise FinanceError('حدّث ملف supabase_financial_ledger.sql في Supabase قبل تشغيل الحفظ؛ نسخة الجداول الحالية تفتقد حماية تدقيق الخزن.')
+
     def rpc(self, name, **params):
         try:
             return self.client.rpc(name, {'p_owner': self.owner_id, **params}).execute().data
         except Exception as exc:
             logger.exception('Financial RPC failed: %s', name)
+            reason=str(getattr(exc,'message',exc))
+            messages={
+                'Financial balance mismatch':'وجدت فرقاً بين الأرصدة والقيود. أوقفت الحفظ؛ راجع تدقيق الخزن، ولا تعالج الفرق بزيادة مجهولة.',
+                'Financial opening record missing':'سجل أرصدة البداية مفقود؛ لا أستطيع تأكيد الخزن قبل مراجعته.',
+                'Customer credit has been used':'جزء من رصيد هذه العملية استُخدم لاحقاً. تراجع عن العملية التي استخدمته أولاً حتى ما يختل الرصيد.',
+                'Debt has repayments; reverse them first':'هذا الدين عليه تسديدات لاحقة. تراجع عن التسديدات المرتبطة أولاً، ثم عن الدين.',
+                'Operation already has a refund or reversal':'هذه العملية مرتبطة باسترجاع أو تراجع سابق. افتح الحركة التابعة وراجعها أولاً.',
+                'Debt balance changed':'متبقي الدين تغيّر؛ أعد اختياره وراجع مبلغ التسديد.',
+                'Insufficient customer credit':'رصيد الزبون لا يغطي المبلغ المحدد؛ راجع التوزيع.',
+            }
+            for marker,message in messages.items():
+                if marker in reason:raise FinanceError(message) from exc
             raise FinanceError('تعذر تأكيد العملية المالية. أعد المحاولة بنفس البطاقة.') from exc
 
     def mode(self, *, refresh=False):
@@ -138,6 +155,7 @@ class Ledger:
             if str(getattr(exc, 'code', '')) == 'PGRST202':
                 return 'missing'
             raise FinanceError('تعذر قراءة حالة السجل المالي؛ لم أغيّر طريقة التخزين.') from exc
+        if result['mode']=='active':self.require_current_schema(result)
         self._mode = result['mode']
         return self._mode
 
@@ -152,11 +170,13 @@ class Ledger:
             raise FinanceError('هيّئ السجل المالي من المالية ← تهيئة ومراجعة، أولاً.')
 
     def setup(self, action, snapshot=None):
+        self.require_current_schema(self.rpc('finance_setup',p_action='status'))
         result = self.rpc('finance_setup', p_action=action, p_snapshot=snapshot)
         self._mode = result['mode']
         return result
 
     def post(self, payload, *, correction=None):
+        self.require_active()
         validate(payload)
         if correction:
             return self.rpc('finance_correct', p_reference=correction, p_replacement=payload)

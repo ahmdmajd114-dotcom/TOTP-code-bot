@@ -42,6 +42,23 @@ class AmountTests(unittest.TestCase):
         c=Mock();c.rpc.return_value.execute.side_effect=Missing()
         self.assertEqual(Ledger(c,1).mode(),'missing')
 
+    def test_old_active_schema_blocks_posts_before_money_rpc(self):
+        c=Mock();c.rpc.return_value.execute.return_value.data={'mode':'active'}
+        with self.assertRaisesRegex(FinanceError,'حماية تدقيق الخزن'):
+            Ledger(c,1).post({'id':'PAY-NEW','kind':'capital','payments':[{'wallet':'master','amount':1000}]})
+        self.assertEqual([call.args[0] for call in c.rpc.call_args_list],['finance_setup'])
+
+    def test_old_schema_cannot_begin_or_activate_setup(self):
+        for action in ('begin','activate'):
+            c=Mock();c.rpc.return_value.execute.return_value.data={'mode':'legacy'}
+            with self.assertRaisesRegex(FinanceError,'حماية تدقيق الخزن'):Ledger(c,1).setup(action)
+            self.assertEqual(c.rpc.call_count,1)
+
+    def test_current_schema_allows_atomic_post(self):
+        c=Mock();c.rpc.return_value.execute.side_effect=[Mock(data={'mode':'active','schema_version':2}),Mock(data={'id':'PAY-NEW'})]
+        self.assertEqual(Ledger(c,1).post({'id':'PAY-NEW','kind':'capital','payments':[{'wallet':'master','amount':1000}]}),{'id':'PAY-NEW'})
+        self.assertEqual([call.args[0] for call in c.rpc.call_args_list],['finance_setup','finance_post'])
+
     def test_historical_import_does_not_add_cash_to_opening_wallets(self):
         p=[['date','total','wallet','product','name','account','chat'],['2026-10-27','15000','master 15000','ChatGPT','Ali','','123']]
         s=build_legacy_snapshot(p,[['date','amount','reason']],[],[],[],{'master':50000})
@@ -227,6 +244,53 @@ class PostgresTransactionTests(unittest.TestCase):
         self.rpc(self.op(payments=[{'wallet':'master','amount':1000}],credit_used=7000))
         self.rpc(self.op('reversal',reference_id=sale['id']),False)
         self.assertEqual(self.balances()['credit:123'],0)
+
+    def test_unexplained_balance_edit_blocks_new_financial_writes(self):
+        self.sql(f"update finance_accounts set balance=balance+777 where owner_id={self.owner} and key='wallet:master'")
+        p=self.op();self.rpc(p,False)
+        self.assertEqual(self.balances()['wallet:master'],100777)
+        self.assertEqual(self.sql(f"select count(*) from finance_operations where owner_id={self.owner} and id='{p['id']}'"),'0')
+        from vault_manager import audit_balances
+        audit=audit_balances(json.loads(self.sql(f'select finance_read({self.owner})')))
+        self.assertEqual(audit['wallet:master']['difference'],777)
+
+    def test_refund_can_be_undone_once_and_refund_limit_is_restored(self):
+        sale=self.op();self.rpc(sale)
+        refund=self.op('refund',customer_id=123,reference_id=sale['id'],payments=[{'wallet':'master','amount':3000}]);self.rpc(refund)
+        reverse=self.op('reversal',reference_id=refund['id']);self.rpc(reverse);self.rpc(reverse)
+        self.assertEqual(self.balances()['wallet:master'],108000)
+        self.rpc(self.op('reversal',reference_id=refund['id']),False)
+        self.rpc(self.op('refund',customer_id=123,reference_id=sale['id'],payments=[{'wallet':'master','amount':8000}]))
+        self.assertEqual(self.balances()['wallet:master'],100000)
+
+    def test_new_debt_can_be_undone_before_repayment_without_changing_wallets(self):
+        debt=self.op('debt_issue',customer_id=123,customer_name='Ali',product='ChatGPT',sales=8000,new_debt=8000,payments=[])
+        self.rpc(debt)
+        self.rpc(self.op('reversal',reference_id=debt['id']))
+        self.assertEqual(self.remaining('DEBT-'+debt['id']),0)
+        self.assertEqual(self.balances()['wallet:master'],100000)
+
+    def test_transfer_undo_restores_both_wallets_once(self):
+        transfer=self.op('transfer',to_wallet='zain',payments=[{'wallet':'master','amount':5000}]);self.rpc(transfer)
+        reverse=self.op('reversal',reference_id=transfer['id']);self.rpc(reverse);self.rpc(reverse)
+        self.assertEqual(self.balances()['wallet:master'],100000)
+        self.assertEqual(self.balances()['wallet:zain'],50000)
+
+    def test_corrected_sale_keeps_receipt_proof_reserved(self):
+        sale=self.op(proof_id='receipt-original');self.rpc(sale)
+        replacement=self.op(sales=9000,payments=[{'wallet':'master','amount':9000}],proof_id='receipt-original')
+        self.sql(f"select finance_correct({self.owner},'{sale['id']}',{self.json(replacement)})")
+        self.assertEqual(self.balances()['wallet:master'],109000)
+        self.rpc(self.op(proof_id='receipt-original'),False)
+
+    def test_statement_has_exact_posting_sequence_for_simultaneous_timestamps(self):
+        from vault_manager import wallet_statement
+        first=self.op(id='PAY-ZZZ-LAST-LEX');second=self.op(id='PAY-AAA-FIRST-LEX')
+        self.sql(f'select finance_post({self.owner},{self.json(first)}); select finance_post({self.owner},{self.json(second)})')
+        data=json.loads(self.sql(f'select finance_read({self.owner})'))
+        audit,rows=wallet_statement(data,'master')
+        self.assertEqual([(r['id'],r['balance']) for r in rows],[(second['id'],116000),(first['id'],108000)])
+        self.assertTrue(audit['matched'])
 
 
 if __name__=='__main__':unittest.main()

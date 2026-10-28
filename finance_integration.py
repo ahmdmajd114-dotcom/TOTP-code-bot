@@ -157,17 +157,22 @@ async def intercept_expense_photo(update,context,pending):
 
 
 async def financial_shortcut(context,bm,chat_id,text,customer_name=None):
-    if text.strip()!='صرف':return False
+    command=text.strip()
+    if command not in {'صرف','قبض'}:return False
     # Deletion has priority even when the ledger is unavailable/not configured.
     try:
         await context.bot.delete_business_messages(business_connection_id=bm.business_connection_id,message_ids=[bm.message_id])
-    except Exception:logger.warning('Cannot delete expense shortcut for %s',chat_id)
+    except Exception:logger.warning('Cannot delete financial shortcut for %s',chat_id)
     try:
         ledger().require_active()
         from debt_manager import cancel_debt_input
         cancel_debt_input(context)
-        from expense_manager import start_expense
-        await start_expense(context,customer_id=chat_id,customer_name=customer_name)
+        if command=='قبض':
+            from income_manager import start_income
+            await start_income(context,customer_id=chat_id,customer_name=customer_name)
+        else:
+            from expense_manager import start_expense
+            await start_expense(context,customer_id=chat_id,customer_name=customer_name)
     except FinanceError as exc:
         await context.bot.send_message(chat_id=_config.owner_id,text=f'⚠️ {exc}')
     return True

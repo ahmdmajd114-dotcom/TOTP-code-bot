@@ -1,15 +1,94 @@
 """Wallet movements and explicit reconciliation; transfers are not revenue."""
 from __future__ import annotations
 
-from financial_ledger import FinanceError,ledger,money,transaction_date
-from finance_ui import services,draft,navigate,display,keyboard,commit_card,suspend_finance_inputs
+from financial_ledger import FinanceError,ledger,money,transaction_date,source_id,KINDS,BAGHDAD
+from datetime import datetime
+from finance_ui import services,draft,navigate,display,keyboard,menu_keyboard,commit_card,suspend_finance_inputs
+
+
+def audit_balances(snapshot):
+    """Rebuild every account independently from immutable opening and entries."""
+    if 'entries' not in snapshot:
+        raise FinanceError('حدّث ملف الجداول حتى يتاح تدقيق الخزن؛ لم أفترض أن القيود صفر.')
+    openings=[r for r in snapshot['operations'] if r['kind']=='opening']
+    if len(openings)!=1:
+        raise FinanceError('سجل أرصدة البداية غير واضح؛ لا يمكن تأكيد المطابقة.')
+    expected={}
+    for item in openings[0]['payload']['accounts']:
+        key=item['key']
+        if key in expected:raise FinanceError('حساب مكرر ضمن أرصدة البداية.')
+        expected[key]=money(item['balance'],signed=True)
+    opening=dict(expected)
+    operations={r['id']:r for r in snapshot['operations']}
+    for entry in snapshot['entries']:
+        if entry['operation_id'] not in operations:
+            raise FinanceError('يوجد قيد مالي بلا عملية أصلية؛ يلزم تدقيقه.')
+        key=entry['account_key']
+        expected[key]=expected.get(key,0)+money(entry['delta'],signed=True)
+    actual=snapshot['accounts']
+    return {key:{'opening':opening.get(key,0),'movements':expected.get(key,0)-opening.get(key,0),
+                 'expected':expected.get(key,0),'actual':int(actual.get(key,0)),
+                 'difference':int(actual.get(key,0))-expected.get(key,0),
+                 'matched':key in actual and key in expected and int(actual[key])==expected[key]}
+            for key in sorted(set(expected)|set(actual))}
+
+
+def wallet_statement(snapshot,name):
+    audited=audit_balances(snapshot);key='wallet:'+name
+    if key not in audited:raise FinanceError('الخزنة غير موجودة.')
+    by_id={r['id']:r for r in snapshot['operations']}
+    entries=[e for e in snapshot['entries'] if e['account_key']==key]
+    entries.sort(key=lambda e:(by_id[e['operation_id']].get('posting_index',0),by_id[e['operation_id']]['recorded_at'],e['operation_id']))
+    result=[];balance=audited[key]['opening']
+    for e in entries:
+        delta=int(e['delta']);balance+=delta;record=by_id[e['operation_id']]
+        result.append({'id':record['id'],'delta':delta,'balance':balance,'kind':record['kind'],
+                       'recorded_at':record['recorded_at'],'description':record['payload'].get('description') or record.get('product') or '',
+                       'customer':record['payload'].get('customer_name') or record.get('customer_id') or ''})
+    return audited[key],list(reversed(result))
 
 
 async def show_vaults(message):
-    ledger().require_active(); accounts=ledger().accounts()
+    ledger().require_active();snapshot=ledger().snapshot();audit=audit_balances(snapshot);accounts=snapshot['accounts']
     names=list(dict.fromkeys([*services().wallets(),*(k[7:] for k in accounts if k.startswith('wallet:'))]))
     text='🏦 أرصدة الخزن المحسوبة\n'+'\n'.join(f"{w}: {accounts.get('wallet:'+w,0):,}" for w in names)
-    await message.reply_text(text,reply_markup=keyboard([[('تحويل بين الخزن','finance_wallet_transfer')],[('إضافة رأس مال','finance_wallet_capital'),('سحب شخصي','finance_wallet_withdrawal')],[('مطابقة رصيد فعلي','finance_wallet_vault_adjustment')]]))
+    mismatches=[key for key,value in audit.items() if not value['matched']]
+    text+='\n\n'+('⚠️ يوجد فرق داخلي؛ يلزم التدقيق قبل تسجيل حركة جديدة.' if mismatches else '✅ الأرصدة مطابقة لرصيد البداية وجميع القيود المسجلة.')
+    rows=[[('تحويل بين الخزن','finance_wallet_transfer')],[('إضافة رأس مال','finance_wallet_capital'),('سحب شخصي','finance_wallet_withdrawal')],[('مطابقة رصيد فعلي','finance_wallet_vault_adjustment')],[('🔎 تدقيق الخزن','finance_walletaudit')]]
+    rows += [[('📋 حركات '+name,'finance_walletlog_'+source_id('W',name)+'_0')] for name in names if 'wallet:'+name in audit]
+    await message.reply_text(text,reply_markup=menu_keyboard(rows))
+
+
+async def handle_vault_menu(data,query,context):
+    if data=='finance_vaults':
+        await show_vaults(query.message)
+        return
+    ledger().require_active();snapshot=ledger().snapshot();audit=audit_balances(snapshot)
+    if data=='finance_walletaudit':
+        lines=['🔎 تدقيق الخزن']
+        for key,r in audit.items():
+            if not key.startswith('wallet:'):continue
+            lines.append(f"{key[7:]}\nالبداية: {r['opening']:,}\nصافي الحركات: {r['movements']:+,}\nالمفترض: {r['expected']:,}\nالمسجل: {r['actual']:,}\n"+('✅ مطابق' if r['matched'] else f"⚠️ فرق داخلي: {r['difference']:+,}"))
+        lines.append('التدقيق لا يغيّر الرصيد. مطابقة الرصيد الفعلي تتم بعملية مستقلة لها سبب وتأكيد.')
+        await query.message.reply_text('\n\n'.join(lines)[:4000],reply_markup=menu_keyboard([],back='finance_vaults'))
+        return
+    token,page=data[len('finance_walletlog_'):].rsplit('_',1);page=max(0,int(page))
+    name=next((k[7:] for k in audit if k.startswith('wallet:') and source_id('W',k[7:])==token),None)
+    if name is None:raise FinanceError('الخزنة لم تعد موجودة؛ افتح القائمة من جديد.')
+    r,entries=wallet_statement(snapshot,name);page=min(page,max(0,(len(entries)-1)//6))
+    lines=[f"📋 حركات {name}\nرصيد البداية: {r['opening']:,}\nالرصيد المسجل: {r['actual']:,}\nالحركات: {len(entries)}"]
+    rows=[]
+    for entry in entries[page*6:(page+1)*6]:
+        stamp=datetime.fromisoformat(entry['recorded_at'].replace('Z','+00:00')).astimezone(BAGHDAD).strftime('%Y-%m-%d %H:%M')
+        lines.append(f"{stamp} — {KINDS.get(entry['kind'],entry['kind'])}\nالحركة: {entry['delta']:+,} | الرصيد بعدها: {entry['balance']:,}\n{entry['description']}\nالزبون: {entry['customer'] or 'عام'}\nرقم: {entry['id']}")
+        rows.append([('تفاصيل '+entry['id'],'finance_view_'+entry['id'])])
+    if not entries:lines.append('لا توجد حركات بعد رصيد البداية.')
+    context.user_data['finance_records_return']=data
+    nav=[]
+    if page:nav.append(('السابق',f'finance_walletlog_{token}_{page-1}'))
+    if (page+1)*6<len(entries):nav.append(('التالي',f'finance_walletlog_{token}_{page+1}'))
+    if nav:rows.append(nav)
+    await query.message.reply_text('\n\n'.join(lines)[:4000],reply_markup=menu_keyboard(rows,back='finance_vaults'))
 
 
 async def start_vault_action(context,kind):
@@ -23,6 +102,10 @@ async def start_vault_action(context,kind):
 async def render_vault(state,context,query=None):
     from financial_ledger import KINDS
     text='🏦 '+KINDS[state['kind']];rows=[];step=state['step'];state['awaiting']=False
+    if state['kind']=='reversal':
+        text=f"↩️ تراجع مالي مرتبط\nرقم الأصل: {state['reference_id']}\n{state.get('reversal_preview') or 'سيعكس تأثير العملية الأصلية وحدها.'}\nالسبب: {state.get('description') or '—'}\nلن يحذف سجل العملية الأصلية."
+        await display(context,state,text,[[('✅ تثبيت التراجع','commit')],[('◀️ رجوع','back'),('إلغاء','cancel')]],query)
+        return
     if step in {'wallet','to'}:
         state['wallet_options']=list(services().wallets())
         rows=[[(w,f'wallet{i}')] for i,w in enumerate(state['wallet_options']) if step!='to' or w!=state.get('wallet')]

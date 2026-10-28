@@ -40,9 +40,13 @@ def keyboard(rows):
     return _services.markup([[_services.button(label, callback_data=callback) for label, callback in line] for line in rows])
 
 
-def draft(kind, **fields):
-    return {'draft_id': operation_id('D')[2:12], 'operation_id': operation_id('PAY' if kind == 'income' else 'EXP'),
-            'flow': kind, 'kind': 'sale' if kind == 'income' else 'expense', 'occurred_at': now_iso(),
+def menu_keyboard(rows, back='finance_home'):
+    return keyboard([*rows,[('◀️ رجوع',back)]])
+
+
+def draft(flow, **fields):
+    return {'draft_id': operation_id('D')[2:12], 'operation_id': operation_id('PAY' if flow == 'income' else 'EXP'),
+            'flow': flow, 'kind': 'sale' if flow == 'income' else 'expense', 'occurred_at': now_iso(),
             'step': 'product', 'history': [], 'revision': 0, 'awaiting': False, 'payments': [], **fields}
 
 
@@ -121,12 +125,13 @@ async def handle_finance_callback(update, context):
         if saved:
             state['committed'] = True
         if state.get('committed'):
-            await query.message.reply_text(f"✅ العملية محفوظة برقم {state['operation_id']}؛ لم أكررها.")
+            await query.message.reply_text(f"✅ العملية محفوظة برقم {state['operation_id']}؛ لم أكررها.",reply_markup=menu_keyboard([[('تفاصيل العملية','finance_view_'+state['operation_id'])]]))
             return
         if action == 'cancel':
             state['closed'], state['awaiting'] = True, False
             ledger().save_draft(state)
-            await query.edit_message_caption(caption='تم الإلغاء قبل التثبيت.', reply_markup=None) if state.get('photo') else await query.edit_message_text('تم الإلغاء قبل التثبيت.', reply_markup=None)
+            markup=menu_keyboard([])
+            await query.edit_message_caption(caption='تم الإلغاء قبل التثبيت.', reply_markup=markup) if state.get('photo') else await query.edit_message_text('تم الإلغاء قبل التثبيت.', reply_markup=markup)
             return
         if state.get('closed'):
             raise FinanceError('هذه البطاقة ملغاة. افتح عملية جديدة.')
@@ -137,6 +142,15 @@ async def handle_finance_callback(update, context):
         handler, render = {'fi': (handle_income_action, render_income), 'fe': (handle_expense_action, render_expense), 'fv': (handle_vault_action, render_vault)}[prefix]
         if int(revision) == state['revision']:
             if action == 'back':
+                if not state.get('history'):
+                    state['awaiting']=False
+                    ledger().save_draft(state)
+                    if state.get('return_to'):
+                        from reports_manager import handle_report_menu
+                        await handle_report_menu(state['return_to'],query,context)
+                    else:
+                        await show_finance(query.message)
+                    return
                 back(state)
             else:
                 await handler(state, action, context, query)
@@ -215,10 +229,13 @@ async def commit_card(state, payload, context, query):
     message = f"✅ تم حفظ العملية كاملة.\nرقم العملية: {payload['id']}"
     if pending:
         message += '\nمزامنة الشيت والمتابعة بالانتظار؛ النظام يعيدها تلقائياً.'
+    rows=[[('تفاصيل العملية','finance_view_'+payload['id'])]]
+    if payload['kind']!='reversal':rows.append([('↩️ التراجع عن العملية','finance_reverse_'+payload['id'])])
+    markup=menu_keyboard(rows)
     if state.get('photo'):
-        await query.edit_message_caption(caption=message, reply_markup=None)
+        await query.edit_message_caption(caption=message, reply_markup=markup)
     else:
-        await query.edit_message_text(message, reply_markup=None)
+        await query.edit_message_text(message, reply_markup=markup)
     try:
         await _services.notify(context, payload)
     except Exception:
@@ -263,7 +280,7 @@ async def show_finance(message):
                     [('⏳ تحتاج متابعة', 'finance_pending')]]
         await message.reply_text(text, reply_markup=keyboard(rows))
     except FinanceError as exc:
-        await message.reply_text(f'⚠️ {exc}')
+        await message.reply_text(f'⚠️ {exc}',reply_markup=keyboard([[('ملف الجداول المحدث','finance_sql')],[('تحديث','finance_home')]]))
 
 
 async def handle_finance_menu(update, context):
@@ -274,7 +291,10 @@ async def handle_finance_menu(update, context):
     await query.answer()
     data = query.data
     try:
-        if data == 'finance_sql':
+        context.user_data.pop('finance_report_input',None)
+        if data == 'finance_home':
+            await show_finance(query.message)
+        elif data == 'finance_sql':
             with Path(__file__).with_name('supabase_financial_ledger.sql').open('rb') as document:
                 await context.bot.send_document(chat_id=_services.owner_id, document=document, caption='شغّل الملف مرة واحدة في SQL Editor بمشروع Supabase نفسه، ثم اضغط تهيئة ومراجعة.')
         elif data == 'finance_setup':
@@ -292,13 +312,13 @@ async def handle_finance_menu(update, context):
             if snapshot['warnings']:
                 text += '\n\n' + '\n'.join(snapshot['warnings'])
             text += '\n\nالمالية متوقفة حتى تعتمد هذه الأرقام أو تلغي التهيئة.'
-            await query.edit_message_text(text[:4000], reply_markup=keyboard([[('✅ اعتماد أرقام البداية', 'finance_activate')], [('إلغاء والعودة للنظام السابق', 'finance_setup_cancel')]]))
+            await query.edit_message_text(text[:4000], reply_markup=menu_keyboard([[('✅ اعتماد أرقام البداية', 'finance_activate')], [('إلغاء والعودة للنظام السابق', 'finance_setup_cancel')]]))
         elif data == 'finance_activate':
             ledger().setup('activate')
             await show_finance(query.message)
         elif data == 'finance_setup_cancel':
             ledger().setup('cancel')
-            await query.edit_message_text('أُلغيت التهيئة؛ البيانات القديمة بقيت كما هي.')
+            await query.edit_message_text('أُلغيت التهيئة؛ البيانات القديمة بقيت كما هي.',reply_markup=menu_keyboard([]))
         elif data == 'finance_income':
             from debt_manager import cancel_debt_input
             cancel_debt_input(context)
@@ -313,9 +333,9 @@ async def handle_finance_menu(update, context):
                 context.user_data.pop(key,None)
             from expense_manager import start_expense
             await start_expense(context)
-        elif data == 'finance_vaults':
-            from vault_manager import show_vaults
-            await show_vaults(query.message)
+        elif data.startswith(('finance_vaults','finance_walletaudit','finance_walletlog')):
+            from vault_manager import handle_vault_menu
+            await handle_vault_menu(data,query,context)
         elif data.startswith('finance_credit_'):
             from customer_balance_manager import start_credit_adjustment
             await start_credit_adjustment(context,int(data[len('finance_credit_'):]))
