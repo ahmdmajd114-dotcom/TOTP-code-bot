@@ -22,7 +22,7 @@ def export_report(report):
     tables={
         'filters.csv':[['الفلتر','القيمة'],*[[k,v] for k,v in report['filters'].items()]],
         'summary.csv':[['المؤشر','القيمة'],['وقت القراءة',report['as_of'].isoformat()],['الفترة',report['filters']['period']],
-                       *[[LABELS[k],v] for k,v in report['totals'].items()],['الربح','غير متاح قبل ربط تكلفة المبيعات']],
+                       *[[LABELS[k],v] for k,v in report['totals'].items()]],
         'products.csv':[['معرف المنتج','الاسم',*[LABELS[k] for k in fields]],
                         *[[g['key'],g['name'],*[g['metrics'][k] for k in fields]] for g in report['products']]],
         'operations.csv':[['رقم العملية','تاريخ العملية','تاريخ التسجيل','النوع','معرف الزبون','المصدر',*[LABELS[k] for k in fields]],

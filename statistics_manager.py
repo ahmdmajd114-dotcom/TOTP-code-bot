@@ -27,8 +27,7 @@ def summary_text(report):
           f"المبيعات بعد المسترجعات: {t['net_sales']:,}\n"
           f"صافي عدد المبيعات: {t['sales_count']} | زبائن المبيعات المعروفة: {report['buyers']}\n"
           f"أول بيع معروف: {report['new_buyers']} | سبق لهم شراء معروف: {report['returning']}\n\n"
-          f"الديون الحالية: {p['debt_current']:,}\nأرصدة محفوظة للزبائن الآن: {p['credit_current']:,}\n"
-          'الربح غير متاح حتى تُربط تكلفة المبيعات؛ صافي الأموال ليس الربح.')
+          f"الديون الحالية: {p['debt_current']:,}\nأرصدة محفوظة للزبائن الآن: {p['credit_current']:,}")
     if t['reversal_count']:text+=f"\nتراجعات القيود: {t['reversal_count']} | قبض مصحح: {t['receipt_corrections']:,} | صرف مصحح: {t['spend_corrections']:,}"
     if q['unknown_sales']:text+=f"\n⚠️ {q['unknown_sales']} حركة قديمة بقيمة مقبوض {q['unknown_receipts']:,}؛ تصنيف البيع غير معروف."
     if q['undated']:text+=f"\n⚠️ {q['undated']} حركة بلا تاريخ؛ تدخل في كل الوقت فقط."
@@ -96,7 +95,7 @@ async def render(message,context,view='home'):
               [('💳 الديون والأرصدة','debts'),('🏦 الخزن','wallets:0')],
               [('📨 مصادر المبيعات','sources:0'),('📊 المقارنة','compare')],
               [('👥 الاشتراكات والحسابات','subscriptions'),('🎁 الدعوات والحملات','rewards')],
-              [('⚠️ تحتاج انتباهك','attention:0'),('💰 التكلفة والربح','costs')],
+              [('⚠️ تحتاج انتباهك','attention:0'),('💸 تفصيل المصاريف','expenses')],
               [('📥 تصدير نفس القراءة','export'),('🔄 قراءة جديدة','refresh')]]
         await message.reply_text(text,reply_markup=keyboard([[ (label,'stats2:'+a) for label,a in line] for line in rows]));return
     if action=='filters':
@@ -155,10 +154,10 @@ async def render(message,context,view='home'):
             for k in ('received','sales','expenses','refunds','sales_count'):
                 text+=f"\n{LABELS[k]}: {t[k]:,} | السابقة: {r['previous'][k]:,} | الفرق: {t[k]-r['previous'][k]:+,}"
         text+='\nالبيانات التاريخية الناقصة تؤثر على المقارنة؛ راجع جودة البيانات.'
-    elif action=='costs':
-        text=(f"💰 التكلفة والربح\nالمبيعات المعروفة: {t['sales']:,}\nالمصاريف المسجلة: {t['expenses']:,}\n"
-              f"شراء/تكلفة منتجات: {t['product_costs']:,}\nتشغيل: {t['operating_expenses']:,}\nرسوم: {t['fee_expenses']:,}\nعام: {t['general_expenses']:,}\nغير مصنف: {t['unknown_expenses']:,}\n\n"
-              'لا يوجد ربط موثوق حالياً بين تكلفة كل حساب/مقعد والبيع الذي استهلكه.\nلذلك الربح وتكلفة المقاعد غير المباعة غير متاحين.\nمصروف شراء حساب مشترك قد يخدم عدة زبائن وفترات؛ لا نقسمه تلقائياً أو نعتبر كل مصاريف الفترة تكلفة مبيعاتها.')
+    elif action in {'expenses','costs'}:
+        # Old inline buttons still open the expense breakdown after renaming.
+        text=(f"💸 تفصيل المصاريف\nالمصاريف المسجلة: {t['expenses']:,}\n"
+              f"شراء منتجات: {t['product_costs']:,}\nتشغيل: {t['operating_expenses']:,}\nرسوم: {t['fee_expenses']:,}\nعام: {t['general_expenses']:,}\nغير مصنف: {t['unknown_expenses']:,}")
     elif action=='subscriptions':
         text='👥 الاشتراكات والحسابات — حالتها وقت القراءة، لكل المتجر'
         sub=op['subscriptions'];acc=op['accounts']
