@@ -132,6 +132,7 @@ class Ledger:
             logger.exception('Financial RPC failed: %s', name)
             reason=str(getattr(exc,'message',exc))
             messages={
+                'Delivery allocation exists':'الدفعة مرتبطة باشتراك مُسلَّم أو محجوز. راجع عملية التسليم وتراجع عن أثرها المطلوب أولاً؛ لم أغيّر الأموال أو ألْغِ الخدمة تلقائياً.',
                 'Financial balance mismatch':'وجدت فرقاً بين الأرصدة والقيود. أوقفت الحفظ؛ راجع تدقيق الخزن، ولا تعالج الفرق بزيادة مجهولة.',
                 'Financial opening record missing':'سجل أرصدة البداية مفقود؛ لا أستطيع تأكيد الخزن قبل مراجعته.',
                 'Customer credit has been used':'جزء من رصيد هذه العملية استُخدم لاحقاً. تراجع عن العملية التي استخدمته أولاً حتى ما يختل الرصيد.',

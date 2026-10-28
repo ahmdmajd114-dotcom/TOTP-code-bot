@@ -1,0 +1,9 @@
+-- LOCAL TEST DATABASE ONLY. This schema is never installed in production.
+create table if not exists totp_accounts(id bigint generated always as identity primary key,label text,secret text,link_code text unique);
+create table if not exists totp_links(chat_id bigint primary key,account_id bigint references totp_accounts(id),linked_at timestamptz default now());
+create table if not exists customer_totp_account_links(customer_chat_id bigint,account_id text,is_primary boolean default false,status text default 'active',linked_at timestamptz default now(),last_selected_at timestamptz,primary key(customer_chat_id,account_id));
+create table if not exists chatgpt_shared_accounts(id uuid primary key default gen_random_uuid(),email text unique,password text,totp_secret text,capacity integer default 3,is_active boolean default true,created_at timestamptz default now());
+create table if not exists chatgpt_account_assignments(id bigint generated always as identity primary key,account_id uuid,customer_chat_id bigint,status text default 'active');
+create table if not exists subscription_reminders(id bigint generated always as identity primary key,customer_chat_id bigint,customer_name text,business_connection_id text,subscription_type text,duration_days integer,product_name text,plan_name text,plan_duration text,is_debt boolean default false,started_at timestamptz,expires_at timestamptz,status text,feedback_status text default 'none',financial_operation_id text,scheduled_message_id bigint,scheduled_message_status text default 'none');
+create table if not exists catalog_products(id uuid primary key default gen_random_uuid(),name text,is_active boolean default true);
+create table if not exists catalog_plans(id uuid primary key default gen_random_uuid(),product_id uuid,name text,price integer,duration text,is_active boolean default true);

@@ -328,6 +328,8 @@ async def handle_finance_menu(update, context):
     await query.answer()
     data = query.data
     try:
+        context.user_data.pop('delivery_input',None)
+        context.user_data.pop('delivery_admin_input',None)
         context.user_data.pop('statistics_input',None)
         context.user_data.pop('finance_report_input',None)
         if data == 'finance_home':

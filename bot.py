@@ -75,6 +75,12 @@ from finance_integration import (
 )
 from financial_ledger import FinanceError, ledger, source_id, money as financial_money
 from finance_ui import show_finance, handle_finance_callback, handle_finance_menu, finance_worker, suspend_finance_inputs
+from account_delivery import (DeliveryServices, configure_delivery, start_link as start_managed_link,
+    handle_delivery_callback, handle_admin_callback as handle_delivery_admin_callback,
+    handle_admin_input as handle_delivery_admin_input, code_permission as delivery_code_permission)
+from account_delivery import reminder_managed as delivery_reminder_managed
+from account_delivery import account_customers as delivery_account_customers
+from account_delivery import account_resource as delivery_account_resource
 from finance_subscription import (configure_subscription_projection, save_financial_subscription, notify_financial_operation,
     financial_delivery_payment, ensure_pending_financial_delivery)
 from finance_instagram import configure_instagram_projection, project_financial_instagram
@@ -2601,6 +2607,7 @@ def build_shared_vault_accounts_keyboard(accounts: list[dict]) -> InlineKeyboard
         ),
     )] for account in accounts]
     rows.append([InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")])
+    rows.append([InlineKeyboardButton("🔗 تسليم الحسابات ورموز /link", callback_data="deliveryadmin:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3862,6 +3869,8 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
         pending_schedules: list[tuple[dict, int, datetime]] = []
         now = datetime.now(timezone.utc)
         for reminder in rows:
+            if delivery_reminder_managed(reminder['id']):
+                continue
             chat_id = reminder.get("customer_chat_id")
             if (
                 not chat_id
@@ -4756,6 +4765,11 @@ def get_instagram_account_sales(account_id: str) -> list[list[str]]:
 def get_instagram_shared_account_usage(account: dict) -> int:
     """Count active Telegram assignments plus confirmed Instagram seats."""
     account_id = str(account.get("id") or "")
+    managed = delivery_account_resource(account_id)
+    if managed is not None:
+        # Explicit /link contracts reserve atomically. The old Instagram Sheet
+        # allocator cannot acquire those holds and must not sell their seats.
+        return int(account.get('capacity') or managed['capacity'])
     try:
         if str(account_id).startswith("legacy:"):
             telegram_used = len(get_customers_for_account(account_id[len("legacy:"):]))
@@ -4808,6 +4822,9 @@ def get_all_accounts_with_secrets() -> list[dict]:
 
 def get_customers_for_account(account_id) -> list[int]:
     """يرجع قائمة chat_id تبع كل الزباين المرتبطين بحساب مشترك معين."""
+    managed = delivery_account_customers(account_id)
+    if managed is not None:
+        return managed
     try:
         res = supabase.table("totp_links").select("chat_id").eq("account_id", account_id).execute()
         return [r["chat_id"] for r in (res.data or [])]
@@ -6130,7 +6147,8 @@ def get_customer_totp_accounts(chat_id: int) -> list[dict]:
             rows = (supabase.table("totp_accounts").select("id, secret, label")
                     .eq("id", link["account_id"]).limit(1).execute().data or [])
             if rows:
-                accounts.append({**rows[0], **link})
+                if delivery_code_permission(chat_id,str(rows[0]['id'])) is not False:
+                    accounts.append({**rows[0], **link})
         except Exception:
             logger.exception("Failed to read TOTP account %s", link.get("account_id"))
     return accounts
@@ -6160,6 +6178,8 @@ def get_secret_for_chat(chat_id: int, account_id: str | None = None) -> tuple[st
             .order("assigned_at", desc=True).limit(1).execute().data or []
         )
         if assigned:
+            if delivery_code_permission(chat_id,str(assigned[0]['account_id'])) is False:
+                return None
             account = (
                 supabase.table("chatgpt_shared_accounts")
                 .select("totp_secret, email")
@@ -6259,9 +6279,13 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
             .limit(1).execute().data or []
         )
         if existing:
+            if delivery_code_permission(customer_chat_id,str(existing[0]['account_id'])) is False:
+                return None
             return existing[0].get("chatgpt_shared_accounts")
         accounts = supabase.table("chatgpt_shared_accounts").select("id, email, password, capacity").eq("is_active", True).order("created_at").execute().data or []
         for account in accounts:
+            if delivery_account_resource(account['id']) is not None:
+                continue
             used = supabase.table("chatgpt_account_assignments").select("id", count="exact").eq("account_id", account["id"]).eq("status", "active").execute()
             effective_capacity = min(int(account["capacity"]), SHARED_CHATGPT_ACCOUNT_CAPACITY)
             if (used.count or 0) >= effective_capacity:
@@ -6815,6 +6839,12 @@ async def generate_current_totp_code_for_chat(chat_id: int, account_id: str | No
     if code_age_seconds >= 15:
         wait_seconds = TOTP_PERIOD_SECONDS - code_age_seconds
         await asyncio.sleep(wait_seconds + 0.15)
+    current = (await run_io(lambda: get_secret_for_chat(chat_id, account_id)))
+    if current is None:
+        return None
+    if account_id is None and current != result:
+        return None
+    secret, _ = current
     return generate_totp_code(secret)
 
 
@@ -7496,6 +7526,8 @@ async def add_private_account(
 async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, bm=None) -> bool:
     """يعالج أوامر الأونر: /addaccount، /addprivate، /link، /resetcode، وAC."""
 
+    if await start_managed_link(context,bm,chat_id,text):
+        return True
     if bm is not None and await financial_shortcut(context, bm, chat_id, text):
         return True
     if text.strip() == "دين":
@@ -9831,6 +9863,8 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
                 BTN_ADMIN, BTN_DEBT, BTN_EXPENSE, BTN_ADD_ACCOUNT, BTN_CATALOG,
                 BTN_PAYMENT_METHODS, BTN_INCOME, BTN_STATS, BTN_CONTINUITY_STATS}:
         context.user_data.pop('statistics_input', None)
+        context.user_data.pop('delivery_input', None)
+        context.user_data.pop('delivery_admin_input', None)
     if text == BTN_FINANCE:
         cancel_debt_input(context)
         await show_finance(message)
@@ -10544,6 +10578,8 @@ async def on_owner_private_message(update: Update, context: ContextTypes.DEFAULT
             return
     # أزرار الإدارة الرئيسية تأخذ الأولوية على أي وضع إدخال قديم.
     if await handle_reply_keyboard_button(update, context):
+        return
+    if await handle_delivery_admin_input(update,context):
         return
     if await finance_owner_input(update, context):
         return
@@ -12523,6 +12559,10 @@ def main() -> None:
         instagram=project_financial_instagram,
     ))
     configure_financial_debts(active=finance_active, records=financial_debt_records, post=post_debt, repay=financial_repay)
+    configure_delivery(DeliveryServices(client=supabase,owner_id=OWNER_USER_ID,
+        products=get_catalog_products,plans=get_catalog_plans,duration=duration_to_days,
+        is_chatgpt=is_chatgpt_product_name,schedule=schedule_subscription_feedback,
+        cancel_schedule=cancel_personal_scheduled_message,invite=schedule_continuity_invite,identity=get_telegram_customer_identity))
     configure_debts(DebtServices(
         owner_id=OWNER_USER_ID,
         open_spreadsheet=open_store_spreadsheet,
@@ -12577,6 +12617,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_payment_callback, pattern=r"^pay_"))
     app.add_handler(CallbackQueryHandler(handle_finance_callback, pattern=r"^f[iev]:"))
     app.add_handler(CallbackQueryHandler(handle_finance_menu, pattern=r"^finance_"))
+    app.add_handler(CallbackQueryHandler(handle_delivery_callback, pattern=r"^dl:"))
+    app.add_handler(CallbackQueryHandler(handle_delivery_admin_callback, pattern=r"^deliveryadmin:"))
 
     # تسجيل مبيعات الإنستغرام — متاح فقط لمعرف المدير المحدد بالبيئة.
     app.add_handler(CallbackQueryHandler(handle_instagram_callback, pattern=r"^ig_"))

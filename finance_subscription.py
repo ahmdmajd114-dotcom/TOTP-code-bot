@@ -17,6 +17,8 @@ def financial_delivery_payment(chat_id):
     for record in sorted(rows,key=lambda r:r['recorded_at'],reverse=True):
         p=record['payload']
         if record['kind']!='sale' or record['historical'] or record['id'] in cancelled or not _config['is_chatgpt'](record.get('product')):continue
+        from account_delivery import funding_managed
+        if funding_managed(record['id']):continue
         if datetime.fromisoformat(record['occurred_at'].replace('Z','+00:00'))<datetime.now(timezone.utc)-timedelta(days=7):continue
         reminders=_config['client'].table('subscription_reminders').select('status,feedback_status').eq('financial_operation_id',record['id']).limit(1).execute().data or []
         if reminders and reminders[0]['status']!='pending_delivery' and reminders[0].get('feedback_status')!='pending_delivery':continue
@@ -42,6 +44,8 @@ def ensure_pending_financial_delivery(chat_id):
 
 async def save_financial_subscription(payload):
     if not payload.get('customer_id') or not payload.get('subscription'):return
+    from account_delivery import funding_managed
+    if funding_managed(payload['id']):return
     client=_config['client'];oid=payload['id'];sub=payload['subscription']
     rows=(await run_io(lambda: client.table('subscription_reminders').select('*').eq('financial_operation_id',oid).limit(1).execute())).data or []
     state={'customer_chat_id':payload['customer_id'],'customer_name':payload.get('customer_name') or 'زبون',
