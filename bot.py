@@ -26,6 +26,7 @@ import logging
 import json
 from html import escape
 from payment_link_logic import find_current_paid_delivery_row
+from payment_sheet_logic import choose_payment_worksheet_title
 from types import SimpleNamespace
 import pyotp
 import httpx
@@ -307,11 +308,12 @@ async def call_ai_api(payload: dict, timeout: float = 20.0) -> dict | None:
 # عادي بكل شي ثاني، بس ميزة تسجيل الدفع تتعطل وتنبهك بذلك بدل ما يكرش.
 # ------------------------------------------------------------------
 _google_sheet = None
+_payment_sheet_resolution_note = None
 
 
 def get_google_sheet():
     """يرجع كائن الشيت (worksheet) جاهز للكتابة، أو None لو فشل الاتصال."""
-    global _google_sheet
+    global _google_sheet, _payment_sheet_resolution_note
     if _google_sheet is not None:
         return _google_sheet
     try:
@@ -324,7 +326,31 @@ def get_google_sheet():
         )
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        _google_sheet = spreadsheet.worksheet(GOOGLE_SHEET_WORKSHEET_NAME)
+        worksheets = spreadsheet.worksheets()
+        worksheet_headers = []
+        for worksheet in worksheets:
+            try:
+                worksheet_headers.append((worksheet.title, worksheet.row_values(1)))
+            except Exception:
+                logger.warning("Could not inspect worksheet header: %s", worksheet.title)
+        resolved_title = choose_payment_worksheet_title(
+            GOOGLE_SHEET_WORKSHEET_NAME, worksheet_headers,
+        )
+        if resolved_title is None:
+            raise RuntimeError(
+                "Payment worksheet not found. configured=%r available=%r"
+                % (GOOGLE_SHEET_WORKSHEET_NAME, [title for title, _ in worksheet_headers])
+            )
+        _google_sheet = next(ws for ws in worksheets if ws.title == resolved_title)
+        if resolved_title != GOOGLE_SHEET_WORKSHEET_NAME:
+            _payment_sheet_resolution_note = (
+                f"تم تصحيح تبويب المدفوعات تلقائياً من "
+                f"{GOOGLE_SHEET_WORKSHEET_NAME} إلى {resolved_title}"
+            )
+            logger.warning(
+                "Configured payment worksheet %r was not usable; resolved %r by headers",
+                GOOGLE_SHEET_WORKSHEET_NAME, resolved_title,
+            )
         if getattr(_google_sheet, "col_count", 0) < 8:
             _google_sheet.resize(
                 rows=max(getattr(_google_sheet, "row_count", 1000), 1000), cols=8
@@ -14078,6 +14104,18 @@ def start_health_server() -> None:
 
 async def on_bot_initialized(app: Application) -> None:
     """يشغّل إصلاح الجدولات القديمة فور إقلاع الخدمة، لا بعد انتظار الـJobQueue."""
+    payment_sheet = get_google_sheet()
+    if payment_sheet is None:
+        await app.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=("🚨 البوت اشتغل لكن ورقة المدفوعات غير متصلة. "
+                  "لن يسمح النظام بإغلاق دين قبل تسجيل الدخل. استخدم /sheetstatus."),
+        )
+    elif _payment_sheet_resolution_note:
+        await app.bot.send_message(
+            chat_id=OWNER_USER_ID,
+            text=f"✅ {_payment_sheet_resolution_note}.\nالتسجيل المالي عاد للعمل.",
+        )
     app.create_task(backfill_linked_chatgpt_schedules(None))
 
 
