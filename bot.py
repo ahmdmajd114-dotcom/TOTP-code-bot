@@ -27,6 +27,7 @@ import json
 from html import escape
 from payment_link_logic import find_current_paid_delivery_row
 from payment_sheet_logic import choose_payment_worksheet_title
+from payment_storage import PaymentWorksheet, payment_datetime
 from types import SimpleNamespace
 import pyotp
 import httpx
@@ -341,7 +342,7 @@ def get_google_sheet():
                 "Payment worksheet not found. configured=%r available=%r"
                 % (GOOGLE_SHEET_WORKSHEET_NAME, [title for title, _ in worksheet_headers])
             )
-        _google_sheet = next(ws for ws in worksheets if ws.title == resolved_title)
+        payment_worksheet = next(ws for ws in worksheets if ws.title == resolved_title)
         if resolved_title != GOOGLE_SHEET_WORKSHEET_NAME:
             _payment_sheet_resolution_note = (
                 f"تم تصحيح تبويب المدفوعات تلقائياً من "
@@ -351,13 +352,14 @@ def get_google_sheet():
                 "Configured payment worksheet %r was not usable; resolved %r by headers",
                 GOOGLE_SHEET_WORKSHEET_NAME, resolved_title,
             )
-        if getattr(_google_sheet, "col_count", 0) < 8:
-            _google_sheet.resize(
-                rows=max(getattr(_google_sheet, "row_count", 1000), 1000), cols=8
+        if getattr(payment_worksheet, "col_count", 0) < 8:
+            payment_worksheet.resize(
+                rows=max(getattr(payment_worksheet, "row_count", 1000), 1000), cols=8
             )
-        header = _google_sheet.row_values(1)
+        header = payment_worksheet.row_values(1)
         if len(header) < SHEET_COL_OPERATION_ID or not header[SHEET_COL_OPERATION_ID - 1].strip():
-            _google_sheet.update_cell(1, SHEET_COL_OPERATION_ID, "رقم العملية")
+            payment_worksheet.update_cell(1, SHEET_COL_OPERATION_ID, "رقم العملية")
+        _google_sheet = PaymentWorksheet(payment_worksheet)
         logger.info("Google Sheets connection established successfully")
         return _google_sheet
     except Exception:
@@ -4083,8 +4085,14 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
                     and existing[SHEET_COL_OPERATION_ID - 1].strip() == operation_id):
                 return True
         target_row = None
+        previously_delivered_account = ""
         if not force_new and is_chatgpt_product_name(product) and chat_id is not None:
             target_row = find_completable_chatgpt_row(sheet, chat_id, missing="payment")
+        if target_row is not None and sheet.payment_column_offset(target_row):
+            # الدفعة الجديدة تُكتب في A:H حتى لو سُلّم حسابها سابقاً
+            # بسطر ذي أعمدة مزاحة. نحفظ الحساب معها ولا نغيّر السجل القديم.
+            previously_delivered_account = sheet.row_values(target_row)[SHEET_COL_CHATGPT_ACCOUNT - 1]
+            target_row = None
 
         if target_row is not None:
             # نسجل وقت استلام الدفع الفعلي، مو وقت ربط الحساب السابق.
@@ -4099,7 +4107,7 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
                 payments_text,
                 product,
                 customer_line,
-                "",  # حسابات جات — تُعبى لاحقاً عن طريق accept/link
+                previously_delivered_account,
                 str(chat_id) if chat_id is not None else "",
                 operation_id,
             ]
@@ -5443,11 +5451,13 @@ def calculate_income_report() -> str:
     if instagram_rows is not None:
         total_month += sum(parse_amount(row[6]) or 0 for row in instagram_rows if len(row) > 6)
 
+    date_warning = payment_stats_date_warning("today")
     return (
         "تقرير الدخل\n\n"
         f"اليوم: {total_today}\n"
         f"هذا الأسبوع: {total_week}\n"
         f"هذا الشهر: {total_month}"
+        + date_warning
     )
 
 
@@ -5474,23 +5484,12 @@ def parse_stats_datetime(value: str) -> datetime:
 
 def parse_sheet_datetime(value: str) -> datetime:
     """يقرأ أوقات Google Sheet المحفوظة كـ UTC ويحوّلها إلى توقيت بغداد."""
-    # Google Sheets قد يرجّع نفس الخلية بصيغة العرض المحلية (يوم/شهر/سنة)
-    # بدل الصيغة التي كتبناها. دعم الصيغتين يمنع إسقاط صفوف الدخل بصمت.
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
-        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
-    ):
-        try:
-            return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc).astimezone(STATS_TIMEZONE)
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognized sheet date/time: {value!r}")
+    return payment_datetime(value).astimezone(STATS_TIMEZONE)
 
 
 def is_debt_payment_row(row: list[str]) -> bool:
-    """يميز أسطر الدين القديمة في ورقة المدفوعات حتى لا تُحسب كدخل."""
-    return len(row) > 2 and row[2].strip().startswith("دين")
+    """أسطر الدين غير المحصل والدفعات الملغاة ليست دخلاً."""
+    return len(row) > 2 and (row[2].strip().startswith("دين") or row[2].strip() == "ملغاة")
 
 
 def parse_stats_period(period_key: str) -> tuple[datetime, datetime] | None:
@@ -5562,7 +5561,10 @@ def get_payment_rows_in_period(period_key: str) -> list[list[str]] | None:
     filtered = []
 
     for row in rows[1:]:
-        if len(row) < 1 or not row[0].strip():
+        if not any(row):
+            continue
+        if date_range is None:
+            filtered.append(row)
             continue
         try:
             row_date = parse_sheet_datetime(row[0])
@@ -5643,6 +5645,16 @@ def get_instagram_sales_rows_in_period(period_key: str) -> list[list[str]] | Non
 PERIOD_LABELS = {"today": "اليوم", "week": "هذا الأسبوع", "month": "هذا الشهر", "all": "كل الوقت"}
 
 
+def payment_stats_date_warning(period_key: str) -> str:
+    sheet = get_google_sheet()
+    count = getattr(sheet, "last_undated_paid_rows", 0)
+    if not count:
+        return ""
+    treatment = "محسوبة بالإجمالي" if period_key == "all" else "غير داخلة بهذه الفترة"
+    return (f"\n\n⚠️ توجد {count} دفعة بلا تاريخ صالح؛ {treatment}. "
+            "يلزم تصحيح تاريخها حتى تُنسب للفترة الصحيحة.")
+
+
 def format_period_label(period_key: str) -> str:
     if period_key in PERIOD_LABELS:
         return PERIOD_LABELS[period_key]
@@ -5686,6 +5698,7 @@ def calculate_totals_summary(period_key: str) -> str:
         f"منه مبيعات إنستغرام: {instagram_income}\n"
         f"المصروف: {total_expense}\n"
         f"الصافي: {net}"
+        + payment_stats_date_warning(period_key)
     )
 
 
@@ -5804,7 +5817,7 @@ def calculate_product_breakdown(period_key: str) -> str:
             "لتدخل بحساب منتج، اكتب اسم المنتج ضمن سبب المصروف."
         )
 
-    return "\n\n".join(lines)
+    return "\n\n".join(lines) + payment_stats_date_warning(period_key)
 
 
 def calculate_chatgpt_account_stats() -> tuple[int, int]:
@@ -12722,6 +12735,9 @@ async def cmd_sheet_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"عدد الصفوف: {last_row_number}\n"
             f"آخر تاريخ: {last_date}\n"
             f"آخر مبلغ: {last_total}\n"
+            "مكان المدفوعات الجديدة: A:G (رقم العملية في H)\n"
+            f"السجلات المقروءة من أعمدة قديمة: {sheet.last_shifted_rows}\n"
+            f"دفعات تحتاج تصحيح التاريخ: {sheet.last_undated_paid_rows}\n"
             f"الرابط: https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
         )
     except Exception:
