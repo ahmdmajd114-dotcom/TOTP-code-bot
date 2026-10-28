@@ -217,6 +217,61 @@ class FinancialFlowTests(unittest.IsolatedAsyncioTestCase):
         await ui.handle_finance_callback(self.query(recovered,'commit'),self.context)
         self.assertEqual(len(self.db.posts),1)
 
+    async def test_confirmation_never_waits_for_sheet_projection(self):
+        s=await start_income(self.context,customer_id=123)
+        s.update(step='summary',product='Scripta',sales=5000,payments=[{'wallet':'ماستر','amount':5000}]);self.db.save_draft(s)
+        ui.services().project.side_effect=AssertionError('Google must not run in the confirmation handler')
+        update=self.query(s,'commit');await ui.handle_finance_callback(update,self.context)
+        self.assertEqual(len(self.db.posts),1)
+        ui.services().project.assert_not_awaited()
+        self.assertIn('تم حفظ العملية المالية',update.callback_query.edit_message_text.call_args.args[0])
+        self.assertIn('بالخلفية',update.callback_query.edit_message_text.call_args.args[0])
+
+    async def test_four_queued_confirmation_clicks_post_exactly_once(self):
+        from runtime_scheduler import CustomerFirstDispatcher
+        s=await start_income(self.context,customer_id=123)
+        s.update(step='summary',product='Scripta',sales=5000,payments=[{'wallet':'ماستر','amount':5000}]);self.db.save_draft(s)
+        dispatcher=CustomerFirstDispatcher(99)
+        updates=[self.query(s,'commit') for _ in range(4)]
+        for update in updates:
+            dispatcher.submit(update,ui.handle_finance_callback(update,self.context))
+        await dispatcher.drain()
+        self.assertEqual(len(self.db.posts),1)
+        self.assertTrue(all(u.callback_query.answer.called for u in updates))
+
+    async def test_expired_acknowledgement_does_not_discard_payment(self):
+        s=await start_income(self.context,customer_id=123)
+        s.update(step='summary',product='Scripta',sales=5000,payments=[{'wallet':'ماستر','amount':5000}]);self.db.save_draft(s)
+        update=self.query(s,'commit');update.callback_query.answer.side_effect=RuntimeError('Query is too old')
+        with self.assertLogs('finance_ui',level='WARNING'):
+            await ui.handle_finance_callback(update,self.context)
+        self.assertEqual(len(self.db.posts),1)
+        self.assertTrue(update.callback_query.edit_message_text.called)
+
+    async def test_acknowledges_click_before_reading_database(self):
+        s=await start_income(self.context,customer_id=123)
+        events=[];original=self.db.draft
+        def read(key):events.append('database');return original(key)
+        self.db.draft=read
+        update=self.query(s,'back');update.callback_query.answer.side_effect=lambda:events.append('answer')
+        await ui.handle_finance_callback(update,self.context)
+        self.assertEqual(events[:2],['answer','database'])
+
+    async def test_commit_survives_draft_refresh_and_message_edit_failures(self):
+        s=await start_income(self.context,customer_id=123)
+        s.update(step='summary',product='Scripta',sales=5000,payments=[{'wallet':'ماستر','amount':5000}]);self.db.save_draft(s)
+        save=self.db.save_draft
+        def save_until_commit(state):
+            if state.get('committed'):raise fl.FinanceError('draft offline')
+            save(state)
+        self.db.save_draft=save_until_commit
+        update=self.query(s,'commit');update.callback_query.edit_message_text.side_effect=RuntimeError('edit failed')
+        with self.assertLogs('finance_ui',level='ERROR'):
+            await ui.handle_finance_callback(update,self.context)
+        self.assertIn('تم حفظ العملية المالية',update.callback_query.message.reply_text.call_args.args[0])
+        await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(len(self.db.posts),1)
+
     async def test_multiple_pending_inputs_require_reply(self):
         a=await start_expense(self.context);a.update(step='amount',awaiting=True);self.db.save_draft(a)
         b=await start_expense(self.context);b.update(step='amount',awaiting=True,message_id=8);self.db.save_draft(b)

@@ -2,6 +2,7 @@ from copy import deepcopy
 from dataclasses import fields
 from types import SimpleNamespace
 import re,unittest
+import asyncio,threading
 from unittest.mock import AsyncMock,Mock
 
 import finance_projection as projection
@@ -71,6 +72,28 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.subscription.side_effect=None
         await projection.project_operation(self.p)
         self.assertEqual(len(self.pay.rows),2);self.assertEqual(self.wallet.rows[1],['108000'])
+
+    async def test_blocked_google_does_not_block_telegram_event_loop(self):
+        loop=asyncio.get_running_loop();started=asyncio.Event();release=threading.Event()
+        original=self.pay.get_all_values
+        def slow_read():
+            loop.call_soon_threadsafe(started.set);release.wait(3);return original()
+        self.pay.get_all_values=slow_read
+        task=asyncio.create_task(projection.project_operation(self.p))
+        try:
+            await asyncio.wait_for(started.wait(),1)
+            self.assertFalse(task.done())
+            # This scheduling point cannot run while Sheets executes on-loop.
+            tick=asyncio.Event();loop.call_soon(tick.set)
+            await asyncio.wait_for(tick.wait(),1)
+        finally:
+            release.set();await task
+        self.assertEqual(len(self.pay.rows),2)
+
+    async def test_concurrent_projection_attempts_still_have_one_receipt(self):
+        await asyncio.gather(projection.project_operation(self.p),projection.project_operation(self.p))
+        self.assertEqual(len(self.pay.rows),2)
+        self.assertEqual(self.wallet.rows[1],['108000'])
 
 
 if __name__=='__main__':unittest.main()

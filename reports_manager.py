@@ -1,5 +1,6 @@
 """Financial reports and audit trail; unavailable history never becomes zero."""
 from __future__ import annotations
+from runtime_scheduler import run_io, background_job
 from datetime import datetime,timedelta,timezone
 from copy import deepcopy
 
@@ -71,14 +72,14 @@ def _record_label(row):
 
 
 async def show_record_search(message,context,text):
-    rows=[r for r in ledger().operations() if text.casefold() in str(r['payload']).casefold() or text in str(r['cash_in']) or text in str(r['cash_out'])]
+    rows=(await run_io(lambda: [r for r in ledger().operations() if text.casefold() in str(r['payload']).casefold() or text in str(r['cash_in']) or text in str(r['cash_out'])]))
     context.user_data['finance_search_text']=text
     context.user_data['finance_records_return']='finance_records_search_results'
     await message.reply_text(f'نتائج: {len(rows)}'+('؛ أول 20، ضيّق البحث للمزيد.' if len(rows)>20 else ''),reply_markup=menu_keyboard([[(_record_label(r)[:80],'finance_view_'+r['id'])] for r in rows[:20]],back='finance_records_search'))
 
 
 async def handle_report_menu(data,query,context):
-    ledger().require_active()
+    (await run_io(lambda: ledger().require_active()))
     if data=='finance_reports':
         from statistics_manager import open_statistics
         await open_statistics(query.message,context)
@@ -89,7 +90,7 @@ async def handle_report_menu(data,query,context):
         context.user_data['finance_report_input']='product'
         await query.message.reply_text('اكتب اسم المنتج كما يظهر بالكتالوج:',reply_markup=menu_keyboard([],back='finance_reports'))
     elif data.startswith('finance_period_'):
-        await query.message.reply_text(financial_report(data[len('finance_period_'):]),reply_markup=menu_keyboard([],back='finance_reports'))
+        await query.message.reply_text((await run_io(lambda: financial_report(data[len('finance_period_'):]))),reply_markup=menu_keyboard([],back='finance_reports'))
     elif data.startswith('finance_records'):
         if data=='finance_records_search_results':
             await show_record_search(query.message,context,context.user_data.get('finance_search_text',''))
@@ -97,7 +98,7 @@ async def handle_report_menu(data,query,context):
         if data=='finance_records_search':
             context.user_data['finance_report_input']='search';await query.message.reply_text('اكتب اسم الزبون، chat_id، المبلغ أو رقم العملية:',reply_markup=menu_keyboard([],back='finance_records'));return
         page=int(data.split('_')[-1]) if data.split('_')[-1].isdigit() else 0
-        rows=sorted(ledger().operations(),key=lambda r:r['recorded_at'],reverse=True)
+        rows=(await run_io(lambda: sorted(ledger().operations(),key=lambda r:r['recorded_at'],reverse=True)))
         context.user_data['finance_records_return']=f'finance_records_{page}'
         # IDs passed in callbacks remain under Telegram's 64 byte limit.
         buttons=[[(_record_label(r)[:80],'finance_view_'+r['id'])] for r in rows[page*8:(page+1)*8] if len(('finance_view_'+r['id']).encode())<=64]
@@ -108,7 +109,7 @@ async def handle_report_menu(data,query,context):
         buttons.append([('بحث بالزبون أو المبلغ أو الرقم','finance_records_search')])
         await query.message.reply_text(f'سجل العمليات — {len(rows)}',reply_markup=menu_keyboard(buttons))
     elif data.startswith('finance_view_'):
-        oid=data[len('finance_view_'):];r=next((r for r in ledger().operations() if r['id']==oid),None)
+        oid=data[len('finance_view_'):];r=(await run_io(lambda: next((r for r in ledger().operations() if r['id']==oid),None)))
         if not r:raise FinanceError('لم أجد العملية.')
         p=r['payload'];text=f"{KINDS.get(r['kind'],'سجل قديم')}\nرقم: {oid}\nالزبون: {p.get('customer_name') or r.get('customer_id') or 'عام'}\nالمنتج: {r.get('product') or '—'}\nقبض: {r['cash_in']:,}\nصرف: {r['cash_out']:,}\nوقت العملية: {r.get('occurred_at') or 'غير معروف'}\nوقت التسجيل: {r['recorded_at']}\nالسبب: {p.get('description') or '—'}"
         buttons=[]
@@ -123,7 +124,7 @@ async def handle_report_menu(data,query,context):
         await query.message.reply_text('اكتب سبب التراجع. بعدها يعرض لك النظام أثره قبل التثبيت:',reply_markup=menu_keyboard([],back='finance_view_'+oid))
     elif data.startswith(('finance_refund_','finance_correct_')):
         correction=data.startswith('finance_correct_');oid=data.split('_',2)[2]
-        r=next(r for r in ledger().operations() if r['id']==oid)
+        r=(await run_io(lambda: next(r for r in ledger().operations() if r['id']==oid)))
         from expense_manager import start_expense,render_expense
         from income_manager import start_income,render_income
         if not correction:
@@ -134,9 +135,9 @@ async def handle_report_menu(data,query,context):
             state.update({k:v for k,v in r['payload'].items() if k not in {'id','kind','occurred_at','source'}})
             state.update(correction_of=oid,step='summary',kind=r['kind'],return_to='finance_view_'+oid);await render(state,context)
     elif data=='finance_pending':
-        rows=(ledger().client.table('finance_outbox').select('*').eq('owner_id',services().owner_id).neq('status','done').order('next_at').limit(20).execute().data or [])
+        rows=((await run_io(lambda: ledger().client.table('finance_outbox').select('*').eq('owner_id',services().owner_id).neq('status','done').order('next_at').limit(20).execute())).data or [])
         text='⏳ تحتاج متابعة\n'+('\n'.join(f"{r['operation_id']} — محاولات: {r['attempts']} — مزامنة بالانتظار" for r in rows) if rows else 'لا توجد مزامنة معلقة.')
-        drafts=ledger().client.table('finance_drafts').select('state').eq('owner_id',services().owner_id).order('updated_at',desc=True).limit(50).execute().data or []
+        drafts=(await run_io(lambda: ledger().client.table('finance_drafts').select('state').eq('owner_id',services().owner_id).order('updated_at',desc=True).limit(50).execute())).data or []
         drafts=[r['state'] for r in drafts if not r['state'].get('closed') and not r['state'].get('committed')]
         await query.message.reply_text(text+'\n\nبطاقات غير مثبتة: '+str(len(drafts)),reply_markup=menu_keyboard([[(f"{s.get('customer_name') or 'عام'} — {s.get('product') or s['flow']}", 'finance_draft_'+s['draft_id'])] for s in drafts[:15]]))
     elif data.startswith('finance_customers'):
@@ -148,16 +149,16 @@ async def report_input(update,context):
     if not key or not message or not message.text:return False
     text=message.text.strip()
     try:
-        if key=='period':await message.reply_text(financial_report(text),reply_markup=menu_keyboard([],back='finance_reports'))
-        elif key=='product':await message.reply_text(financial_report('all',text),reply_markup=menu_keyboard([],back='finance_reports'))
+        if key=='period':await message.reply_text((await run_io(lambda: financial_report(text))),reply_markup=menu_keyboard([],back='finance_reports'))
+        elif key=='product':await message.reply_text((await run_io(lambda: financial_report('all',text))),reply_markup=menu_keyboard([],back='finance_reports'))
         elif key=='customer':
-            cid=int(text);snapshot=ledger().snapshot();rows=[r for r in snapshot['operations'] if r.get('customer_id')==cid];debts=[d for d in snapshot['debts'] if d['customer_id']==cid and int(d['remaining'])>0];a=snapshot['accounts']
-            name,_=services().identity(cid)
+            cid=int(text);snapshot=(await run_io(lambda: ledger().snapshot()));rows=[r for r in snapshot['operations'] if r.get('customer_id')==cid];debts=[d for d in snapshot['debts'] if d['customer_id']==cid and int(d['remaining'])>0];a=snapshot['accounts']
+            name,_=(await run_io(lambda: services().identity(cid)))
             await message.reply_text(f"بطاقة {name} ({cid})\nعليه: {sum(int(d['remaining']) for d in debts):,}\nإله رصيد: {a.get('credit:'+str(cid),0):,}\nالعمليات: {len(rows)}",reply_markup=menu_keyboard([[('تسجيل قبض','finance_income')],[('تسوية رصيد الزبون',f'finance_credit_{cid}')]],back='finance_customers'))
         elif key=='search':
             await show_record_search(message,context,text)
         elif key=='reverse':
-            oid=context.user_data['finance_reverse_id'];r=next(r for r in ledger().operations() if r['id']==oid)
+            oid=context.user_data['finance_reverse_id'];r=(await run_io(lambda: next(r for r in ledger().operations() if r['id']==oid)))
             # Persist a normal vault-flow card with an explicit inverse summary.
             from finance_ui import draft,display
             s=draft('vault',kind='reversal',reference_id=oid,description=text,step='summary',return_to='finance_view_'+oid,

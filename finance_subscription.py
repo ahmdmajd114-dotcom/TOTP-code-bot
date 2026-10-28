@@ -1,4 +1,5 @@
 """Idempotent post-commit subscription projection into existing delivery flow."""
+from runtime_scheduler import run_io, background_job
 from financial_ledger import FinanceError,ledger
 from datetime import datetime,timedelta,timezone
 
@@ -42,16 +43,16 @@ def ensure_pending_financial_delivery(chat_id):
 async def save_financial_subscription(payload):
     if not payload.get('customer_id') or not payload.get('subscription'):return
     client=_config['client'];oid=payload['id'];sub=payload['subscription']
-    rows=client.table('subscription_reminders').select('*').eq('financial_operation_id',oid).limit(1).execute().data or []
+    rows=(await run_io(lambda: client.table('subscription_reminders').select('*').eq('financial_operation_id',oid).limit(1).execute())).data or []
     state={'customer_chat_id':payload['customer_id'],'customer_name':payload.get('customer_name') or 'زبون',
         'customer_username':payload.get('customer_username'),'business_connection_id':payload.get('business_connection_id'),
         'product':payload['product'],'financial_operation_id':oid,**sub,
         'duration_days':_config['duration'](sub.get('plan_duration')),'reminder_disabled':_config['permanent'](sub.get('plan_duration'))}
     pending=_config['is_chatgpt'](payload['product'])
     if not rows:
-        if not _config['save'](state,status='pending_delivery' if pending else 'active'):
+        if not (await run_io(lambda: _config['save'](state,status='pending_delivery' if pending else 'active'))):
             raise FinanceError('متابعة الاشتراك بانتظار المزامنة.')
-        rows=client.table('subscription_reminders').select('*').eq('financial_operation_id',oid).limit(1).execute().data or []
+        rows=(await run_io(lambda: client.table('subscription_reminders').select('*').eq('financial_operation_id',oid).limit(1).execute())).data or []
     if not rows:raise FinanceError('لم تتأكد متابعة الاشتراك.')
     row=rows[0]
     if not pending and row.get('scheduled_message_status')!='scheduled':

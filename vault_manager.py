@@ -1,5 +1,6 @@
 """Wallet movements and explicit reconciliation; transfers are not revenue."""
 from __future__ import annotations
+from runtime_scheduler import run_io, background_job
 
 from financial_ledger import FinanceError,ledger,money,transaction_date,source_id,KINDS,BAGHDAD
 from datetime import datetime
@@ -49,8 +50,8 @@ def wallet_statement(snapshot,name):
 
 
 async def show_vaults(message):
-    ledger().require_active();snapshot=ledger().snapshot();audit=audit_balances(snapshot);accounts=snapshot['accounts']
-    names=list(dict.fromkeys([*services().wallets(),*(k[7:] for k in accounts if k.startswith('wallet:'))]))
+    (await run_io(lambda: ledger().require_active()));snapshot=(await run_io(lambda: ledger().snapshot()));audit=audit_balances(snapshot);accounts=snapshot['accounts']
+    names=(await run_io(lambda: list(dict.fromkeys([*services().wallets(),*(k[7:] for k in accounts if k.startswith('wallet:'))]))))
     text='🏦 أرصدة الخزن المحسوبة\n'+'\n'.join(f"{w}: {accounts.get('wallet:'+w,0):,}" for w in names)
     mismatches=[key for key,value in audit.items() if not value['matched']]
     text+='\n\n'+('⚠️ يوجد فرق داخلي؛ يلزم التدقيق قبل تسجيل حركة جديدة.' if mismatches else '✅ الأرصدة مطابقة لرصيد البداية وجميع القيود المسجلة.')
@@ -63,7 +64,7 @@ async def handle_vault_menu(data,query,context):
     if data=='finance_vaults':
         await show_vaults(query.message)
         return
-    ledger().require_active();snapshot=ledger().snapshot();audit=audit_balances(snapshot)
+    (await run_io(lambda: ledger().require_active()));snapshot=(await run_io(lambda: ledger().snapshot()));audit=audit_balances(snapshot)
     if data=='finance_walletaudit':
         lines=['🔎 تدقيق الخزن']
         for key,r in audit.items():
@@ -92,8 +93,8 @@ async def handle_vault_menu(data,query,context):
 
 
 async def start_vault_action(context,kind):
-    ledger().require_active()
-    suspend_finance_inputs()
+    (await run_io(lambda: ledger().require_active()))
+    (await run_io(lambda: suspend_finance_inputs()))
     if kind not in {'transfer','capital','withdrawal','vault_adjustment'}:raise FinanceError('نوع حركة الخزنة غير صالح.')
     state=draft('vault',kind=kind,step='wallet')
     await render_vault(state,context)
@@ -107,7 +108,7 @@ async def render_vault(state,context,query=None):
         await display(context,state,text,[[('✅ تثبيت التراجع','commit')],[('◀️ رجوع','back'),('إلغاء','cancel')]],query)
         return
     if step in {'wallet','to'}:
-        state['wallet_options']=list(services().wallets())
+        state['wallet_options']=(await run_io(lambda: list(services().wallets())))
         rows=[[(w,f'wallet{i}')] for i,w in enumerate(state['wallet_options']) if step!='to' or w!=state.get('wallet')]
         text+='\nاختَر الخزنة '+('المستلمة:' if step=='to' else 'المصدر:')
     elif step in {'amount','reason','date'}:
@@ -125,7 +126,7 @@ async def render_vault(state,context,query=None):
 
 async def handle_vault_action(state,action,context,query):
     if action.startswith('wallet'):
-        wallet=selected_wallet(state,action)
+        wallet=(await run_io(lambda: selected_wallet(state,action)))
         if state['step']=='to':state['to_wallet']=wallet;navigate(state,'amount')
         else:
             state['wallet']=wallet;navigate(state,'to' if state['kind']=='transfer' else 'amount')
@@ -135,7 +136,7 @@ async def handle_vault_action(state,action,context,query):
         payload['id']=state['operation_id']
         payload['payments']=[] if state['kind'] in {'vault_adjustment','credit_adjustment','reversal'} else [{'wallet':state['wallet'],'amount':state['amount']}]
         if state['kind']=='vault_adjustment':
-            current=ledger().accounts().get('wallet:'+state['wallet'],0)
+            current=(await run_io(lambda: ledger().accounts())).get('wallet:'+state['wallet'],0)
             if current!=state['expected_balance']:raise FinanceError('رصيد المحفظة تغير أثناء المراجعة؛ أعد المطابقة.')
             payload['expected_balance']=state['expected_balance']
         await commit_card(state,payload,context,query)

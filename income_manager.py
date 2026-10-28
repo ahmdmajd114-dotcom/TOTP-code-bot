@@ -1,5 +1,6 @@
 """Receipts, purchases, debt allocation and customer deposits in one owner flow."""
 from __future__ import annotations
+from runtime_scheduler import run_io, background_job
 
 from copy import deepcopy
 from datetime import datetime
@@ -54,14 +55,14 @@ def income_payload(state):
 
 
 async def start_income(context, *, customer_id=None, customer_name=None, photo_message=None, source=None, quick=None):
-    ledger().require_active()
-    suspend_finance_inputs()
+    (await run_io(lambda: ledger().require_active()))
+    (await run_io(lambda: suspend_finance_inputs()))
     state = draft('income', customer_id=customer_id, customer_name=customer_name, source=source or 'telegram', sales=0)
     if photo_message is not None:
         state.update(photo=True, message_id=photo_message.message_id)
     if quick:
         state.update(quick)
-    state['step'] = 'purpose' if customer_id is not None and ledger().debts(customer_id, open_only=True) else 'product' if customer_id is not None else 'customer'
+    state['step'] = 'purpose' if customer_id is not None and (await run_io(lambda: ledger().debts(customer_id, open_only=True))) else 'product' if customer_id is not None else 'customer'
     if quick and quick.get('product'):
         state['step'] = 'summary'
     await render_income(state, context)
@@ -100,7 +101,7 @@ async def render_income(state, context, query=None):
         text = heading + '\nهذا الزبون عليه دين؛ هذه الدفعة مقابل شنو؟'
         rows = [[('تسديد دين', 'repay')], [('شراء جديد', 'purchase')], [('دين وشراء بنفس الدفعة', 'mixed')], [('رصيد مقدم للزبون', 'deposit')]]
     elif step == 'debt':
-        debts = ledger().debts(state['customer_id'], open_only=True)
+        debts = (await run_io(lambda: ledger().debts(state['customer_id'], open_only=True)))
         state['debt_options'] = [d['id'] for d in debts]
         if not debts:
             raise FinanceError('ماكو دين مفتوح؛ حدّث البطاقة.')
@@ -108,7 +109,7 @@ async def render_income(state, context, query=None):
         rows = [[(f"{d['product']} — {d.get('plan_name') or ''} — {int(d['remaining']):,}", f'debt{i}')] for i, d in enumerate(debts)]
     elif step in {'product', 'plan'}:
         if step == 'product':
-            options = _products()
+            options = (await run_io(lambda: _products()))
             state['product_options'] = [str(p['id']) for p in options]
             rows = [[(p['name'], f'product{i}')] for i, p in enumerate(options)]
             rows += [[('✏️ منتج أو إيراد حر', 'free')]]
@@ -116,12 +117,12 @@ async def render_income(state, context, query=None):
                 rows += [[('رصيد مقدم للزبون', 'deposit')]]
             text = heading + '\nاختَر المنتج:'
         else:
-            options = [p for p in services().plans(state['product_id']) if p.get('is_active')]
+            options = (await run_io(lambda: [p for p in services().plans(state['product_id']) if p.get('is_active')]))
             state['plan_options'] = [str(p['id']) for p in options]
             text = heading + f"\n{state['product']}\nاختَر الباقة:"
             rows = [[(f"{p['name']} — {money(p['price']):,}", f'plan{i}')] for i, p in enumerate(options)]
     elif step == 'wallet':
-        state['wallet_options'] = list(services().wallets())
+        state['wallet_options'] = (await run_io(lambda: list(services().wallets())))
         text = heading + '\nاختَر الخزنة:'
         rows = [[(name, f'wallet{i}')] for i, name in enumerate(state['wallet_options'])]
         if state.get('customer_id') is not None and state['kind']!='credit_deposit' and state.get('sales',0)+sum(s['amount'] for s in state.get('settlements',[]))>0:
@@ -130,10 +131,14 @@ async def render_income(state, context, query=None):
         text=heading+'\nاختَر التسديد الذي تريد تعديله:'
         rows=[[(f"{s['debt_id']} — {s['amount']:,}",f'editdebt{i}')] for i,s in enumerate(state['settlements'])]
     elif step in {'amount', 'price', 'free', 'split', 'date', 'credit', 'debt_amount'}:
+        credit_prompt=''
+        if step=='credit':
+            available=await run_io(lambda: ledger().accounts().get('credit:'+str(state.get('customer_id')),0))
+            credit_prompt=f"رصيد الزبون المتاح: {available:,}\nاكتب المبلغ الذي تريد استخدامه (0 للإلغاء):"
         text = heading + '\n' + {'amount': 'اكتب المبلغ المستلم فعلياً:', 'price': 'اكتب سعر البيع المتفق عليه:',
             'free': 'اكتب اسم المنتج أو سبب الإيراد:', 'split': 'اكتب المحافظ والمبالغ: ماستر 5000 + زين كاش 3000',
             'date': 'اكتب تاريخ الاستلام بتوقيت بغداد: 2026-10-28 14:30',
-            'credit': f"رصيد الزبون المتاح: {ledger().accounts().get('credit:'+str(state.get('customer_id')),0):,}\nاكتب المبلغ الذي تريد استخدامه (0 للإلغاء):",
+            'credit': credit_prompt,
             'debt_amount': 'اكتب المبلغ المخصص لتسديد هذا الدين:'}[step]
         state['awaiting'] = True
     else:
@@ -181,7 +186,7 @@ async def handle_income_action(state, action, context, query):
             navigate(state, 'debt' if action in {'repay','mixed'} else 'product')
     elif action.startswith('debt') and action[4:].isdigit():
         debt_id = state['debt_options'][int(action[4:])]
-        debt = next((d for d in ledger().debts(state['customer_id'], open_only=True) if d['id']==debt_id), None)
+        debt = (await run_io(lambda: next((d for d in ledger().debts(state['customer_id'], open_only=True) if d['id']==debt_id), None)))
         if not debt: raise FinanceError('هذا الدين تغير؛ حدّث القائمة.')
         item={'debt_id': debt_id,'amount': int(debt['remaining']),'expected_remaining':int(debt['remaining'])}
         if state.pop('add_settlement',False):
@@ -194,22 +199,22 @@ async def handle_income_action(state, action, context, query):
             state.update(product=debt['product'], plan_name=debt.get('plan_name'), sales=0, kind='debt_repayment')
             navigate(state, 'wallet')
     elif action.startswith('product') and action[7:].isdigit():
-        product = next((p for p in _products() if str(p['id']) == state['product_options'][int(action[7:])]), None)
+        product = (await run_io(lambda: next((p for p in _products() if str(p['id']) == state['product_options'][int(action[7:])]), None)))
         if not product: raise FinanceError('المنتج لم يعد متاحاً.')
-        _choose_product(state, product)
+        (await run_io(lambda: _choose_product(state, product)))
     elif action.startswith('plan') and action[4:].isdigit():
         plan_id = state['plan_options'][int(action[4:])]
-        plan = next((p for p in services().plans(state['product_id']) if str(p['id'])==plan_id and p.get('is_active')),None)
+        plan = (await run_io(lambda: next((p for p in services().plans(state['product_id']) if str(p['id'])==plan_id and p.get('is_active')),None)))
         if not plan: raise FinanceError('الباقة تغيرت؛ أعد اختيارها.')
-        _choose_plan(state,plan)
+        (await run_io(lambda: _choose_plan(state,plan)))
     elif action.startswith('wallet') and action[6:].isdigit():
-        wallet = selected_wallet(state,action)
+        wallet = (await run_io(lambda: selected_wallet(state,action)))
         expected = state.get('sales',0) + sum(p['amount'] for p in state.get('settlements',[])) - state.get('credit_used',0)
         state['payments'] = [{'wallet':wallet,'amount': max(0,expected)}]
         navigate(state,'summary' if expected>0 else 'amount')
     elif action=='creditonly':
         needed=state.get('sales',0)+sum(s['amount'] for s in state.get('settlements',[]))
-        available=ledger().accounts().get('credit:'+str(state['customer_id']),0)
+        available=(await run_io(lambda: ledger().accounts())).get('credit:'+str(state['customer_id']),0)
         if needed<=0 or needed>available:raise FinanceError('الرصيد لا يغطي العملية كاملة؛ استخدم جزءاً منه من الملخص.')
         state.update(payments=[],credit_used=needed,difference=None);navigate(state,'summary')
     elif action.startswith('diff'):

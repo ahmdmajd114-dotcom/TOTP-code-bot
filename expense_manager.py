@@ -1,5 +1,6 @@
 """Owner expenses and linked financial refunds; never cancel other services."""
 from __future__ import annotations
+from runtime_scheduler import run_io, background_job
 
 from copy import deepcopy
 from financial_ledger import FinanceError, ledger, money, parse_wallets, transaction_date
@@ -9,8 +10,8 @@ EXPENSE_KINDS = {'cost':'تكلفة منتج','operating':'تشغيل المتج
 
 
 async def start_expense(context, *, customer_id=None, customer_name=None, photo_message=None, refund=None, quick=None):
-    ledger().require_active()
-    suspend_finance_inputs()
+    (await run_io(lambda: ledger().require_active()))
+    (await run_io(lambda: suspend_finance_inputs()))
     state=draft('expense',customer_id=customer_id,customer_name=customer_name,step='product',category='cost')
     if photo_message: state.update(photo=True,message_id=photo_message.message_id)
     if refund:
@@ -32,19 +33,19 @@ async def render_expense(state,context,query=None):
     text=('💸 استرجاع مرتبط بعملية' if state['kind']=='refund' else '💸 تسجيل مصروف')+'\n'+customer_text(state)
     step=state['step']; rows=[];state['awaiting']=False
     if step=='product':
-        products=[p for p in services().products() if p.get('is_active')]
+        products=(await run_io(lambda: [p for p in services().products() if p.get('is_active')]))
         state['product_options']=[str(p['id']) for p in products]
         rows=[[(p['name'],f'product{i}')] for i,p in enumerate(products)]
         rows += [[('تشغيل المتجر','categoryoperating'),('رسوم وعمولات','categoryfee')],[('✏️ سبب حر','free')]]
         text+='\nاختَر المنتج أو سبب المصروف:'
     elif step=='plan':
-        plans=[p for p in services().plans(state['product_id']) if p.get('is_active')]
+        plans=(await run_io(lambda: [p for p in services().plans(state['product_id']) if p.get('is_active')]))
         state['plan_options']=[str(p['id']) for p in plans]
         rows=[[(p['name'],f'plan{i}')] for i,p in enumerate(plans)]
         rows += [[('تكلفة عامة لهذا المنتج','noplan')]]
         text+='\nاختَر الباقة لربط التكلفة بها، أو تكلفة عامة:'
     elif step=='wallet':
-        state['wallet_options']=list(services().wallets())
+        state['wallet_options']=(await run_io(lambda: list(services().wallets())))
         rows=[[(w,f'wallet{i}')] for i,w in enumerate(state['wallet_options'])]
         text+='\nاختَر الخزنة التي خرج منها المبلغ:'
     elif step in {'amount','free','date','split'}:
@@ -66,21 +67,21 @@ async def handle_expense_action(state,action,context,query):
     if action=='commit': await commit_card(state,expense_payload(state),context,query)
     elif action.startswith('product') and action[7:].isdigit():
         pid=state['product_options'][int(action[7:])]
-        product=next((p for p in services().products() if str(p['id'])==pid and p.get('is_active')),None)
+        product=(await run_io(lambda: next((p for p in services().products() if str(p['id'])==pid and p.get('is_active')),None)))
         if not product:raise FinanceError('المنتج لم يعد متاحاً.')
         state.update(product_id=pid,product=product['name'],description=product['name'],category='cost')
-        plans=[p for p in services().plans(pid) if p.get('is_active')]
+        plans=(await run_io(lambda: [p for p in services().plans(pid) if p.get('is_active')]))
         if len(plans)==1:
             state.update(plan_id=str(plans[0]['id']),plan_name=plans[0]['name']);navigate(state,'amount')
         else:navigate(state,'plan' if plans else 'amount')
     elif action.startswith('plan') and action[4:].isdigit():
         pid=state['plan_options'][int(action[4:])]
-        plan=next((p for p in services().plans(state['product_id']) if str(p['id'])==pid and p.get('is_active')),None)
+        plan=(await run_io(lambda: next((p for p in services().plans(state['product_id']) if str(p['id'])==pid and p.get('is_active')),None)))
         if not plan:raise FinanceError('الباقة تغيرت.')
         state.update(plan_id=pid,plan_name=plan['name']);navigate(state,'amount')
     elif action=='noplan':state.update(plan_id=None,plan_name=None);navigate(state,'amount')
     elif action.startswith('wallet') and action[6:].isdigit():
-        wallet=selected_wallet(state,action)
+        wallet=(await run_io(lambda: selected_wallet(state,action)))
         state['payments']=[{'wallet':wallet,'amount':state['amount']}];navigate(state,'summary')
     elif action.startswith('category'):
         state.update(category=action[8:],product=None,product_id=None);navigate(state,'free')

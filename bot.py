@@ -16,6 +16,7 @@
 - أنت تربط زبون معين بحساب معين بأمر /link داخل محادثته
 - أنت تصفر عداد محاولات الكود بأمر /resetcode داخل محادثة الزبون
 """
+from runtime_scheduler import run_io, background_job, customer_first_processor, drain_customer_updates, dispatch_deferred_reply
 
 import os
 import re
@@ -287,6 +288,7 @@ _delayed_greeting_delivery_keys: set[tuple[int, int]] = set()
 # أي تدخل يدوي من الأونر يلغي الرد التلقائي للرسالة المقصودة فقط، لا المحادثة كلها.
 _suppressed_auto_reply_keys: set[tuple[int, int]] = set()
 _latest_customer_message_ids: dict[int, int] = {}
+_owner_arrival_reply_targets: dict[tuple[int, int], tuple[bool, int | None]] = {}
 _support_context_until: dict[int, datetime] = {}
 # وقت آخر رد من الأونر الذي أنهى تدخله في المشكلة الحالية.
 _support_context_resolved_at: dict[int, datetime] = {}
@@ -681,18 +683,18 @@ async def cmd_add_customer_credit(
         await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ المبلغ يجب أن يكون أكبر من صفر.")
         return
     note = " ".join(context.args[2:]).strip() or "تصحيح فرق دفعة سابقة"
-    if finance_active():
+    if (await run_io(lambda: finance_active())):
         from customer_balance_manager import start_credit_adjustment
         await start_credit_adjustment(context, customer_chat_id, amount, note)
         return
-    customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
-    saved, balance = append_customer_credit(
+    customer_name, customer_username = (await run_io(lambda: get_telegram_customer_identity(customer_chat_id)))
+    saved, balance = (await run_io(lambda: append_customer_credit(
         customer_chat_id,
         format_customer_line(customer_name, customer_username),
         amount,
         "ChatGPT",
         note,
-    )
+    )))
     if not saved:
         await context.bot.send_message(chat_id=OWNER_USER_ID, text="⚠️ تعذر حفظ الرصيد؛ لم يتغير أي سجل.")
         return
@@ -1279,11 +1281,11 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
     """يعيد إدخال رسالة واحدة مجمعة لكل زبون عبر مسار الرد الطبيعي."""
     try:
         rows = (
-            supabase.table("paused_customer_messages")
+            (await run_io(lambda: supabase.table("paused_customer_messages")
             .select("*")
             .eq("owner_user_id", OWNER_USER_ID)
             .order("received_at")
-            .execute()
+            .execute()))
             .data
             or []
         )
@@ -1301,12 +1303,12 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
         # مرة ثانية قبل المعالجة حتى لا نستعمل نسخة قديمة من الصف المحذوف.
         try:
             still_pending = (
-                supabase.table("paused_customer_messages")
+                (await run_io(lambda: supabase.table("paused_customer_messages")
                 .select("message_id")
                 .eq("owner_user_id", OWNER_USER_ID)
                 .eq("customer_chat_id", chat_id)
                 .eq("message_id", message_id)
-                .limit(1).execute().data or []
+                .limit(1).execute())).data or []
             )
         except Exception:
             logger.exception("Failed to recheck paused message for %s", chat_id)
@@ -1342,9 +1344,9 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
                 SimpleNamespace(business_message=synthetic_bm, edited_business_message=None),
                 context,
             )
-            supabase.table("paused_customer_messages").delete().eq(
+            (await run_io(lambda: supabase.table("paused_customer_messages").delete().eq(
                 "owner_user_id", OWNER_USER_ID
-            ).eq("customer_chat_id", chat_id).execute()
+            ).eq("customer_chat_id", chat_id).execute()))
             completed += 1
         except Exception:
             _ready_customer_texts.pop((chat_id, message_id), None)
@@ -1363,7 +1365,7 @@ async def handle_auto_reply_callback(update: Update, context: ContextTypes.DEFAU
         return
     await query.answer()
     if query.data == "autoreply_pause":
-        if not set_auto_reply_paused(True):
+        if not (await run_io(lambda: set_auto_reply_paused(True))):
             await query.edit_message_text("⚠️ تعذر حفظ الإيقاف. لم تتغير حالة الردود.")
             return
         await query.edit_message_text(
@@ -1374,7 +1376,7 @@ async def handle_auto_reply_callback(update: Update, context: ContextTypes.DEFAU
         )
         return
     if query.data == "autoreply_resume":
-        if not set_auto_reply_paused(False):
+        if not (await run_io(lambda: set_auto_reply_paused(False))):
             await query.edit_message_text("⚠️ تعذر حفظ الاستئناف. الردود ما زالت متوقفة.")
             return
         await query.edit_message_text(
@@ -1537,7 +1539,7 @@ def format_catalog_product(product: dict, plans: list[dict]) -> str:
 
 
 async def show_catalog_main(message) -> None:
-    products = get_catalog_products()
+    products = (await run_io(lambda: get_catalog_products()))
     await message.reply_text(
         "🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.",
         reply_markup=build_catalog_main_keyboard(products),
@@ -1552,7 +1554,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     if data == "catalog_main":
-        products = get_catalog_products()
+        products = (await run_io(lambda: get_catalog_products()))
         await query.message.reply_text(
             "🗂️ المنتجات والباقات\nاختَر منتجًا لإدارة باقاته وأسعاره.",
             reply_markup=build_catalog_main_keyboard(products),
@@ -1569,7 +1571,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("catalog_edit_product_"):
         product_id = data[len("catalog_edit_product_"):]
-        if get_catalog_product(product_id) is None:
+        if (await run_io(lambda: get_catalog_product(product_id))) is None:
             await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
             return
         context.user_data["pending_catalog_input"] = {
@@ -1585,15 +1587,15 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("catalog_toggle_product_"):
         product_id = data[len("catalog_toggle_product_"):]
-        product = get_catalog_product(product_id)
+        product = (await run_io(lambda: get_catalog_product(product_id)))
         if product is None:
             await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
             return
         try:
-            supabase.table("catalog_products").update({"is_active": not product["is_active"]}).eq("id", product_id).execute()
-            product = get_catalog_product(product_id)
+            (await run_io(lambda: supabase.table("catalog_products").update({"is_active": not product["is_active"]}).eq("id", product_id).execute()))
+            product = (await run_io(lambda: get_catalog_product(product_id)))
             if product:
-                plans = get_catalog_plans(product_id)
+                plans = (await run_io(lambda: get_catalog_plans(product_id)))
                 await query.edit_message_text(format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
         except Exception:
             logger.exception("Failed to toggle catalog product")
@@ -1602,7 +1604,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("catalog_pdelc_"):
         product_id = data[len("catalog_pdelc_"):]
-        product = get_catalog_product(product_id)
+        product = (await run_io(lambda: get_catalog_product(product_id)))
         if product is None:
             await query.edit_message_text("⚠️ المنتج ما عاد موجود.")
             return
@@ -1618,8 +1620,8 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_pdel_"):
         product_id = data[len("catalog_pdel_"):]
         try:
-            supabase.table("catalog_products").delete().eq("id", product_id).execute()
-            products = get_catalog_products()
+            (await run_io(lambda: supabase.table("catalog_products").delete().eq("id", product_id).execute()))
+            products = (await run_io(lambda: get_catalog_products()))
             await query.edit_message_text("✅ تم حذف المنتج وباقاته.", reply_markup=build_catalog_main_keyboard(products))
         except Exception:
             logger.exception("Failed to delete catalog product")
@@ -1628,11 +1630,11 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("catalog_product_"):
         try:
-            product = get_catalog_product(data[len("catalog_product_"):])
+            product = (await run_io(lambda: get_catalog_product(data[len("catalog_product_"):])))
             if product is None:
                 await query.message.reply_text("⚠️ المنتج ما عاد موجود.")
                 return
-            plans = get_catalog_plans(product["id"])
+            plans = (await run_io(lambda: get_catalog_plans(product["id"])))
             # نرسل رسالة جديدة: هذا أضمن من تعديل رسالة زر قديمة، خصوصاً
             # إذا ضغطت عليها بعد إعادة نشر البوت.
             await query.message.reply_text(
@@ -1658,7 +1660,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_plan_"):
         plan_id = data[len("catalog_plan_"):]
         try:
-            result = supabase.table("catalog_plans").select("*").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("*").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
         except Exception:
             logger.exception("Failed to fetch catalog plan")
@@ -1694,12 +1696,12 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_public_"):
         plan_id = data[len("catalog_public_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id, show_in_catalog").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id, show_in_catalog").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
             if not plan:
                 await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
                 return
-            supabase.table("catalog_plans").update({"show_in_catalog": not plan.get("show_in_catalog", True)}).eq("id", plan_id).execute()
+            (await run_io(lambda: supabase.table("catalog_plans").update({"show_in_catalog": not plan.get("show_in_catalog", True)}).eq("id", plan_id).execute()))
             await query.edit_message_text("✅ تم تحديث ظهور الباقة بالموقع.", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ رجوع للباقة", callback_data=f"catalog_plan_{plan_id}")],
             ]))
@@ -1711,12 +1713,12 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_customer_"):
         plan_id = data[len("catalog_customer_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, show_to_customers").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, show_to_customers").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
             if not plan:
                 await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
                 return
-            supabase.table("catalog_plans").update({"show_to_customers": not plan.get("show_to_customers", True)}).eq("id", plan_id).execute()
+            (await run_io(lambda: supabase.table("catalog_plans").update({"show_to_customers": not plan.get("show_to_customers", True)}).eq("id", plan_id).execute()))
             await query.edit_message_text("✅ تم تحديث ظهور الباقة لردود الزبائن.", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("◀️ رجوع للباقة", callback_data=f"catalog_plan_{plan_id}")],
             ]))
@@ -1728,7 +1730,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_edit_plan_"):
         plan_id = data[len("catalog_edit_plan_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
         except Exception:
             logger.exception("Failed to fetch catalog plan for editing")
@@ -1748,7 +1750,7 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_xdelc_"):
         plan_id = data[len("catalog_xdelc_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id, name").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id, name").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
         except Exception:
             logger.exception("Failed to fetch catalog plan for deletion")
@@ -1768,15 +1770,15 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_xdel_"):
         plan_id = data[len("catalog_xdel_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
             if plan is None:
                 await query.edit_message_text("⚠️ الباقة ما عادت موجودة.")
                 return
-            supabase.table("catalog_plans").delete().eq("id", plan_id).execute()
-            product = get_catalog_product(plan["product_id"])
+            (await run_io(lambda: supabase.table("catalog_plans").delete().eq("id", plan_id).execute()))
+            product = (await run_io(lambda: get_catalog_product(plan["product_id"])))
             if product:
-                plans = get_catalog_plans(product["id"])
+                plans = (await run_io(lambda: get_catalog_plans(product["id"])))
                 await query.edit_message_text("✅ تم حذف الباقة.\n\n" + format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
         except Exception:
             logger.exception("Failed to delete catalog plan")
@@ -1786,13 +1788,13 @@ async def handle_catalog_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("catalog_toggle_"):
         plan_id = data[len("catalog_toggle_"):]
         try:
-            result = supabase.table("catalog_plans").select("id, product_id, is_active").eq("id", plan_id).execute()
+            result = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id, is_active").eq("id", plan_id).execute()))
             plan = result.data[0] if result.data else None
             if plan:
-                supabase.table("catalog_plans").update({"is_active": not plan["is_active"]}).eq("id", plan_id).execute()
-                product = get_catalog_product(plan["product_id"])
+                (await run_io(lambda: supabase.table("catalog_plans").update({"is_active": not plan["is_active"]}).eq("id", plan_id).execute()))
+                product = (await run_io(lambda: get_catalog_product(plan["product_id"])))
                 if product:
-                    plans = get_catalog_plans(product["id"])
+                    plans = (await run_io(lambda: get_catalog_plans(product["id"])))
                     await query.edit_message_text(format_catalog_product(product, plans), reply_markup=build_catalog_product_keyboard(product, plans))
         except Exception:
             logger.exception("Failed to toggle catalog plan")
@@ -1822,10 +1824,10 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 return True
             payload = {"name": name, "aliases": aliases, "description": description or None}
             if state.get("product_id"):
-                supabase.table("catalog_products").update(payload).eq("id", state["product_id"]).execute()
+                (await run_io(lambda: supabase.table("catalog_products").update(payload).eq("id", state["product_id"]).execute()))
                 await message.reply_text("✅ تم تعديل المنتج والكلمات والوصف.")
             else:
-                supabase.table("catalog_products").insert(payload).execute()
+                (await run_io(lambda: supabase.table("catalog_products").insert(payload).execute()))
                 await message.reply_text("✅ تم إضافة المنتج.")
         elif state["step"] == "plan_data":
             parts = [part.strip() for part in text.split("|", 3)]
@@ -1841,10 +1843,10 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
             price, display_price = parsed_price
             payload = {"product_id": state["product_id"], "name": parts[0], "price": price, "display_price": display_price, "duration": duration, "description": parts[3] if len(parts) > 3 else None}
             if state.get("plan_id"):
-                supabase.table("catalog_plans").update(payload).eq("id", state["plan_id"]).execute()
+                (await run_io(lambda: supabase.table("catalog_plans").update(payload).eq("id", state["plan_id"]).execute()))
                 await message.reply_text("✅ تم تعديل الباقة.")
             else:
-                supabase.table("catalog_plans").insert(payload).execute()
+                (await run_io(lambda: supabase.table("catalog_plans").insert(payload).execute()))
                 await message.reply_text("✅ تم إضافة الباقة.")
         elif state["step"] == "plan_price":
             parsed_price = parse_catalog_plan_price(text)
@@ -1852,7 +1854,7 @@ async def handle_catalog_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 await message.reply_text("اكتب السعر الحقيقي، وتكدر تضيف المعروض بين قوسين. مثال: 10000 (5 الف د.ع)")
                 return True
             price, display_price = parsed_price
-            supabase.table("catalog_plans").update({"price": price, "display_price": display_price}).eq("id", state["plan_id"]).execute()
+            (await run_io(lambda: supabase.table("catalog_plans").update({"price": price, "display_price": display_price}).eq("id", state["plan_id"]).execute()))
             await message.reply_text("✅ تم تعديل السعر.")
         else:
             return False
@@ -2178,40 +2180,41 @@ async def send_campaign(context: ContextTypes.DEFAULT_TYPE, campaign_id: str) ->
     """يحوّل الحملة المؤكدة إلى طابور محفوظ؛ العامل الدوري يتولى الإرسال."""
     del context
     try:
-        result = (supabase.table("customer_campaigns").update({
+        result = ((await run_io(lambda: supabase.table("customer_campaigns").update({
             "status": "queued", "next_send_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", campaign_id).eq("status", "draft").execute().data or [])
+        }).eq("id", campaign_id).eq("status", "draft").execute())).data or [])
         return bool(result)
     except Exception:
         logger.exception("Failed to queue campaign %s", campaign_id)
         return False
 
 
+@background_job
 async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     """يرسل محاولة واحدة فقط عند حلول وقتها، ثم يحجز الموعد الآمن التالي."""
     now = datetime.now(timezone.utc)
     try:
-        campaigns = (supabase.table("customer_campaigns")
+        campaigns = ((await run_io(lambda: supabase.table("customer_campaigns")
                      .select("id, message_text, sent_count, failed_count, skipped_count, attempted_count")
                      .in_("status", ["queued", "sending"])
                      .lte("next_send_at", now.isoformat()).order("next_send_at").limit(1)
-                     .execute().data or [])
+                     .execute())).data or [])
         if not campaigns:
             return
         campaign = campaigns[0]
-        recipients = (supabase.table("customer_campaign_recipients")
+        recipients = ((await run_io(lambda: supabase.table("customer_campaign_recipients")
                       .select("id, customer_chat_id, business_connection_id")
                       .eq("campaign_id", campaign["id"]).eq("delivery_status", "pending")
-                      .order("id").limit(1).execute().data or [])
+                      .order("id").limit(1).execute())).data or [])
     except Exception:
         logger.exception("Failed to load campaign queue")
         return
 
     if not recipients:
         try:
-            supabase.table("customer_campaigns").update({
+            (await run_io(lambda: supabase.table("customer_campaigns").update({
                 "status": "sent", "sent_at": now.isoformat(), "next_send_at": None,
-            }).eq("id", campaign["id"]).execute()
+            }).eq("id", campaign["id"]).execute()))
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=(f"✅ اكتمل طابور الحملة.\nتم الإرسال: {campaign['sent_count']}\n"
@@ -2228,16 +2231,16 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Skip them quickly so a running campaign can reach real customers.
         try:
             attempted_count = int(campaign.get("attempted_count") or 0) + 1
-            supabase.table("customer_campaign_recipients").update({
+            (await run_io(lambda: supabase.table("customer_campaign_recipients").update({
                 "delivery_status": "skipped",
                 "error_text": "Synthetic or non-private Telegram chat id",
-            }).eq("id", recipient["id"]).execute()
-            supabase.table("customer_campaigns").update({
+            }).eq("id", recipient["id"]).execute()))
+            (await run_io(lambda: supabase.table("customer_campaigns").update({
                 "status": "sending",
                 "attempted_count": attempted_count,
                 "skipped_count": int(campaign.get("skipped_count") or 0) + 1,
                 "next_send_at": (now + timedelta(seconds=1)).isoformat(),
-            }).eq("id", campaign["id"]).in_("status", ["queued", "sending"]).execute()
+            }).eq("id", campaign["id"]).in_("status", ["queued", "sending"]).execute()))
         except Exception:
             logger.exception("Failed to skip invalid campaign recipient %s", recipient_chat_id)
         return
@@ -2270,23 +2273,23 @@ async def process_campaign_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
             "sent_count": int(campaign.get("sent_count") or 0) + (1 if status == "sent" else 0),
             "failed_count": int(campaign.get("failed_count") or 0) + (1 if status == "failed" else 0),
         }
-        supabase.table("customer_campaign_recipients").update({
+        (await run_io(lambda: supabase.table("customer_campaign_recipients").update({
             "delivery_status": status, "error_text": error_text,
             "delivered_at": now.isoformat() if status == "sent" else None,
-        }).eq("id", recipient["id"]).execute()
+        }).eq("id", recipient["id"]).execute()))
         # قد يضغط المالك "إيقاف مؤقت" أثناء إرسال هذه الرسالة نفسها.
         # نحفظ نتيجة هذه المحاولة، لكن لا نعيد تشغيل الحملة من العامل الدوري.
-        latest = (supabase.table("customer_campaigns").select("status")
-                  .eq("id", campaign["id"]).limit(1).execute().data or [])
+        latest = ((await run_io(lambda: supabase.table("customer_campaigns").select("status")
+                  .eq("id", campaign["id"]).limit(1).execute())).data or [])
         latest_status = latest[0].get("status") if latest else None
         if latest_status in {"paused", "cancelled"}:
-            supabase.table("customer_campaigns").update(counters).eq("id", campaign["id"]).execute()
+            (await run_io(lambda: supabase.table("customer_campaigns").update(counters).eq("id", campaign["id"]).execute()))
         else:
-            supabase.table("customer_campaigns").update({
+            (await run_io(lambda: supabase.table("customer_campaigns").update({
                 **counters,
                 "status": "sending",
                 "next_send_at": (now + timedelta(seconds=next_delay)).isoformat(),
-            }).eq("id", campaign["id"]).execute()
+            }).eq("id", campaign["id"]).execute()))
     except Exception:
         logger.exception("Failed to persist campaign queue result")
 
@@ -2358,7 +2361,7 @@ def payment_keyboard(methods: list[dict]) -> InlineKeyboardMarkup:
 
 
 async def show_payment_methods(message) -> None:
-    await message.reply_text("💳 طرق الدفع\nاختَر طريقة لتعديلها، أو أضف طريقة جديدة.", reply_markup=payment_keyboard(get_payment_methods()))
+    await message.reply_text("💳 طرق الدفع\nاختَر طريقة لتعديلها، أو أضف طريقة جديدة.", reply_markup=payment_keyboard((await run_io(lambda: get_payment_methods()))))
 
 
 async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2374,9 +2377,9 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if data.startswith("campaign_pause_"):
         campaign_id = data[len("campaign_pause_"):]
         try:
-            rows = (supabase.table("customer_campaigns").update({
+            rows = ((await run_io(lambda: supabase.table("customer_campaigns").update({
                 "status": "paused", "next_send_at": None,
-            }).eq("id", campaign_id).in_("status", ["queued", "sending"]).execute().data or [])
+            }).eq("id", campaign_id).in_("status", ["queued", "sending"]).execute())).data or [])
             if rows:
                 await query.edit_message_text(
                     "⏸️ تم إيقاف الإرسال مؤقتاً.\n\n"
@@ -2395,9 +2398,9 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if data.startswith("campaign_resume_"):
         campaign_id = data[len("campaign_resume_"):]
         try:
-            rows = (supabase.table("customer_campaigns").update({
+            rows = ((await run_io(lambda: supabase.table("customer_campaigns").update({
                 "status": "queued", "next_send_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", campaign_id).eq("status", "paused").execute().data or [])
+            }).eq("id", campaign_id).eq("status", "paused").execute())).data or [])
             if rows:
                 await query.edit_message_text(
                     "▶️ تم استئناف الإرسال بالطابور الآمن.",
@@ -2414,9 +2417,9 @@ async def handle_campaign_callback(update: Update, context: ContextTypes.DEFAULT
     if data.startswith("campaign_stop_"):
         campaign_id = data[len("campaign_stop_"):]
         try:
-            rows = (supabase.table("customer_campaigns").update({
+            rows = ((await run_io(lambda: supabase.table("customer_campaigns").update({
                 "status": "cancelled", "next_send_at": None,
-            }).eq("id", campaign_id).eq("status", "paused").execute().data or [])
+            }).eq("id", campaign_id).eq("status", "paused").execute())).data or [])
             if rows:
                 await query.edit_message_text("⏹️ تم الإيقاف النهائي. لن تُرسل بقية رسائل هذه الحملة.")
             else:
@@ -2466,7 +2469,7 @@ async def handle_campaign_message_input(update: Update, context: ContextTypes.DE
     if is_continuity_invite and not continuity_bot_url():
         await message.reply_text("⚠️ أضف CONTINUITY_BOT_USERNAME في Render أولاً حتى يظهر زر بوت المكافآت.")
         return True
-    campaign, recipients = create_campaign_snapshot(draft["audience_key"], text)
+    campaign, recipients = (await run_io(lambda: create_campaign_snapshot(draft["audience_key"], text)))
     context.user_data.pop("campaign_draft", None)
     if campaign is None:
         await message.reply_text("⚠️ تعذر حفظ الحملة. شغّل ملف Supabase الجديد وتأكد من الاتصال.")
@@ -2672,7 +2675,7 @@ async def send_business_message_with_current_fallback(
             reply_markup=reply_markup,
         )
     except Exception:
-        current_connection_id = get_current_business_connection_id()
+        current_connection_id = (await run_io(lambda: get_current_business_connection_id()))
         if not current_connection_id or current_connection_id == connection_id:
             raise
         logger.warning("Retrying Business message to %s with current connection", customer_chat_id)
@@ -2786,16 +2789,17 @@ def schedule_continuity_invite(chat_id: int, connection_id: str | None) -> bool:
         return False
 
 
+@background_job
 async def deliver_due_continuity_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
     """يرسل دعوات بوت الاستمرارية المستحقة ويحفظ النتيجة لمنع التكرار."""
     if not continuity_bot_url():
         return
     try:
-        rows = (supabase.table("continuity_bot_invites")
+        rows = ((await run_io(lambda: supabase.table("continuity_bot_invites")
                 .select("customer_chat_id, business_connection_id")
                 .eq("status", "scheduled")
                 .lte("due_at", datetime.now(timezone.utc).isoformat())
-                .limit(100).execute().data or [])
+                .limit(100).execute())).data or [])
     except Exception:
         logger.exception("Failed to load due continuity invites")
         return
@@ -2810,20 +2814,20 @@ async def deliver_due_continuity_invites(context: ContextTypes.DEFAULT_TYPE) -> 
                 context, int(chat_id), CONTINUITY_INVITE_TEXT, str(connection_id),
                 continuity_invite_keyboard(),
             )
-            supabase.table("continuity_bot_invites").update({
+            (await run_io(lambda: supabase.table("continuity_bot_invites").update({
                 "status": "sent", "sent_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("customer_chat_id", int(chat_id)).execute()
+            }).eq("customer_chat_id", int(chat_id)).execute()))
         except Exception:
             logger.exception("Failed to deliver continuity invite to customer %s", chat_id)
-            supabase.table("continuity_bot_invites").update({
+            (await run_io(lambda: supabase.table("continuity_bot_invites").update({
                 "status": "failed",
-            }).eq("customer_chat_id", int(chat_id)).execute()
+            }).eq("customer_chat_id", int(chat_id)).execute()))
 
 
 async def send_relogin_notice(context: ContextTypes.DEFAULT_TYPE, customer_chat_id: int, text: str) -> None:
     """يرسل تنبيه تسجيل الدخول عبر Business، ثم الحساب الشخصي عند انتهاء الاتصال."""
     try:
-        connection_id = get_customer_business_connection_id(customer_chat_id)
+        connection_id = (await run_io(lambda: get_customer_business_connection_id(customer_chat_id)))
         if not connection_id:
             raise RuntimeError("No Business connection available for customer")
         await send_business_message_with_current_fallback(context, customer_chat_id, text, connection_id)
@@ -2838,12 +2842,12 @@ async def send_relogin_notice(context: ContextTypes.DEFAULT_TYPE, customer_chat_
 async def send_shared_account_relogin_notifications(context: ContextTypes.DEFAULT_TYPE, account_id: str) -> tuple[int, int]:
     """ينبه المشتركين الفعّالين المرتبطين بحساب واحد بعد تسجيل الخروج الجماعي."""
     try:
-        accounts = supabase.table("chatgpt_shared_accounts").select("id, email").eq("id", account_id).limit(1).execute().data or []
+        accounts = (await run_io(lambda: supabase.table("chatgpt_shared_accounts").select("id, email").eq("id", account_id).limit(1).execute())).data or []
         assignments = (
-            supabase.table("chatgpt_account_assignments")
+            (await run_io(lambda: supabase.table("chatgpt_account_assignments")
             .select("customer_chat_id")
             .eq("account_id", account_id).eq("status", "active")
-            .execute().data or []
+            .execute())).data or []
         )
     except Exception:
         logger.exception("Failed to find shared-account customers")
@@ -2871,7 +2875,7 @@ async def send_legacy_shared_account_relogin_notifications(
     context: ContextTypes.DEFAULT_TYPE, account_id: str, account_name: str,
 ) -> tuple[int, int]:
     """نفس التنبيه للحسابات القديمة المرتبطة عبر totp_links."""
-    customer_ids = get_customers_for_account(account_id)
+    customer_ids = (await run_io(lambda: get_customers_for_account(account_id)))
     sent = failed = 0
     for customer_id in sorted(set(customer_ids)):
         try:
@@ -2889,9 +2893,9 @@ async def send_legacy_shared_account_relogin_notifications(
 
 
 async def show_chatgpt_shared_vault(message) -> None:
-    accounts = get_chatgpt_shared_accounts()
+    accounts = (await run_io(lambda: get_chatgpt_shared_accounts()))
     await message.reply_text(
-        get_chatgpt_shared_vault_summary(),
+        (await run_io(lambda: get_chatgpt_shared_vault_summary())),
         reply_markup=build_shared_vault_accounts_keyboard(accounts) if accounts else InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة حساب مشترك", callback_data="vault_add_shared")]]),
     )
 
@@ -2911,7 +2915,7 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         )
         return
     if query.data.startswith("vault_cancel_confirm_"):
-        if finance_active():
+        if (await run_io(lambda: finance_active())):
             await query.edit_message_text('الإلغاء المالي أصبح من المالية ← سجل العمليات، ثم اختر العملية والاسترجاع؛ حتى لا يتكرر الخصم أو تُلغى حسابات أخرى.')
             return
         parts = query.data[len("vault_cancel_confirm_"):].split("_", 3)
@@ -2924,11 +2928,11 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         except ValueError:
             await query.edit_message_text("⚠️ بيانات الزبون غير صحيحة.")
             return
-        sheet = get_google_sheet()
+        sheet = (await run_io(lambda: get_google_sheet()))
         payment_row = None
         if sheet is not None:
             try:
-                rows = sheet.get_all_values()
+                rows = (await run_io(lambda: sheet.get_all_values()))
                 if 1 < row_number <= len(rows):
                     payment_row = rows[row_number - 1]
             except Exception:
@@ -2939,22 +2943,22 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         vault_amounts = parse_payment_vault_amounts(payment_row[SHEET_COL_PAYMENTS - 1])
         changed = []
         for vault, amount in vault_amounts.items():
-            if not adjust_vault_balance(vault, -amount):
+            if not (await run_io(lambda: adjust_vault_balance(vault, -amount))):
                 for previous_vault, previous_amount in changed:
-                    adjust_vault_balance(previous_vault, previous_amount)
+                    (await run_io(lambda: adjust_vault_balance(previous_vault, previous_amount)))
                 await query.edit_message_text("⚠️ تعذر تعديل الخزنة، لم يتم الإلغاء.")
                 return
             changed.append((vault, amount))
         try:
-            sheet.update_cell(row_number, SHEET_COL_TOTAL, "")
-            sheet.update_cell(row_number, SHEET_COL_PAYMENTS, "ملغاة")
-            sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")
+            (await run_io(lambda: sheet.update_cell(row_number, SHEET_COL_TOTAL, "")))
+            (await run_io(lambda: sheet.update_cell(row_number, SHEET_COL_PAYMENTS, "ملغاة")))
+            (await run_io(lambda: sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")))
             if source == "native":
-                supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq("account_id", account_id).eq("customer_chat_id", chat_id).eq("status", "active").execute()
+                (await run_io(lambda: supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq("account_id", account_id).eq("customer_chat_id", chat_id).eq("status", "active").execute()))
             else:
-                supabase.table("totp_links").delete().eq("account_id", account_id).eq("chat_id", chat_id).execute()
+                (await run_io(lambda: supabase.table("totp_links").delete().eq("account_id", account_id).eq("chat_id", chat_id).execute()))
             await cancel_scheduled_subscription_feedback(chat_id)
-            supabase.table("subscription_reminders").update({"status": "cancelled"}).eq("customer_chat_id", chat_id).eq("subscription_type", "shared").eq("status", "active").execute()
+            (await run_io(lambda: supabase.table("subscription_reminders").update({"status": "cancelled"}).eq("customer_chat_id", chat_id).eq("subscription_type", "shared").eq("status", "active").execute()))
             context.user_data.pop("pending_cancel_customer", None)
             await query.edit_message_text(
                 f"✅ تم إلغاء ارتباط الزبون وإلغاء الدفع.\n"
@@ -2962,7 +2966,7 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
             )
         except Exception:
             for vault, amount in changed:
-                adjust_vault_balance(vault, amount)
+                (await run_io(lambda: adjust_vault_balance(vault, amount)))
             logger.exception("Failed to complete customer cancellation")
             await query.edit_message_text("⚠️ تعذر إكمال الإلغاء، وتمت محاولة إرجاع تعديل الخزنة.")
         return
@@ -2971,15 +2975,15 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         await query.edit_message_text("تم إلغاء العملية بدون أي تغيير.")
         return
     if query.data == "vault_accounts":
-        accounts = get_chatgpt_shared_accounts()
+        accounts = (await run_io(lambda: get_chatgpt_shared_accounts()))
         await query.edit_message_text(
-            get_chatgpt_shared_vault_summary(),
+            (await run_io(lambda: get_chatgpt_shared_vault_summary())),
             reply_markup=build_shared_vault_accounts_keyboard(accounts),
         )
         return
     if query.data.startswith("vault_account_"):
         account_id = query.data[len("vault_account_"):]
-        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]
+        accounts = (await run_io(lambda: [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]))
         if not accounts:
             await query.edit_message_text("الحساب غير موجود أو متوقف.")
             return
@@ -2991,7 +2995,7 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         return
     if query.data.startswith("vault_legacy_account_"):
         account_id = query.data[len("vault_legacy_account_"):]
-        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]
+        accounts = (await run_io(lambda: [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]))
         if not accounts:
             await query.edit_message_text("الحساب غير موجود.")
             return
@@ -3013,7 +3017,7 @@ async def handle_chatgpt_vault_callback(update: Update, context: ContextTypes.DE
         return
     if query.data.startswith("vault_legacy_relogin_"):
         account_id = query.data[len("vault_legacy_relogin_"):]
-        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]
+        accounts = (await run_io(lambda: [account for account in get_chatgpt_shared_accounts() if str(account.get("legacy_id")) == account_id]))
         account_name = accounts[0].get("email") if accounts else "الحساب المشترك"
         sent, failed = await send_legacy_shared_account_relogin_notifications(context, account_id, account_name)
         await query.edit_message_text(
@@ -3058,23 +3062,23 @@ async def handle_shared_account_input(update: Update, context: ContextTypes.DEFA
             await message.reply_text("المفتاح مو صحيح. أرسل مفتاح TOTP الطويل مرة ثانية.")
             return True
         try:
-            supabase.table("chatgpt_shared_accounts").insert({
+            (await run_io(lambda: supabase.table("chatgpt_shared_accounts").insert({
                 "email": state["email"], "password": state["password"],
                 "totp_secret": secret, "capacity": SHARED_CHATGPT_ACCOUNT_CAPACITY,
-            }).execute()
+            }).execute()))
         except Exception:
             logger.exception("Failed to add shared ChatGPT account")
             await message.reply_text("⚠️ ما انحفظ الحساب. تأكد أن الإيميل مو مضاف سابقاً.")
             return True
         try:
             # نخلي الحساب الجديد معروفاً أيضاً لمسار /link القديم.
-            legacy_exists = supabase.table("totp_accounts").select("id").eq("label", state["email"]).limit(1).execute().data or []
+            legacy_exists = (await run_io(lambda: supabase.table("totp_accounts").select("id").eq("label", state["email"]).limit(1).execute())).data or []
             if not legacy_exists:
-                supabase.table("totp_accounts").insert({
+                (await run_io(lambda: supabase.table("totp_accounts").insert({
                     "link_code": "vault_" + uuid.uuid4().hex[:12],
                     "secret": secret,
                     "label": state["email"],
-                }).execute()
+                }).execute()))
         except Exception:
             logger.exception("Failed to mirror new shared account into legacy accounts")
         context.user_data.pop("pending_shared_account", None)
@@ -3096,7 +3100,7 @@ async def handle_cancel_customer_input(update: Update, context: ContextTypes.DEF
     except ValueError:
         await message.reply_text("أرسل chat_id صحيح كرقم فقط.")
         return True
-    payment = get_latest_customer_payment(chat_id)
+    payment = (await run_io(lambda: get_latest_customer_payment(chat_id)))
     if payment is None:
         await message.reply_text("ما لكيت دفعة مسجلة لهذا الزبون حتى ألغيها.")
         return True
@@ -3148,9 +3152,9 @@ async def handle_payment_method_callback(update: Update, context: ContextTypes.D
         return
     if data.startswith("pm_toggle_"):
         method_id = data[len("pm_toggle_"):]
-        rows = supabase.table("payment_methods").select("is_active").eq("id", method_id).execute().data or []
+        rows = (await run_io(lambda: supabase.table("payment_methods").select("is_active").eq("id", method_id).execute())).data or []
         if rows:
-            supabase.table("payment_methods").update({"is_active": not rows[0]["is_active"]}).eq("id", method_id).execute()
+            (await run_io(lambda: supabase.table("payment_methods").update({"is_active": not rows[0]["is_active"]}).eq("id", method_id).execute()))
         await show_payment_methods(query.message)
         return
     if data.startswith("pm_delc_"):
@@ -3158,12 +3162,12 @@ async def handle_payment_method_callback(update: Update, context: ContextTypes.D
         await query.edit_message_text("تأكيد حذف طريقة الدفع؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ نعم، احذف", callback_data=f"pm_del_{method_id}")], [InlineKeyboardButton("◀️ إلغاء", callback_data=f"pm_{method_id}")]]))
         return
     if data.startswith("pm_del_"):
-        supabase.table("payment_methods").delete().eq("id", data[len("pm_del_"):]).execute()
+        (await run_io(lambda: supabase.table("payment_methods").delete().eq("id", data[len("pm_del_"):]).execute()))
         await show_payment_methods(query.message)
         return
     if data.startswith("pm_"):
         method_id = data[len("pm_"):]
-        rows = supabase.table("payment_methods").select("id, name, instructions, is_active").eq("id", method_id).execute().data or []
+        rows = (await run_io(lambda: supabase.table("payment_methods").select("id, name, instructions, is_active").eq("id", method_id).execute())).data or []
         if not rows:
             await query.message.reply_text("⚠️ طريقة الدفع ما عادت موجودة.")
             return
@@ -3192,9 +3196,9 @@ async def handle_payment_method_input(update: Update, context: ContextTypes.DEFA
     payload = {"name": name.strip(), "instructions": instructions.strip()}
     try:
         if state.get("id"):
-            supabase.table("payment_methods").update(payload).eq("id", state["id"]).execute()
+            (await run_io(lambda: supabase.table("payment_methods").update(payload).eq("id", state["id"]).execute()))
         else:
-            supabase.table("payment_methods").insert(payload).execute()
+            (await run_io(lambda: supabase.table("payment_methods").insert(payload).execute()))
     except Exception:
         logger.exception("Failed to save payment method")
         await message.reply_text("⚠️ فشل حفظ طريقة الدفع.")
@@ -3778,15 +3782,15 @@ async def schedule_subscription_feedback(state: dict) -> bool:
             query = query.eq("id", state["reminder_id"])
         else:
             query = query.order("created_at", desc=True).limit(1)
-        row = query.execute().data or []
+        row = (await run_io(lambda: query.execute())).data or []
         if not row:
             return False
         expires_at = datetime.fromisoformat(row[0]["expires_at"].replace("Z", "+00:00"))
         message_id = await schedule_personal_message(int(chat_id), SUBSCRIPTION_FEEDBACK_TEXT, expires_at)
-        supabase.table("subscription_reminders").update({
+        (await run_io(lambda: supabase.table("subscription_reminders").update({
             "scheduled_message_id": message_id,
             "scheduled_message_status": "scheduled",
-        }).eq("id", row[0]["id"]).execute()
+        }).eq("id", row[0]["id"]).execute()))
         return True
     except Exception:
         logger.exception("Failed to schedule personal Telegram feedback for customer %s", chat_id)
@@ -3800,10 +3804,10 @@ async def replace_chatgpt_reminder_with_compensation(state: dict, duration_days:
         return None
     try:
         rows = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select("id, product_name, scheduled_message_id")
             .eq("customer_chat_id", chat_id)
-            .order("created_at", desc=True).limit(50).execute().data or []
+            .order("created_at", desc=True).limit(50).execute())).data or []
         )
         reminder = next((row for row in rows if is_chatgpt_product_name(row.get("product_name"))), None)
         if reminder is None:
@@ -3813,7 +3817,7 @@ async def replace_chatgpt_reminder_with_compensation(state: dict, duration_days:
             await cancel_personal_scheduled_message(int(chat_id), int(old_message_id))
 
         started_at = datetime.now(timezone.utc)
-        supabase.table("subscription_reminders").update({
+        (await run_io(lambda: supabase.table("subscription_reminders").update({
             "product_name": CHATGPT_PRODUCT_NAME,
             "plan_name": "تعويض",
             "plan_duration": f"{duration_days} يوم",
@@ -3826,13 +3830,14 @@ async def replace_chatgpt_reminder_with_compensation(state: dict, duration_days:
             "expires_at": (started_at + timedelta(days=duration_days)).isoformat(),
             "scheduled_message_id": None,
             "scheduled_message_status": "none",
-        }).eq("id", reminder["id"]).execute()
+        }).eq("id", reminder["id"]).execute()))
         return {**state, "duration_days": duration_days, "reminder_id": reminder["id"]}
     except Exception:
         logger.exception("Failed to replace ChatGPT reminder with compensation for %s", chat_id)
         return None
 
 
+@background_job
 async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE) -> None:
     """يصلح ربطات ChatGPT القديمة التي سبقت ميزة الجدولة.
 
@@ -3843,7 +3848,7 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
         return
     try:
         rows = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select(
                 "id, customer_chat_id, product_name, duration_days, feedback_only, "
                 "scheduled_message_status, created_at"
@@ -3851,7 +3856,7 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
             .eq("status", "active")
             .order("created_at", desc=True)
             .limit(1000)
-            .execute().data or []
+            .execute())).data or []
         )
         processed_chat_ids: set[int] = set()
         pending_schedules: list[tuple[dict, int, datetime]] = []
@@ -3871,8 +3876,8 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
             if duration_days <= 0:
                 continue
             links = (
-                supabase.table("totp_links").select("linked_at")
-                .eq("chat_id", int(chat_id)).limit(1).execute().data or []
+                (await run_io(lambda: supabase.table("totp_links").select("linked_at")
+                .eq("chat_id", int(chat_id)).limit(1).execute())).data or []
             )
             if not links or not links[0].get("linked_at"):
                 continue
@@ -3881,16 +3886,16 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
                 expires_at = linked_at + timedelta(days=duration_days)
                 if expires_at <= now:
                     continue
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "started_at": linked_at.isoformat(),
                     "expires_at": expires_at.isoformat(),
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
                 pending_schedules.append((reminder, int(chat_id), expires_at))
             except Exception:
                 logger.exception("Failed to backfill scheduled feedback for customer %s", chat_id)
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "scheduled_message_status": "failed",
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
 
         if not pending_schedules:
             return
@@ -3901,15 +3906,15 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
         for reminder, chat_id, _expires_at in pending_schedules:
             result = results.get(chat_id)
             if isinstance(result, int):
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "scheduled_message_id": result,
                     "scheduled_message_status": "scheduled",
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
             else:
                 logger.error("Failed to backfill scheduled feedback for customer %s: %s", chat_id, result)
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "scheduled_message_status": "failed",
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
     except Exception:
         logger.exception("Failed to backfill scheduled ChatGPT feedback")
 
@@ -3959,16 +3964,16 @@ def activate_pending_chatgpt_subscription_on_delivery(chat_id: int) -> dict | No
 async def cancel_scheduled_subscription_feedback(customer_chat_id: int) -> None:
     """يلغي كل رسائل المتابعة المجدولة للزبون قبل إلغاء/تعويض اشتراكه."""
     try:
-        rows = (supabase.table("subscription_reminders")
+        rows = ((await run_io(lambda: supabase.table("subscription_reminders")
                 .select("id, scheduled_message_id")
                 .eq("customer_chat_id", customer_chat_id).eq("status", "active")
-                .not_.is_("scheduled_message_id", "null").execute().data or [])
+                .not_.is_("scheduled_message_id", "null").execute())).data or [])
         for row in rows:
             if personal_scheduler_is_configured():
                 await cancel_personal_scheduled_message(customer_chat_id, int(row["scheduled_message_id"]))
-            supabase.table("subscription_reminders").update({
+            (await run_io(lambda: supabase.table("subscription_reminders").update({
                 "scheduled_message_status": "cancelled",
-            }).eq("id", row["id"]).execute()
+            }).eq("id", row["id"]).execute()))
     except Exception:
         logger.exception("Failed to cancel scheduled feedback for customer %s", customer_chat_id)
 
@@ -3986,15 +3991,16 @@ def save_personal_reminder(due_at: datetime, purpose: str) -> bool:
         return False
 
 
+@background_job
 async def check_personal_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Notify due personal reminders and repeat them until acknowledged."""
     now = datetime.now(timezone.utc)
     repeat_after = now - timedelta(minutes=15)
     try:
-        reminders = (supabase.table("personal_reminders")
+        reminders = ((await run_io(lambda: supabase.table("personal_reminders")
             .select("id, remind_at, purpose, last_notified_at, notification_count")
             .eq("owner_user_id", OWNER_USER_ID).eq("status", "pending")
-            .lte("remind_at", now.isoformat()).execute().data or [])
+            .lte("remind_at", now.isoformat()).execute())).data or [])
     except Exception:
         logger.exception("Failed to load personal reminders")
         return
@@ -4013,10 +4019,10 @@ async def check_personal_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text=f"⏰ تذكير\n\n{reminder['purpose']}\n\nيبقى هذا التذكير يتكرر كل 15 دقيقة إلى أن تأكد الاستلام.",
                 reply_markup=personal_reminder_keyboard(reminder["id"]),
             )
-            supabase.table("personal_reminders").update({
+            (await run_io(lambda: supabase.table("personal_reminders").update({
                 "last_notified_at": now.isoformat(),
                 "notification_count": (reminder.get("notification_count") or 0) + 1,
-            }).eq("id", reminder["id"]).eq("status", "pending").execute()
+            }).eq("id", reminder["id"]).eq("status", "pending").execute()))
         except Exception:
             logger.exception("Failed to send personal reminder %s", reminder.get("id"))
 
@@ -4031,10 +4037,10 @@ async def handle_personal_reminder_callback(update: Update, context: ContextType
         await query.answer("التذكير غير صحيح.", show_alert=True)
         return
     try:
-        result = (supabase.table("personal_reminders")
+        result = ((await run_io(lambda: supabase.table("personal_reminders")
             .update({"status": "acknowledged", "acknowledged_at": datetime.now(timezone.utc).isoformat()})
             .eq("id", reminder_id).eq("owner_user_id", OWNER_USER_ID).eq("status", "pending")
-            .execute())
+            .execute())))
         if not result.data:
             await query.answer("هذا التذكير مؤكد مسبقاً.", show_alert=True)
             return
@@ -4509,7 +4515,7 @@ async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
     conversation_summaries. يُستدعى "بالكسل" (lazy) وقت وصول رسالة
     جديدة، بدل مؤقت خارجي.
     """
-    existing = get_conversation_summary(customer_chat_id)
+    existing = (await run_io(lambda: get_conversation_summary(customer_chat_id)))
     now = datetime.now(timezone.utc)
 
     if existing and existing.get("last_message_at"):
@@ -4527,7 +4533,7 @@ async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
         )
         if existing and existing.get("last_message_at"):
             query = query.gt("created_at", existing["last_message_at"])
-        res = query.execute()
+        res = (await run_io(lambda: query.execute()))
         new_messages = res.data or []
     except Exception:
         logger.exception("Failed to fetch new messages for summary update")
@@ -4562,11 +4568,11 @@ async def maybe_update_conversation_summary(customer_chat_id: int) -> None:
 
     latest_message_at = new_messages[-1]["created_at"]
     try:
-        supabase.table("conversation_summaries").upsert({
+        (await run_io(lambda: supabase.table("conversation_summaries").upsert({
             "customer_chat_id": customer_chat_id,
             "summary_text": new_summary,
             "last_message_at": latest_message_at,
-        }).execute()
+        }).execute()))
     except Exception:
         logger.exception("Failed to save updated conversation summary")
 
@@ -4594,13 +4600,13 @@ async def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
         return False, "بيانات التعويض غير مكتملة."
     if amount <= 0 or amount > original_total:
         return False, "مبلغ التعويض يجب أن يكون أكبر من صفر ولا يتجاوز الدفعة المسجلة."
-    sheet = get_google_sheet()
+    sheet = (await run_io(lambda: get_google_sheet()))
     if sheet is None:
         return False, "تعذر فتح شيت الدفعات؛ لم يُنفذ التعويض."
     reason = f"تعويض للزبون {chat_id}: {expense.get('reason') or 'بدون سبب'}"
     try:
         # نتحقق من السطر ثانية قبل أي تعديل، حتى لا نطبق التعويض على دفعة تغيرت.
-        rows = sheet.get_all_values()
+        rows = (await run_io(lambda: sheet.get_all_values()))
         if row_number <= 1 or row_number > len(rows):
             return False, "دفعة الزبون لم تعد موجودة."
         row = rows[row_number - 1]
@@ -4608,20 +4614,20 @@ async def apply_customer_compensation(expense: dict) -> tuple[bool, str]:
             return False, "دفعة الزبون تغيرت؛ أعد بدء التعويض."
         if parse_sheet_amount(row[SHEET_COL_TOTAL - 1]) != original_total:
             return False, "مبلغ الدفعة تغير؛ أعد بدء التعويض حتى لا ينخصم مرتين."
-        if not append_expense_row(amount, reason):
+        if not (await run_io(lambda: append_expense_row(amount, reason))):
             return False, "فشل حفظ التعويض في ورقة المصروفات."
-        sheet.update_cell(row_number, SHEET_COL_TOTAL, original_total - amount)
-        sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")
+        (await run_io(lambda: sheet.update_cell(row_number, SHEET_COL_TOTAL, original_total - amount)))
+        (await run_io(lambda: sheet.update_cell(row_number, SHEET_COL_CHATGPT_ACCOUNT, "")))
         # التعويض ينهي الخدمة الحالية: لا رسالة انتهاء لاحقاً ولا كود/حساب باقٍ.
         await cancel_scheduled_subscription_feedback(chat_id)
-        supabase.table("subscription_reminders").update({"status": "cancelled"}).eq(
+        (await run_io(lambda: supabase.table("subscription_reminders").update({"status": "cancelled"}).eq(
             "customer_chat_id", chat_id
-        ).eq("status", "active").execute()
-        supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq(
+        ).eq("status", "active").execute()))
+        (await run_io(lambda: supabase.table("chatgpt_account_assignments").update({"status": "cancelled"}).eq(
             "customer_chat_id", chat_id
-        ).eq("status", "active").execute()
-        supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
-        if expense.get("vault") and not adjust_vault_balance(expense["vault"], -amount):
+        ).eq("status", "active").execute()))
+        (await run_io(lambda: supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()))
+        if expense.get("vault") and not (await run_io(lambda: adjust_vault_balance(expense["vault"], -amount))):
             return False, "تم حفظ التعويض لكن تعذر خصمه من الخزنة؛ عدّل الخزنة يدوياً."
         return True, f"تم تعويض {amount} وإلغاء الخدمة/متابعة الانتهاء. صافي الدفعة صار {original_total - amount}."
     except Exception:
@@ -5060,8 +5066,8 @@ def get_expected_payment_for_interactive_session(customer_chat_id: int) -> tuple
 
 async def analyze_payment_proof(file_bytes: bytes, customer_chat_id: int) -> dict | None:
     """يفحص وصل الدفع بالصورة مقابل الباقة وطرق الدفع المعتمدة."""
-    expected_amount, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
-    active_methods = [method for method in get_payment_methods() if method.get("is_active")]
+    expected_amount, plan_name = (await run_io(lambda: get_expected_payment_for_interactive_session(customer_chat_id)))
+    active_methods = (await run_io(lambda: [method for method in get_payment_methods() if method.get("is_active")]))
     destinations = "\n".join(f"- {method['name']}: {method['instructions']}" for method in active_methods)
     prompt = (
         f"{PAYMENT_PROOF_ANALYSIS_PROMPT}\n\n"
@@ -5259,10 +5265,10 @@ async def generate_grounded_interactive_answer(
 ) -> str | None:
     """Answer novel questions from trusted knowledge/archive, or abstain."""
     prompt = (
-        f"سياق المحادثة:\n{context_text}\n\n"
+        (await run_io(lambda: f"سياق المحادثة:\n{context_text}\n\n"
         f"رسالة الزبون الحالية:\n{redact_context_text(customer_text)}\n\n"
         f"معرفة المتجر:\n{build_interactive_knowledge()}\n\n"
-        f"أمثلة أرشيف قريبة (قد تكون فارغة):\n{style_examples_text or 'لا توجد'}"
+        f"أمثلة أرشيف قريبة (قد تكون فارغة):\n{style_examples_text or 'لا توجد'}"))
     )
     try:
         data = await call_ai_api({
@@ -5453,9 +5459,9 @@ async def catalog_mention_is_purchase(
                 {
                     "role": "user",
                     "content": (
-                        f"المنتج/المنتجات التي تطابقت من الكاتالوج: {product_names}\n\n"
+                        (await run_io(lambda: f"المنتج/المنتجات التي تطابقت من الكاتالوج: {product_names}\n\n"
                         f"سياق المحادثة الحديث:\n{format_product_purchase_context(customer_chat_id)}\n\n"
-                        f"رسالة العميل الحالية:\n{redact_context_text(text)}"
+                        f"رسالة العميل الحالية:\n{redact_context_text(text)}"))
                     ),
                 },
             ],
@@ -5592,10 +5598,10 @@ def set_interactive_sale_state(
 
 async def choose_test_response_action(customer_chat_id: int, new_message: str) -> str | None:
     """يفهم النية ثم يمررها على حالة الجلسة؛ الموديل لا يختار الرد مباشرة."""
-    templates = get_interactive_response_templates()
-    recent_messages, session_id = get_recent_interactive_context(customer_chat_id)
+    templates = (await run_io(lambda: get_interactive_response_templates()))
+    recent_messages, session_id = (await run_io(lambda: get_recent_interactive_context(customer_chat_id)))
     style_examples_text = format_style_examples(
-        get_relevant_style_examples(new_message), templates
+        (await run_io(lambda: get_relevant_style_examples(new_message))), templates
     )
     context_lines = []
     for item in recent_messages:
@@ -5608,21 +5614,21 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
                 text = "[تم تسليم بيانات الحساب]"
             context_lines.append(f"{speaker}: {redact_context_text(text)}")
     context_text = "\n".join(context_lines) or "لا يوجد سياق سابق."
-    sale_state = get_interactive_sale_state(customer_chat_id)
+    sale_state = (await run_io(lambda: get_interactive_sale_state(customer_chat_id)))
     workflow_state = sale_state.get("workflow_state", "observing")
-    selected_product = get_selected_catalog_product(customer_chat_id)
+    selected_product = (await run_io(lambda: get_selected_catalog_product(customer_chat_id)))
     recent_customer_text = "\n".join(
         (item.get("message_text") or "").strip()
         for item in recent_messages[-8:]
         if item.get("sender_type") == "customer" and (item.get("message_text") or "").strip()
     )
-    explicit_catalog_product = find_catalog_product_context(new_message)
+    explicit_catalog_product = (await run_io(lambda: find_catalog_product_context(new_message)))
     current_mentions_known_product = bool(explicit_catalog_product)
-    recent_mentions_known_product = bool(find_catalog_product_context(recent_customer_text))
+    recent_mentions_known_product = bool((await run_io(lambda: find_catalog_product_context(recent_customer_text))))
     support_cancelled_this_turn = is_support_cancellation(new_message)
     latest_context_product = None
     for item in reversed(recent_messages[:-1]):
-        latest_context_product = find_catalog_product_context(item.get("message_text") or "")
+        latest_context_product = (await run_io(lambda: find_catalog_product_context(item.get("message_text") or "")))
         if latest_context_product:
             break
 
@@ -5631,7 +5637,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     if should_switch_from_support(
         workflow_state, new_message, current_mentions_known_product
     ):
-        set_interactive_sale_state(customer_chat_id, "observing", None, None)
+        (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "observing", None, None)))
         workflow_state = "observing"
         sale_state = {**sale_state, "workflow_state": "observing", "selected_product_id": None, "selected_plan_id": None}
         selected_product = None
@@ -5642,18 +5648,18 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     if explicit_catalog_product and not is_chatgpt_product(explicit_catalog_product) and (
         not has_support_signal(new_message) or support_cancelled_this_turn
     ):
-        plans = [plan for plan in get_catalog_plans(explicit_catalog_product["id"]) if plan.get("is_active")]
+        plans = (await run_io(lambda: [plan for plan in get_catalog_plans(explicit_catalog_product["id"]) if plan.get("is_active")]))
         if plans:
-            set_interactive_sale_state(
+            (await run_io(lambda: set_interactive_sale_state(
                 customer_chat_id,
                 "awaiting_catalog_plan_choice",
                 explicit_catalog_product["id"],
                 None,
-            )
+            )))
             return "catalog_product_plans"
-        set_interactive_sale_state(
+        (await run_io(lambda: set_interactive_sale_state(
             customer_chat_id, "product_context", explicit_catalog_product["id"], None
-        )
+        )))
         return "catalog_product_plans"
 
     # متابعة مثل «عدكم لو لا؟» تأخذ آخر منتج مذكور صراحةً، من دون اتصال
@@ -5664,12 +5670,12 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         and is_product_availability_followup(new_message)
         and workflow_state not in {"support_pending", "support_review"}
     ):
-        set_interactive_sale_state(
+        (await run_io(lambda: set_interactive_sale_state(
             customer_chat_id,
             "awaiting_catalog_plan_choice",
             latest_context_product["id"],
             None,
-        )
+        )))
         return "chatgpt_plans" if is_chatgpt_product(latest_context_product) else "catalog_product_plans"
 
     # الحالات الواضحة لا تحتاج تخمين من الموديل. هذا يمنع الخطأ الظاهر
@@ -5689,7 +5695,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         recent_mentions_known_product,
     ):
         support_action = support_action_for_turn(workflow_state, new_message)
-        set_interactive_sale_state(customer_chat_id, "support_review")
+        (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "support_review")))
         return support_action
     # بعد إرسال الوصل لا نسمح لأي كلمة لاحقة (مثل "هسة" أو "جات") أن ترجع
     # المحادثة للباقات أو للردود العامة. النتيجة الوحيدة تكون فحص الصورة ثم
@@ -5719,7 +5725,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         if has_any_normalized_term(normalized, {"ماصار", "مايشتغل", "خطا", "خطأ", "مشكله", "مشكلة"}) or (
             "ما" in normalized and has_any_normalized_term(normalized, {"صار", "يشتغل"})
         ):
-            set_interactive_sale_state(customer_chat_id, "support_review")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "support_review")))
             return "request_support_screenshot"
         if has_any_normalized_term(normalized, {"كود", "الرمز", "رمز", "code", "otp"}):
             return "code_request"
@@ -5740,22 +5746,22 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             if item.get("sender_type") == "customer" and (item.get("message_text") or "").strip()
         ]
         plan_choice_text = " ".join(customer_choice_messages[-4:])
-        selected = find_selected_chatgpt_plan(plan_choice_text)
+        selected = (await run_io(lambda: find_selected_chatgpt_plan(plan_choice_text)))
         if selected:
             product, plan = selected
-            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])))
             return "payment_methods"
-        missing_choice = get_chatgpt_plan_choice_gap(plan_choice_text)
+        missing_choice = (await run_io(lambda: get_chatgpt_plan_choice_gap(plan_choice_text)))
         if missing_choice:
             return missing_choice
         return "request_plan_choice"
     if workflow_state == "awaiting_catalog_plan_choice":
-        product = get_selected_catalog_product(customer_chat_id)
+        product = (await run_io(lambda: get_selected_catalog_product(customer_chat_id)))
         if not product:
             return "clarify"
-        selected_plan = find_selected_catalog_plan(product, new_message)
+        selected_plan = (await run_io(lambda: find_selected_catalog_plan(product, new_message)))
         if selected_plan:
-            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], selected_plan["id"])
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], selected_plan["id"])))
             return "payment_methods"
         # إعادة سؤال «شنو متوفر؟» أو اسم المنتج تعرض نفس باقاته، ولا ترجع
         # إلى فلو ChatGPT ولا تطلب اختياراً أعمى.
@@ -5763,7 +5769,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # «شكد لازم أدفع؟» بعد اختيار الباقة سؤال عن مبلغ الباقة نفسها، مو
     # طلب لإعادة أرقام الدفع. نعتمد السعر المخزّن للباقة المختارة.
     if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and is_plan_question(new_message):
-        expected_amount, _ = get_expected_payment_for_interactive_session(customer_chat_id)
+        expected_amount, _ = (await run_io(lambda: get_expected_payment_for_interactive_session(customer_chat_id)))
         if expected_amount is not None:
             return "selected_plan_price"
     # «شنو عدكم غيره؟» لا تحدد هل يقصد باقات أو منتجات أو طريقة دفع أخرى؛
@@ -5772,7 +5778,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         return "clarify"
     if is_payment_claim(new_message):
         if workflow_state in {"awaiting_payment", "awaiting_payment_proof"}:
-            set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")))
             return "request_payment_proof"
         return "request_plan_choice"
     if workflow_state in {"awaiting_payment", "awaiting_payment_proof"} and asks_payment_guidance(new_message):
@@ -5787,39 +5793,39 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     # الزبون قد يحدد المنتج والباقـة من أول رسالة مثل: «أريد جات مشترك
     # شهر». لا نعيد له القائمة في هذه الحالة؛ نثبت اختياره وننتقل مباشرة
     # لخطوة الدفع.
-    if is_chatgpt_catalog_context(new_message):
-        selected = find_selected_chatgpt_plan(new_message)
+    if (await run_io(lambda: is_chatgpt_catalog_context(new_message))):
+        selected = (await run_io(lambda: find_selected_chatgpt_plan(new_message)))
         if selected:
             product, plan = selected
-            set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_payment", product["id"], plan["id"])))
             return "payment_methods"
-        missing_choice = get_chatgpt_plan_choice_gap(new_message)
+        missing_choice = (await run_io(lambda: get_chatgpt_plan_choice_gap(new_message)))
         if missing_choice:
-            product = get_chatgpt_catalog_product()
-            set_interactive_sale_state(
+            product = (await run_io(lambda: get_chatgpt_catalog_product()))
+            (await run_io(lambda: set_interactive_sale_state(
                 customer_chat_id,
                 "awaiting_plan_choice",
                 product["id"] if product else None,
                 None,
-            )
+            )))
             return missing_choice
-    if is_chatgpt_catalog_context(new_message) or (
-        is_plan_question(new_message) and is_chatgpt_catalog_context(context_text)
+    if (await run_io(lambda: is_chatgpt_catalog_context(new_message))) or (
+        is_plan_question(new_message) and (await run_io(lambda: is_chatgpt_catalog_context(context_text)))
     ):
-        product = get_chatgpt_catalog_product()
-        set_interactive_sale_state(
+        product = (await run_io(lambda: get_chatgpt_catalog_product()))
+        (await run_io(lambda: set_interactive_sale_state(
             customer_chat_id,
             "awaiting_plan_choice",
             product["id"] if product else None,
             None,
-        )
+        )))
         return "chatgpt_plans"
 
     # منتجات الكاتالوج الأخرى لها نفس منطق العرض والاختيار، لكن لا تدخل
     # أبداً في تسليم حسابات ChatGPT.
-    catalog_product = find_catalog_product_context(new_message)
+    catalog_product = (await run_io(lambda: find_catalog_product_context(new_message)))
     if catalog_product and not is_chatgpt_product(catalog_product):
-        set_interactive_sale_state(customer_chat_id, "awaiting_catalog_plan_choice", catalog_product["id"], None)
+        (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_catalog_plan_choice", catalog_product["id"], None)))
         return "catalog_product_plans"
 
     # داخل عملية بيع قائمة، أي كلام ما فهمناه لا يرجع لآخر رد ولا يخرج عن
@@ -5830,10 +5836,10 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
     }:
         return "clarify"
 
-    known_product_names = sorted({
+    known_product_names = (await run_io(lambda: sorted({
         *(category for category in INTERACTIVE_PRODUCT_FAQ_CATEGORIES),
         *(str(product.get("name") or "").strip() for product in get_catalog_products() if product.get("is_active")),
-    })
+    })))
     messages = [{
         "role": "system",
         "content": (
@@ -5867,7 +5873,7 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
         logger.info("Interactive intent %s for session %s", frame, session_id)
 
         if frame.intent == "support":
-            set_interactive_sale_state(customer_chat_id, "support_review")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "support_review")))
             return "request_support_screenshot"
         if frame.intent == "greeting":
             return "static_faq"
@@ -5889,24 +5895,24 @@ async def choose_test_response_action(customer_chat_id: int, new_message: str) -
             return "registration_guidance"
         if frame.intent == "workspace_help":
             return "workspace_guidance"
-        if frame.intent in {"purchase", "plan_selection"} and frame.product and is_chatgpt_catalog_context(frame.product):
-            product = get_chatgpt_catalog_product()
-            set_interactive_sale_state(
+        if frame.intent in {"purchase", "plan_selection"} and frame.product and (await run_io(lambda: is_chatgpt_catalog_context(frame.product))):
+            product = (await run_io(lambda: get_chatgpt_catalog_product()))
+            (await run_io(lambda: set_interactive_sale_state(
                 customer_chat_id,
                 "awaiting_plan_choice",
                 product["id"] if product else None,
                 None,
-            )
+            )))
             return "chatgpt_plans"
         if frame.intent in {"purchase", "plan_selection"} and frame.product:
-            contextual_catalog_product = find_catalog_product_context(frame.product)
+            contextual_catalog_product = (await run_io(lambda: find_catalog_product_context(frame.product)))
             if contextual_catalog_product and not is_chatgpt_product(contextual_catalog_product):
-                set_interactive_sale_state(
+                (await run_io(lambda: set_interactive_sale_state(
                     customer_chat_id,
                     "awaiting_catalog_plan_choice",
                     contextual_catalog_product["id"],
                     None,
-                )
+                )))
                 return "catalog_product_plans"
         # نوع/مدة بدون منتج لا يكفيان لافتراض ChatGPT من الأرشيف.
         if frame.intent in {"purchase", "plan_selection"}:
@@ -6052,7 +6058,7 @@ async def classify_intent(customer_chat_id: int, text: str) -> tuple[list[str], 
     # نثبته بشكل مستقل عن قائمة الكلمات القديمة.
     if has_thanks_signal(text) and "شكر" not in categories:
         categories.append("شكر")
-    catalog_products = get_catalog_products()
+    catalog_products = (await run_io(lambda: get_catalog_products()))
     matched_products = match_catalog_products(text, catalog_products)
     if matched_products and await catalog_mention_is_purchase(
         customer_chat_id, text, [dict(product) for product in matched_products]
@@ -6270,14 +6276,15 @@ def assign_shared_chatgpt_account(customer_chat_id: int) -> dict | None:
     return None
 
 
+@background_job
 async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """يسجل انتهاء الاشتراك؛ رسالة الزبون ترسلها جدولة Telegram وحدها."""
     now = datetime.now(timezone.utc)
     try:
         reminders = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select("id, customer_chat_id, customer_name, customer_username, business_connection_id, product_name, plan_name, plan_duration, subscription_type, duration_months, feedback_only, source, instagram_sale_id, instagram_account, scheduled_message_id, scheduled_message_status")
-            .eq("status", "active").lte("expires_at", now.isoformat()).execute().data or []
+            .eq("status", "active").lte("expires_at", now.isoformat()).execute())).data or []
         )
     except Exception:
         logger.exception("Failed to check subscription reminders")
@@ -6290,16 +6297,16 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
         if reminder.get("customer_username"):
             customer += f" (@{reminder['customer_username']})"
         try:
-            supabase.table("subscription_reminders").update({
+            (await run_io(lambda: supabase.table("subscription_reminders").update({
                 "status": "expired", "expiry_notified_at": now.isoformat(),
-            }).eq("id", reminder["id"]).eq("status", "active").execute()
+            }).eq("id", reminder["id"]).eq("status", "active").execute()))
 
             # إذا لم يبقَ للزبون اشتراك فعّال آخر (مثلاً جدد مقدماً)، نفك
             # /link أيضاً. لذلك عداد زبائن الحساب بالإحصائيات ينقص فوراً.
             unlinked = False
             chat_id = reminder.get("customer_chat_id")
-            if not reminder.get("feedback_only") and chat_id is not None and can_unlink_expired_customer(chat_id):
-                supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()
+            if not reminder.get("feedback_only") and chat_id is not None and (await run_io(lambda: can_unlink_expired_customer(chat_id))):
+                (await run_io(lambda: supabase.table("totp_links").delete().eq("chat_id", chat_id).execute()))
                 unlinked = True
 
             # لا نرسل من Business هنا إطلاقاً؛ هذا كان سبب الرسالة الثانية.
@@ -6309,10 +6316,10 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
             scheduled = bool(reminder.get("scheduled_message_id")) and (
                 reminder.get("scheduled_message_status") == "scheduled"
             )
-            supabase.table("subscription_reminders").update({
+            (await run_io(lambda: supabase.table("subscription_reminders").update({
                 "feedback_status": "awaiting_reply" if scheduled else "needs_owner",
                 "feedback_requested_at": now.isoformat() if scheduled else None,
-            }).eq("id", reminder["id"]).execute()
+            }).eq("id", reminder["id"]).execute()))
             source_text = "\n📲 المصدر: Instagram" if reminder.get("source") == "instagram" else ""
             sale_text = f"\nرقم العملية: {reminder.get('instagram_sale_id')}" if reminder.get("instagram_sale_id") else ""
             owner_event = (
@@ -6333,19 +6340,20 @@ async def check_expired_subscription_reminders(context: ContextTypes.DEFAULT_TYP
             logger.exception("Failed to notify expired subscription %s", reminder.get("id"))
 
 
+@background_job
 async def retry_expired_reminders_missing_chat(
     context: ContextTypes.DEFAULT_TYPE, now: datetime,
 ) -> None:
     """يعيد محاولة السجلات القديمة التي انتهت قبل حفظ chat_id لها."""
     try:
         reminders = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select("id, customer_chat_id, business_connection_id, customer_name, customer_username, instagram_account")
             .eq("status", "expired").is_("customer_chat_id", "null")
             # هذه كانت الحالة الخاطئة في النسخ السابقة: وُضع السجل كأنه
             # ينتظر رداً رغم أن الرسالة لم تُرسل.
             .in_("feedback_status", ["awaiting_reply", "delivery_missing_chat"])
-            .execute().data or []
+            .execute())).data or []
         )
     except Exception:
         logger.exception("Failed to find expired reminders missing chat_id")
@@ -6353,13 +6361,13 @@ async def retry_expired_reminders_missing_chat(
 
     feedback_text = SUBSCRIPTION_FEEDBACK_TEXT
     for reminder in reminders:
-        chat_id, connection_id = resolve_reminder_delivery_target(reminder)
+        chat_id, connection_id = (await run_io(lambda: resolve_reminder_delivery_target(reminder)))
         if chat_id is None or not connection_id:
             # السجل يبقى محفوظاً، لكن لا ندّعي أن المتابعة أُرسلت.
             try:
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "feedback_status": "delivery_missing_chat",
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
             except Exception:
                 logger.exception("Failed to mark reminder %s as missing Telegram chat", reminder.get("id"))
             continue
@@ -6367,10 +6375,10 @@ async def retry_expired_reminders_missing_chat(
             await send_business_message_with_current_fallback(
                 context, chat_id, feedback_text, connection_id,
             )
-            supabase.table("subscription_reminders").update({
+            (await run_io(lambda: supabase.table("subscription_reminders").update({
                 "feedback_status": "awaiting_reply",
                 "feedback_requested_at": now.isoformat(),
-            }).eq("id", reminder["id"]).execute()
+            }).eq("id", reminder["id"]).execute()))
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=f"✅ أُرسلت متابعة رضا متأخرة للزبون: {reminder.get('customer_name') or chat_id}",
@@ -6378,9 +6386,9 @@ async def retry_expired_reminders_missing_chat(
         except Exception:
             logger.exception("Failed to resend expired feedback to customer %s", chat_id)
             try:
-                supabase.table("subscription_reminders").update({
+                (await run_io(lambda: supabase.table("subscription_reminders").update({
                     "feedback_status": "delivery_failed",
-                }).eq("id", reminder["id"]).execute()
+                }).eq("id", reminder["id"]).execute()))
             except Exception:
                 logger.exception("Failed to mark reminder %s as failed", reminder.get("id"))
 
@@ -6438,7 +6446,7 @@ def get_subscription_followups(limit: int = 30) -> list[dict]:
 
 
 async def show_subscription_followups(message) -> None:
-    reminders = get_subscription_followups()
+    reminders = (await run_io(lambda: get_subscription_followups()))
     if not reminders:
         await message.reply_text("📋 ماكو اشتراكات منتهية تحتاج متابعة ولا اشتراكات تنتهي خلال 7 أيام.")
         return
@@ -6455,7 +6463,7 @@ async def handle_subscription_followup_callback(update: Update, context: Context
     await query.answer()
     data = query.data or ""
     if data == "subfollow_list":
-        reminders = get_subscription_followups()
+        reminders = (await run_io(lambda: get_subscription_followups()))
         text = ("📋 متابعات الاشتراكات:" if reminders else
                 "📋 ماكو اشتراكات منتهية تحتاج متابعة ولا اشتراكات تنتهي خلال 7 أيام.")
         await query.edit_message_text(
@@ -6469,9 +6477,9 @@ async def handle_subscription_followup_callback(update: Update, context: Context
     action, reminder_id_text = match.groups()
     reminder_id = int(reminder_id_text)
     rows = (
-        supabase.table("subscription_reminders")
+        (await run_io(lambda: supabase.table("subscription_reminders")
         .select("id, customer_chat_id, customer_name, customer_username, product_name, plan_name, plan_duration, expires_at, status, feedback_status, scheduled_message_status")
-        .eq("id", reminder_id).limit(1).execute().data or []
+        .eq("id", reminder_id).limit(1).execute())).data or []
     )
     if not rows:
         await query.edit_message_text("⚠️ هذا السجل لم يعد موجوداً.")
@@ -6488,17 +6496,17 @@ async def handle_subscription_followup_callback(update: Update, context: Context
         + f"\nحالة الجدولة: {reminder.get('scheduled_message_status') or '—'}"
     )
     if action == "done":
-        supabase.table("subscription_reminders").update({
+        (await run_io(lambda: supabase.table("subscription_reminders").update({
             "feedback_status": "manual_done",
             "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", reminder_id).execute()
+        }).eq("id", reminder_id).execute()))
         await query.edit_message_text("✅ تم إغلاق المتابعة.\n\n" + details)
         return
     if action == "snooze":
         due = datetime.now(timezone.utc) + timedelta(days=1)
-        saved = save_personal_reminder(due, f"متابعة اشتراك:\n{details}")
+        saved = (await run_io(lambda: save_personal_reminder(due, f"متابعة اشتراك:\n{details}")))
         if saved:
-            supabase.table("subscription_reminders").update({"feedback_status": "snoozed"}).eq("id", reminder_id).execute()
+            (await run_io(lambda: supabase.table("subscription_reminders").update({"feedback_status": "snoozed"}).eq("id", reminder_id).execute()))
         await query.edit_message_text(
             ("⏰ تم تأجيل المتابعة ليوم واحد.\n\n" if saved else "⚠️ تعذر حفظ التأجيل.\n\n") + details
         )
@@ -6521,10 +6529,10 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
     """يعالج رد الزبون على رسالة المتابعة قبل دخوله إلى الردود العامة."""
     try:
         rows = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select("id, business_connection_id")
             .eq("customer_chat_id", bm.chat.id).eq("feedback_status", "awaiting_reply")
-            .order("feedback_requested_at", desc=True).limit(1).execute().data or []
+            .order("feedback_requested_at", desc=True).limit(1).execute())).data or []
         )
     except Exception:
         logger.exception("Failed to find pending feedback reply")
@@ -6534,10 +6542,10 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
 
     reminder_id = rows[0]["id"]
     if feedback_reply_is_negative(text):
-        supabase.table("subscription_reminders").update({
+        (await run_io(lambda: supabase.table("subscription_reminders").update({
             "feedback_status": "needs_owner",
             "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", reminder_id).execute()
+        }).eq("id", reminder_id).execute()))
         try:
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
@@ -6558,10 +6566,10 @@ async def handle_feedback_followup(context: ContextTypes.DEFAULT_TYPE, bm, text:
     if not feedback_reply_is_positive(text):
         return False
 
-    supabase.table("subscription_reminders").update({
+    (await run_io(lambda: supabase.table("subscription_reminders").update({
         "feedback_status": "positive",
         "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", reminder_id).execute()
+    }).eq("id", reminder_id).execute()))
     if SUBSCRIPTION_FEEDBACK_URL:
         send_kwargs = {
             "business_connection_id": rows[0].get("business_connection_id") or bm.business_connection_id,
@@ -6582,11 +6590,11 @@ async def owner_mark_feedback_positive(
     """يصحح تصنيف متابعة الرضا ويرسل طلب التقييم من داخل محادثة الزبون."""
     try:
         rows = (
-            supabase.table("subscription_reminders")
+            (await run_io(lambda: supabase.table("subscription_reminders")
             .select("id, business_connection_id, feedback_status")
             .eq("customer_chat_id", bm.chat.id)
             .in_("feedback_status", ["awaiting_reply", "needs_owner"])
-            .order("feedback_requested_at", desc=True).limit(1).execute().data or []
+            .order("feedback_requested_at", desc=True).limit(1).execute())).data or []
         )
     except Exception:
         logger.exception("Failed to find feedback for owner correction")
@@ -6595,10 +6603,10 @@ async def owner_mark_feedback_positive(
         return False, "⚠️ ماكو متابعة رضا مفتوحة لهذا الزبون."
     reminder = rows[0]
     try:
-        supabase.table("subscription_reminders").update({
+        (await run_io(lambda: supabase.table("subscription_reminders").update({
             "feedback_status": "positive",
             "feedback_responded_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", reminder["id"]).execute()
+        }).eq("id", reminder["id"]).execute()))
         send_kwargs = {
             "business_connection_id": (
                 reminder.get("business_connection_id") or bm.business_connection_id
@@ -6798,7 +6806,7 @@ def replied_totp_account_id(chat_id: int, bm) -> str | None:
 
 async def generate_current_totp_code_for_chat(chat_id: int, account_id: str | None = None) -> str | None:
     """أرسل الكود الحالي خلال أول 15 ثانية، وإلا انتظر الدورة التالية."""
-    result = get_secret_for_chat(chat_id, account_id)
+    result = (await run_io(lambda: get_secret_for_chat(chat_id, account_id)))
     if result is None:
         return None
     secret, _ = result
@@ -7190,7 +7198,7 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
         return
     if not data.startswith("code_manual_send_"):
         return
-    result = get_secret_for_chat(chat_id)
+    result = (await run_io(lambda: get_secret_for_chat(chat_id)))
     if result is None:
         await query.answer("ما لكيت حساب مرتبط.", show_alert=True)
         return
@@ -7200,10 +7208,10 @@ async def handle_manual_extra_code_callback(update: Update, context: ContextType
         return
     send_kwargs = {"chat_id": chat_id, "text": code}
     try:
-        reminder = (supabase.table("subscription_reminders")
+        reminder = ((await run_io(lambda: supabase.table("subscription_reminders")
             .select("business_connection_id")
             .eq("customer_chat_id", chat_id).eq("status", "active")
-            .order("started_at", desc=True).limit(1).execute().data or [])
+            .order("started_at", desc=True).limit(1).execute())).data or [])
         if reminder and reminder[0].get("business_connection_id"):
             send_kwargs["business_connection_id"] = reminder[0]["business_connection_id"]
         await context.bot.send_message(**send_kwargs)
@@ -7229,16 +7237,16 @@ async def handle_totp_account_picker_callback(update: Update, context: ContextTy
     if query.from_user.id != expected_user_id:
         await query.answer("هذا الاختيار مو إلك.", show_alert=True)
         return
-    if get_secret_for_chat(chat_id, account_id) is None:
+    if (await run_io(lambda: get_secret_for_chat(chat_id, account_id))) is None:
         await query.answer("هذا الحساب لم يعد متاحاً.", show_alert=True)
         return
-    remember_selected_totp_account(chat_id, account_id)
+    (await run_io(lambda: remember_selected_totp_account(chat_id, account_id)))
     # الكود الذي يصدر بعد الاختيار هو المحاولة الأولى للحساب الجديد.
-    _save_retry_state(chat_id, 1, False)
+    (await run_io(lambda: _save_retry_state(chat_id, 1, False)))
     await query.answer("تم اختيار الحساب؛ أنتظر بداية الكود الجديد.")
     connection_id = getattr(
         query.message, "business_connection_id", None,
-    ) or get_customer_business_connection_id(chat_id)
+    ) or (await run_io(lambda: get_customer_business_connection_id(chat_id)))
     if connection_id:
         try:
             await context.bot.delete_business_messages(
@@ -7334,55 +7342,55 @@ async def add_private_account(
         normalized_secret = normalize_totp_secret(secret)
         pyotp.TOTP(normalized_secret).now()
         link_code = "private_" + uuid.uuid4().hex[:12]
-        account = supabase.table("totp_accounts").insert({
+        account = (await run_io(lambda: supabase.table("totp_accounts").insert({
             "link_code": link_code,
             "secret": normalized_secret,
             "label": label or "حساب خاص",
-        }).execute().data
+        }).execute())).data
         if not account:
             raise RuntimeError("لم تُرجع قاعدة البيانات الحساب المضاف")
 
         account_id = str(account[0]["id"])
         # إثبات الدفع لازم ينقرأ قبل كتابة الحساب في الشيت؛ نفس قاعدة /link.
-        delivery_payment = get_current_chatgpt_delivery_payment(target_chat_id)
+        delivery_payment = (await run_io(lambda: get_current_chatgpt_delivery_payment(target_chat_id)))
         delivery_payment_recorded = delivery_payment is not None
         delivery_payment_total = (
             parse_sheet_amount(delivery_payment[1][SHEET_COL_TOTAL - 1])
             if delivery_payment else 0
         )
         old_links = (
-            supabase.table("totp_links").select("account_id")
-            .eq("chat_id", target_chat_id).limit(1).execute().data or []
+            (await run_io(lambda: supabase.table("totp_links").select("account_id")
+            .eq("chat_id", target_chat_id).limit(1).execute())).data or []
         )
         old_account_id = old_links[0].get("account_id") if old_links else None
         if old_account_id:
-            remember_customer_totp_account(target_chat_id, str(old_account_id), primary=True)
-        supabase.table("totp_links").upsert({
+            (await run_io(lambda: remember_customer_totp_account(target_chat_id, str(old_account_id), primary=True)))
+        (await run_io(lambda: supabase.table("totp_links").upsert({
             "chat_id": target_chat_id,
             "account_id": account_id,
-        }).execute()
-        remember_customer_totp_account(target_chat_id, account_id, primary=True)
+        }).execute()))
+        (await run_io(lambda: remember_customer_totp_account(target_chat_id, account_id, primary=True)))
 
-        state = get_interactive_sale_state(target_chat_id)
+        state = (await run_io(lambda: get_interactive_sale_state(target_chat_id)))
         if state.get("workflow_state") == "private_activation_pending":
-            set_interactive_sale_state(target_chat_id, "account_delivered")
+            (await run_io(lambda: set_interactive_sale_state(target_chat_id, "account_delivered")))
 
         account_name = (label or "حساب خاص").strip()
-        sheet_account_saved = upsert_chatgpt_account(
+        sheet_account_saved = (await run_io(lambda: upsert_chatgpt_account(
             target_chat_id,
             f"chat_id: {target_chat_id}",
             None,
             f"{account_name} (خاص)",
             create_if_missing=False,
-        )
+        )))
 
-        customer_name, customer_username = get_telegram_customer_identity(target_chat_id)
+        customer_name, customer_username = (await run_io(lambda: get_telegram_customer_identity(target_chat_id)))
         delivery_state = {
             "customer_chat_id": target_chat_id,
             "customer_name": customer_name,
             "customer_username": customer_username,
             "account_label": f"{account_name} (خاص)",
-            "business_connection_id": get_customer_business_connection_id(target_chat_id),
+            "business_connection_id": (await run_io(lambda: get_customer_business_connection_id(target_chat_id))),
             "previous_account_id": str(old_account_id) if old_account_id else None,
             "new_account_id": account_id,
             "delivery_payment_recorded": delivery_payment_recorded,
@@ -7399,7 +7407,7 @@ async def add_private_account(
         )
 
         # إذا عنده اشتراك سابق، نستخدم نفس تمييز /link: جديد، تعويض، دين.
-        if has_previous_chatgpt_subscription_for_delivery_choice(target_chat_id):
+        if (await run_io(lambda: has_previous_chatgpt_subscription_for_delivery_choice(target_chat_id))):
             context.user_data["pending_link_delivery"] = delivery_state
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
@@ -7419,17 +7427,17 @@ async def add_private_account(
             return
 
         # الزبون الجديد المدفوع يبدأ عدّه من لحظة /addprivate.
-        activated = activate_pending_chatgpt_subscription_on_delivery(target_chat_id)
+        activated = (await run_io(lambda: activate_pending_chatgpt_subscription_on_delivery(target_chat_id)))
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(
+            activated = (await run_io(lambda: recover_paid_chatgpt_subscription_on_delivery(
                 target_chat_id, payment_total=delivery_payment_total,
-            )
+            )))
 
         if activated:
             scheduled = await schedule_subscription_feedback(activated)
-            invite_scheduled = schedule_continuity_invite(
+            invite_scheduled = (await run_io(lambda: schedule_continuity_invite(
                 target_chat_id, delivery_state.get("business_connection_id"),
-            )
+            )))
             end = datetime.now(timezone(timedelta(hours=3))) + timedelta(
                 days=activated["duration_days"]
             )
@@ -7446,7 +7454,7 @@ async def add_private_account(
                       + f"\nينتهي: {end.strftime('%Y-%m-%d %H:%M')}\n{schedule_text}"
                       + "\nمن هسه إذا يطلب كود، ينرسل له تلقائياً."),
             )
-        elif delivery_payment_recorded or has_recorded_paid_subscription_for_link(target_chat_id):
+        elif delivery_payment_recorded or (await run_io(lambda: has_recorded_paid_subscription_for_link(target_chat_id))):
             context.user_data["pending_link_debt"] = {
                 **delivery_state, "is_debt": False,
             }
@@ -7455,7 +7463,7 @@ async def add_private_account(
                 text=(base_text
                       + "\n✅ الدفعة مسجلة، لكن ما كدرت أحدد باقة واحدة من المبلغ."
                       + "\nاختَر الباقة التي اشتراها الزبون:"),
-                reply_markup=build_link_debt_plan_keyboard(target_chat_id),
+                reply_markup=(await run_io(lambda: build_link_debt_plan_keyboard(target_chat_id))),
             )
         else:
             context.user_data["pending_link_debt"] = {
@@ -7512,7 +7520,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # /id داخل محادثة الزبون: يخفي الأمر ويرسل المعرف
     # لمحادثة الأونر الخاصة، من غير ما يظهر للزبون.
     if text.strip().lower() == "/id":
-        fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
+        fallback_name, fallback_username = (await run_io(lambda: get_telegram_customer_identity(chat_id)))
         customer_name = (
             (bm.chat.full_name or bm.chat.first_name or "غير معروف")
             if bm is not None else fallback_name
@@ -7567,18 +7575,18 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         note = " ".join(parts[amount_index + 1:]).strip() or "تصحيح فرق دفعة سابقة"
         customer_name = (
             bm.chat.full_name or bm.chat.first_name or "غير معروف"
-            if bm is not None else get_telegram_customer_identity(chat_id)[0]
+            if bm is not None else (await run_io(lambda: get_telegram_customer_identity(chat_id)))[0]
         )
         customer_username = (
-            bm.chat.username if bm is not None else get_telegram_customer_identity(chat_id)[1]
+            bm.chat.username if bm is not None else (await run_io(lambda: get_telegram_customer_identity(chat_id)))[1]
         )
-        saved, balance = append_customer_credit(
+        saved, balance = (await run_io(lambda: append_customer_credit(
             chat_id,
             format_customer_line(customer_name, customer_username),
             amount,
             "ChatGPT",
             note,
-        )
+        )))
         result_text = (
             f"✅ تم حفظ {amount} رصيد للزبون {chat_id}.\n"
             f"الرصيد الحالي: {balance}.\nالملاحظة: {note}"
@@ -7595,7 +7603,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         selected_photo = (
             bm.reply_to_message
             if bm is not None and bm.reply_to_message and bm.reply_to_message.photo
-            else get_latest_customer_business_photo(chat_id)
+            else (await run_io(lambda: get_latest_customer_business_photo(chat_id)))
         )
         if selected_photo is not None:
             await handle_incoming_payment_photo(update, context, selected_photo, bypass_rate_limit=True)
@@ -7628,9 +7636,9 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if add_match:
         link_code, secret, label = add_match.groups()
         try:
-            supabase.table("totp_accounts").insert(
+            (await run_io(lambda: supabase.table("totp_accounts").insert(
                 {"link_code": link_code, "secret": normalize_totp_secret(secret), "label": label or ""}
-            ).execute()
+            ).execute()))
             await context.bot.send_message(
                 chat_id=OWNER_USER_ID,
                 text=f"✅ تمت اضافة الحساب.\nرمز الربط: {link_code}\nملاحظة: {label or '—'}",
@@ -7656,10 +7664,10 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if link_match:
         link_code = link_match.group(1)
         acc_res = (
-            supabase.table("totp_accounts")
+            (await run_io(lambda: supabase.table("totp_accounts")
             .select("id, label")
             .eq("link_code", link_code)
-            .execute()
+            .execute()))
         )
         if not acc_res.data:
             await context.bot.send_message(
@@ -7674,7 +7682,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         # نلتقط وجود الدفعة قبل أن يكتب /link الحساب في Google Sheet.
         # كتابة الحساب قد تكمل أو تنشئ سطراً جديداً، فلا يصح أن نفحص
         # الدفعة بعدها ونعتبر السطر الجديد الفارغ دليلاً على وجود دين.
-        delivery_payment = get_current_chatgpt_delivery_payment(chat_id)
+        delivery_payment = (await run_io(lambda: get_current_chatgpt_delivery_payment(chat_id)))
         delivery_payment_recorded = delivery_payment is not None
         delivery_payment_total = (
             parse_sheet_amount(delivery_payment[1][SHEET_COL_TOTAL - 1])
@@ -7690,39 +7698,39 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # نحتفظ بالحساب السابق قبل أن يحدث /link الحساب الأساسي. السؤال
         # يظهر فقط لمن لديه اشتراك ChatGPT فعّال وحساب مختلف فعلاً.
-        old_link = (supabase.table("totp_links").select("account_id")
-                    .eq("chat_id", chat_id).limit(1).execute().data or [])
+        old_link = ((await run_io(lambda: supabase.table("totp_links").select("account_id")
+                    .eq("chat_id", chat_id).limit(1).execute())).data or [])
         old_account_id = old_link[0].get("account_id") if old_link else None
         # عند إعادة نفس /link بعد فشل خطوة لاحقة يكون totp_links قد صار
         # يشير للحساب الجديد نفسه. نسترجع عندها الحساب السابق المختلف من
         # سجل العلاقات حتى تكون إعادة المحاولة آمنة ولا يضيع السؤال.
         if old_account_id and str(old_account_id) == str(account_id):
             try:
-                previous_links = (supabase.table("customer_totp_account_links")
+                previous_links = ((await run_io(lambda: supabase.table("customer_totp_account_links")
                                   .select("account_id, linked_at")
                                   .eq("customer_chat_id", chat_id)
                                   .eq("status", "active")
                                   .neq("account_id", str(account_id))
                                   .order("linked_at", desc=True).limit(1)
-                                  .execute().data or [])
+                                  .execute())).data or [])
                 if previous_links:
                     old_account_id = previous_links[0].get("account_id")
             except Exception:
                 logger.exception("Failed to recover previous account while retrying /link for %s", chat_id)
         if old_account_id:
-            remember_customer_totp_account(chat_id, str(old_account_id), primary=True)
+            (await run_io(lambda: remember_customer_totp_account(chat_id, str(old_account_id), primary=True)))
 
-        supabase.table("totp_links").upsert(
+        (await run_io(lambda: supabase.table("totp_links").upsert(
             {"chat_id": chat_id, "account_id": account_id}
-        ).execute()
-        remember_customer_totp_account(chat_id, str(account_id), primary=True)
+        ).execute()))
+        (await run_io(lambda: remember_customer_totp_account(chat_id, str(account_id), primary=True)))
         authorize_recently_linked_customer_code(chat_id)
 
         # إذا كان هذا ربط حساب خاص بعد تأكيد الدفع، يصير الزبون مخوّلاً
         # بطلب الكود تلقائياً. الحسابات المشتركة تبقى على مسارها المعتاد.
-        state = get_interactive_sale_state(chat_id)
+        state = (await run_io(lambda: get_interactive_sale_state(chat_id)))
         if state.get("workflow_state") == "private_activation_pending":
-            set_interactive_sale_state(chat_id, "account_delivered")
+            (await run_io(lambda: set_interactive_sale_state(chat_id, "account_delivered")))
 
         # لو اللابل يشبه إيميل، نعتبره حساب ChatGPT مشترك ونسجله بالشيت
         # (يكمل سطر ناقص لنفس الزبون لو موجود، وإلا يفتح سطر جديد)
@@ -7730,10 +7738,10 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if bm is not None and "@" in label and "." in label:
             customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
             customer_username = bm.chat.username
-            saved = upsert_chatgpt_account(chat_id, customer_name, customer_username, label)
+            saved = (await run_io(lambda: upsert_chatgpt_account(chat_id, customer_name, customer_username, label)))
             sheet_note = "\n✅ تم تسجيل الحساب بالشيت." if saved else "\n⚠️ فشل تسجيل الحساب بالشيت."
 
-        fallback_name, fallback_username = get_telegram_customer_identity(chat_id)
+        fallback_name, fallback_username = (await run_io(lambda: get_telegram_customer_identity(chat_id)))
         delivery_state = {
             "customer_chat_id": chat_id,
             "customer_name": (
@@ -7742,14 +7750,14 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
             ),
             "customer_username": bm.chat.username if bm is not None else fallback_username,
             "account_label": label or link_code,
-            "business_connection_id": bm.business_connection_id if bm is not None else get_customer_business_connection_id(chat_id),
+            "business_connection_id": bm.business_connection_id if bm is not None else (await run_io(lambda: get_customer_business_connection_id(chat_id))),
             "previous_account_id": str(old_account_id) if old_account_id else None,
             "new_account_id": str(account_id),
             "delivery_payment_recorded": delivery_payment_recorded,
             "delivery_payment_row_number": delivery_payment[0] if delivery_payment else None,
             "delivery_payment_total": delivery_payment_total,
         }
-        previous_subscription = has_previous_chatgpt_subscription_for_delivery_choice(chat_id)
+        previous_subscription = (await run_io(lambda: has_previous_chatgpt_subscription_for_delivery_choice(chat_id)))
         if previous_subscription:
             # فقط الزبون الذي عنده اشتراك سابق يحتاج يحدد: جديد لو تعويض.
             context.user_data["pending_link_delivery"] = delivery_state
@@ -7762,16 +7770,16 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             # زبون جديد دافع: نفس الفلو القديم، نفعّل باقته تلقائياً من لحظة
             # تسليم الحساب، من دون أي سؤال إضافي.
-            activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+            activated = (await run_io(lambda: activate_pending_chatgpt_subscription_on_delivery(chat_id)))
             if activated is None:
-                activated = recover_paid_chatgpt_subscription_on_delivery(
+                activated = (await run_io(lambda: recover_paid_chatgpt_subscription_on_delivery(
                     chat_id, payment_total=delivery_payment_total,
-                )
+                )))
             if activated:
                 scheduled = await schedule_subscription_feedback(activated)
-                invite_scheduled = schedule_continuity_invite(
+                invite_scheduled = (await run_io(lambda: schedule_continuity_invite(
                     chat_id, delivery_state.get("business_connection_id"),
-                )
+                )))
                 end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
                 schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
                 if invite_scheduled:
@@ -7784,7 +7792,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             else:
                 if (delivery_payment_recorded
-                        or has_recorded_paid_subscription_for_link(chat_id)):
+                        or (await run_io(lambda: has_recorded_paid_subscription_for_link(chat_id)))):
                     # الدفعة موجودة فعلاً، لكن لم نستطع استرجاع الباقة
                     # تلقائياً (مثل الدفع الزائد). لا نسأل عن دين.
                     context.user_data["pending_link_debt"] = {
@@ -7795,7 +7803,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
                         text=(f"✅ تم ربط هذا الزبون بالحساب ({label or link_code}).{sheet_note}\n"
                               "✅ الدفعة مسجلة، لكن مبلغها لا يطابق سعر باقة واحدة.\n"
                               "اختَر الباقة التي اشتراها الزبون:"),
-                        reply_markup=build_link_debt_plan_keyboard(chat_id),
+                        reply_markup=(await run_io(lambda: build_link_debt_plan_keyboard(chat_id))),
                     )
                 else:
                     # فقط عند عدم وجود أي دفعة نفتح سؤال الدين.
@@ -7835,7 +7843,7 @@ async def handle_owner_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # /resetcode  (يُرسل داخل محادثة الزبون نفسه — يصفر عداد محاولات الكود)
     if RESETCODE_PATTERN.match(text.strip()):
-        reset_retry_state(chat_id)
+        (await run_io(lambda: reset_retry_state(chat_id)))
         await context.bot.send_message(
             chat_id=OWNER_USER_ID,
             text="✅ تم تصفير عداد محاولات الكود لهذا الزبون، راح يقدر يطلب كود من جديد بشكل طبيعي.",
@@ -7897,14 +7905,14 @@ async def handle_customer_photo(
         return
 
     description = result.description or "صورة زبون لم يتضح محتواها"
-    archive_message(
+    (await run_io(lambda: archive_message(
         chat_id,
         customer_name,
         customer_username,
         sender_type="customer",
         message_text=bm.caption,
         image_description=description,
-    )
+    )))
 
     if not is_confident_code_verification(result):
         # الوصل المؤكد، والصور غير الواضحة، تبقى تحت مراجعة الأونر ولا
@@ -7912,7 +7920,7 @@ async def handle_customer_photo(
         await handle_incoming_payment_photo(update, context, bm)
         return
 
-    reply_text, stopped = process_code_request(chat_id)
+    reply_text, stopped = (await run_io(lambda: process_code_request(chat_id)))
     image_summary = f"[صورة شاشة تحقق]\n{description}"
     if reply_text:
         if reply_text.startswith(CODE_REPLY_MARKER):
@@ -7934,13 +7942,13 @@ async def handle_customer_photo(
             chat_id=chat_id,
             text=reply_text,
         )
-        archive_message(
+        (await run_io(lambda: archive_message(
             chat_id,
             customer_name,
             customer_username,
             sender_type="bot",
             message_text=reply_text,
-        )
+        )))
         await notify_owner(
             context,
             chat_id,
@@ -7989,6 +7997,7 @@ async def handle_customer_photo(
         logger.exception("Failed to notify owner about unauthorized image-code request")
 
 
+@background_job
 async def describe_and_archive_customer_photo(context: ContextTypes.DEFAULT_TYPE, bm) -> None:
     """
     يحمّل صورة زبون، يوصفها بمزود الذكاء الاصطناعي المختار، ويؤرشف
@@ -8010,12 +8019,13 @@ async def describe_and_archive_customer_photo(context: ContextTypes.DEFAULT_TYPE
     if description is None:
         return
 
-    archive_message(
+    (await run_io(lambda: archive_message(
         customer_chat_id, customer_name, customer_username,
         sender_type="customer", message_text=None, image_description=description,
-    )
+    )))
 
 
+@background_job
 async def describe_and_archive_owner_photo(context: ContextTypes.DEFAULT_TYPE, bm) -> None:
     """
     يحمّل صورة أرسلتها أنت (owner) بمحادثة زبون معين، يوصفها بالذكاء
@@ -8038,10 +8048,10 @@ async def describe_and_archive_owner_photo(context: ContextTypes.DEFAULT_TYPE, b
     if description is None:
         return
 
-    archive_message(
+    (await run_io(lambda: archive_message(
         customer_chat_id, customer_name, customer_username,
         sender_type="owner", message_text=None, image_description=description,
-    )
+    )))
 
 
 async def handle_incoming_payment_photo(
@@ -8059,7 +8069,7 @@ async def handle_incoming_payment_photo(
     """
     customer_chat_id = bm.chat.id
 
-    if not bypass_rate_limit and not is_photo_within_rate_limit(customer_chat_id):
+    if not bypass_rate_limit and not (await run_io(lambda: is_photo_within_rate_limit(customer_chat_id))):
         logger.info(f"Photo from chat_id={customer_chat_id} ignored — exceeded rate limit")
         return
 
@@ -8101,7 +8111,7 @@ async def handle_incoming_payment_photo(
         "plan_price": None,
         "duration_days": None,
     }
-    archive_photo_rate_limit_marker(customer_chat_id, "customer")
+    (await run_io(lambda: archive_photo_rate_limit_marker(customer_chat_id, "customer")))
 
 
 def remember_latest_customer_business_photo(bm) -> None:
@@ -8160,7 +8170,7 @@ async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAU
     وصلت أصلاً بمحادثتك مع البوت) مع زرين: هل هذي إثبات مصروف؟
     محدودة بصورة وحدة/6 ساعات (عداد مستقل عن صور الزبائن).
     """
-    if not is_owner_photo_within_rate_limit():
+    if not (await run_io(lambda: is_owner_photo_within_rate_limit())):
         logger.info("Owner expense photo ignored — exceeded rate limit")
         return
 
@@ -8186,7 +8196,7 @@ async def handle_owner_expense_photo(update: Update, context: ContextTypes.DEFAU
         "file_id": file_id,
         "customer_chat_id": customer_chat_id,
     }
-    archive_photo_rate_limit_marker(OWNER_USER_ID, "owner")
+    (await run_io(lambda: archive_photo_rate_limit_marker(OWNER_USER_ID, "owner")))
 
 
 async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8234,11 +8244,11 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("pay_plan_"):
         plan_id = data[len("pay_plan_"):]
         try:
-            rows = supabase.table("catalog_plans").select("id, product_id, name, price, duration, is_active").eq("id", plan_id).limit(1).execute().data or []
+            rows = (await run_io(lambda: supabase.table("catalog_plans").select("id, product_id, name, price, duration, is_active").eq("id", plan_id).limit(1).execute())).data or []
         except Exception:
             rows = []
         selected_product_id = state.get("catalog_product_id")
-        selected_product = catalog_product_for_payment_name(state.get("product") or "")
+        selected_product = (await run_io(lambda: catalog_product_for_payment_name(state.get("product") or "")))
         if (not rows or not rows[0].get("is_active")
                 or not (duration_to_days(rows[0].get("duration")) or is_permanent_duration(rows[0].get("duration")))
                 or (selected_product_id and rows[0].get("product_id") != selected_product_id)
@@ -8257,12 +8267,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         # بدل محاولة تثبيت ناقصة. هنا يظهر أيضاً زر تسديد الدين عند وجوده.
         if not state["payments"]:
             customer_chat_id = state.get("customer_chat_id")
-            has_debt = payment_state_has_matching_debt(state)
+            has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
             await query.edit_message_caption(
                 caption=format_payment_summary(state),
-                reply_markup=build_summary_keyboard(
+                reply_markup=(await run_io(lambda: build_summary_keyboard(
                     has_product=True, has_payment=False, show_debt_repayment=has_debt
-                ),
+                ))),
             )
             return
         data = "pay_finalize"
@@ -8290,13 +8300,13 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data == "pay_confirm":
-        await query.edit_message_caption(caption=format_payment_summary(state), reply_markup=build_product_keyboard())
+        await query.edit_message_caption(caption=format_payment_summary(state), reply_markup=(await run_io(lambda: build_product_keyboard())))
         return
 
     # منتج كاتالوج: لا نقبل إلا منتجاً ما زال مفعّلاً في «المنتجات والباقات».
     if data.startswith("pay_catalog_"):
         product_id = data[len("pay_catalog_"):]
-        product = get_catalog_product(product_id)
+        product = (await run_io(lambda: get_catalog_product(product_id)))
         if not product or not product.get("is_active"):
             await query.answer("هذا المنتج غير متاح حالياً في الكاتالوج.", show_alert=True)
             return
@@ -8311,7 +8321,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             "duration_days": None,
             "reminder_disabled": False,
         })
-        generic_plans = prepare_generic_subscription(state)
+        generic_plans = (await run_io(lambda: prepare_generic_subscription(state)))
         if generic_plans:
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
@@ -8319,12 +8329,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             return
         customer_chat_id = state.get("customer_chat_id")
-        has_debt = payment_state_has_matching_debt(state)
+        has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
-            ),
+            ))),
         )
         return
 
@@ -8345,7 +8355,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=build_ambos_duration_keyboard(),
             )
             return
-        generic_plans = prepare_generic_subscription(state)
+        generic_plans = (await run_io(lambda: prepare_generic_subscription(state)))
         if generic_plans:
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة:",
@@ -8353,12 +8363,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             return
         customer_chat_id = state.get("customer_chat_id")
-        has_debt = payment_state_has_matching_debt(state)
+        has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
-            ),
+            ))),
         )
         return
 
@@ -8366,7 +8376,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "pay_product_list":
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_product_list_keyboard(),
+            reply_markup=(await run_io(lambda: build_product_list_keyboard())),
         )
         return
 
@@ -8395,7 +8405,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         })
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_product_keyboard(),
+            reply_markup=(await run_io(lambda: build_product_keyboard())),
         )
         return
 
@@ -8409,17 +8419,17 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         if state.get("payment_purpose") == "debt":
             await query.edit_message_caption(
                 caption=format_payment_summary(state) + "\n\nاختَر طريقة الدفع:",
-                reply_markup=build_summary_keyboard(has_product=True, has_payment=False),
+                reply_markup=(await run_io(lambda: build_summary_keyboard(has_product=True, has_payment=False))),
             )
             return
         customer_chat_id = state.get("customer_chat_id")
-        has_debt = payment_state_has_matching_debt(state)
+        has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=bool(state.get("product")), has_payment=bool(state.get("payments")),
                 show_debt_repayment=has_debt,
-            ),
+            ))),
         )
         return
 
@@ -8430,7 +8440,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=(build_debt_payment_ready_keyboard()
                           if state.get("payment_purpose") == "debt"
                           else build_catalog_payment_ready_keyboard(
-                              show_debt_repayment=payment_state_has_matching_debt(state))),
+                              show_debt_repayment=(await run_io(lambda: payment_state_has_matching_debt(state))))),
         )
         return
 
@@ -8451,7 +8461,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=(build_debt_payment_ready_keyboard()
                               if state.get("payment_purpose") == "debt"
                               else build_catalog_payment_ready_keyboard(
-                                  show_debt_repayment=payment_state_has_matching_debt(state))),
+                                  show_debt_repayment=(await run_io(lambda: payment_state_has_matching_debt(state))))),
             )
             return
 
@@ -8477,12 +8487,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state["pending_amount"] = 0
         state["awaiting_manual_amount"] = False
         customer_chat_id = state.get("customer_chat_id")
-        has_debt = payment_state_has_matching_debt(state)
+        has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=bool(state["product"]), has_payment=bool(state["payments"]), show_debt_repayment=has_debt
-            ),
+            ))),
         )
         return
 
@@ -8534,12 +8544,12 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         state["pending_method"] = None
         state["pending_amount"] = 0
         customer_chat_id = state.get("customer_chat_id")
-        has_debt = payment_state_has_matching_debt(state)
+        has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
         await query.edit_message_caption(
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=bool(state["product"]), has_payment=True, show_debt_repayment=has_debt
-            ),
+            ))),
         )
         return
 
@@ -8569,7 +8579,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 and state["product"] != CHATGPT_PRODUCT_NAME
                 and not state.get("duration_days")
                 and not state.get("reminder_disabled")):
-            generic_plans = prepare_generic_subscription(state)
+            generic_plans = (await run_io(lambda: prepare_generic_subscription(state)))
             if generic_plans:
                 await query.edit_message_caption(
                     caption=format_payment_summary(state) + "\n\nاختَر الباقة/المدة حتى ينحفظ تنبيه النهاية:",
@@ -8589,7 +8599,7 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
-        saved = append_payment_row(state)
+        saved = (await run_io(lambda: append_payment_row(state)))
         subscription_saved = False
         credit_saved = False
         credit_balance = 0
@@ -8599,26 +8609,26 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             # ChatGPT ينتظر تسليم الحساب: لا يبدأ الاشتراك ولا تُرسل المتابعة
             # من وقت الدفع، بل من /link. بقية المنتجات تبدأ عند تثبيت الدفع.
             pending_delivery = is_chatgpt_payment_state(state)
-            subscription_saved = save_subscription_reminder(
+            subscription_saved = (await run_io(lambda: save_subscription_reminder(
                 state, status="pending_delivery" if pending_delivery else "active",
-            )
+            )))
             if subscription_saved and not pending_delivery:
                 await schedule_subscription_feedback(state)
 
         if saved and overage > 0 and state.get("overpayment_decision") == "credit":
-            credit_saved, credit_balance = append_customer_credit(
+            credit_saved, credit_balance = (await run_io(lambda: append_customer_credit(
                 int(state["customer_chat_id"]),
                 format_customer_line(state["customer_name"], state.get("customer_username")),
                 overage,
                 state["product"],
                 f"فرق دفعة عن باقة {state.get('plan_name') or state['product']}",
-            )
+            )))
 
         # نزيد رصيد كل خزنة مطابقة لطرق الدفع المستخدمة بهذي العملية
         if saved:
             for method, amount in state["payments"]:
                 if method in VAULT_NAMES:
-                    adjust_vault_balance(method, amount)
+                    (await run_io(lambda: adjust_vault_balance(method, amount)))
 
         # نبعث إشعار لفرع "مدفوعات" بكل تفاصيل العملية — سطر منفصل لكل
         # طريقة دفع لو دفع الزبون بأكثر من طريقة بنفس العملية
@@ -8695,7 +8705,7 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("⚠️ انتهت صلاحية هذا السؤال. أعد /link للحساب حتى يظهر السؤال من جديد.")
         return
 
-    customer_name, customer_username = get_telegram_customer_identity(customer_chat_id)
+    customer_name, customer_username = (await run_io(lambda: get_telegram_customer_identity(customer_chat_id)))
     same_pending_customer = str(stored_state.get("customer_chat_id")) == str(customer_chat_id)
     state = {
         **stored_state,
@@ -8716,10 +8726,10 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
             # التعويض يعني تلقائياً أن الحساب الذي سلّمناه بديل عن السابق؛
             # لا نحمّل الأونر سؤالاً ثانياً ولا نبقي كود الحساب المعطّل.
             if state.get("previous_account_id") and state.get("new_account_id"):
-                remember_customer_totp_account(
+                (await run_io(lambda: remember_customer_totp_account(
                     customer_chat_id, str(state["new_account_id"]),
                     primary=True, replace_previous=True,
-                )
+                )))
             context.user_data["pending_link_compensation"] = state
             await query.edit_message_text(
                 "💸 هذا تعويض، وتم اعتماد الحساب الجديد بدلاً من السابق.\n"
@@ -8744,12 +8754,12 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
             return
 
         # زبون بلا حساب سابق: نفعّل الدفعة مباشرة عند التسليم الفعلي.
-        activated = activate_pending_chatgpt_subscription_on_delivery(customer_chat_id)
+        activated = (await run_io(lambda: activate_pending_chatgpt_subscription_on_delivery(customer_chat_id)))
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(
+            activated = (await run_io(lambda: recover_paid_chatgpt_subscription_on_delivery(
                 customer_chat_id,
                 payment_total=state.get("delivery_payment_total"),
-            )
+            )))
         if activated is None:
             payment_recorded = bool(state.get("delivery_payment_recorded"))
             context.user_data.pop("pending_link_delivery", None)
@@ -8760,7 +8770,7 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
                 await query.edit_message_text(
                     "✅ الدفعة مسجلة، لكن تعذر تحديد الباقة تلقائياً.\n"
                     "اختَر باقة ChatGPT التي دفعها الزبون:",
-                    reply_markup=build_link_debt_plan_keyboard(customer_chat_id),
+                    reply_markup=(await run_io(lambda: build_link_debt_plan_keyboard(customer_chat_id))),
                 )
             else:
                 await query.edit_message_text(
@@ -8769,9 +8779,9 @@ async def handle_link_debt_callback(update: Update, context: ContextTypes.DEFAUL
                 )
             return
         scheduled = await schedule_subscription_feedback(activated)
-        invite_scheduled = schedule_continuity_invite(
+        invite_scheduled = (await run_io(lambda: schedule_continuity_invite(
             customer_chat_id, state.get("business_connection_id"),
-        )
+        )))
         context.user_data.pop("pending_link_delivery", None)
         end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
         schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
@@ -8803,7 +8813,7 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
     chat_id = int(raw_chat_id)
     state = context.user_data.get("pending_link_account_relationship") or {}
     if int(state.get("customer_chat_id", 0)) != chat_id:
-        state = recover_link_account_relationship_state(chat_id) or {}
+        state = (await run_io(lambda: recover_link_account_relationship_state(chat_id))) or {}
         if not state:
             await query.edit_message_text("⚠️ انتهت صلاحية سؤال الحساب وما كدرت أسترجع الحسابين. أعد /link.")
             return
@@ -8816,28 +8826,28 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
         return
     try:
         if choice == "replace":
-            supabase.table("customer_totp_account_links").update({
+            (await run_io(lambda: supabase.table("customer_totp_account_links").update({
                 "status": "replaced", "is_primary": False,
-            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()
+            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()))
         else:
-            supabase.table("customer_totp_account_links").update({
+            (await run_io(lambda: supabase.table("customer_totp_account_links").update({
                 "status": "active",
-            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()
-        supabase.table("customer_totp_account_links").update({
+            }).eq("customer_chat_id", chat_id).eq("account_id", str(old_account_id)).execute()))
+        (await run_io(lambda: supabase.table("customer_totp_account_links").update({
             "status": "active", "is_primary": True,
-        }).eq("customer_chat_id", chat_id).eq("account_id", str(new_account_id)).execute()
+        }).eq("customer_chat_id", chat_id).eq("account_id", str(new_account_id)).execute()))
     except Exception:
         logger.exception("Failed to save account relationship choice for customer %s", chat_id)
         await query.edit_message_text("⚠️ تعذر حفظ الاختيار. تأكد من تشغيل SQL الجديد ثم أعد /link.")
         return
     context.user_data.pop("pending_link_account_relationship", None)
     if state.get("activate_subscription_after_choice"):
-        activated = activate_pending_chatgpt_subscription_on_delivery(chat_id)
+        activated = (await run_io(lambda: activate_pending_chatgpt_subscription_on_delivery(chat_id)))
         if activated is None:
-            activated = recover_paid_chatgpt_subscription_on_delivery(
+            activated = (await run_io(lambda: recover_paid_chatgpt_subscription_on_delivery(
                 chat_id,
                 payment_total=state.get("delivery_payment_total"),
-            )
+            )))
         if activated is None:
             # لا نعتبر الاشتراك القديم دليلاً على دفع التسليم الجديد.
             # سطر التسليم الحالي في الشيت هو الفيصل: إن كان مدفوعاً نطلب
@@ -8847,7 +8857,7 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
                 "customer_chat_id": chat_id,
                 "is_debt": not (
                     state.get("delivery_payment_recorded")
-                    or has_current_chatgpt_delivery_payment(chat_id)
+                    or (await run_io(lambda: has_current_chatgpt_delivery_payment(chat_id)))
                 ),
             }
             context.user_data["pending_link_debt"] = relationship_state
@@ -8861,11 +8871,11 @@ async def handle_link_account_relationship_callback(update: Update, context: Con
                 await query.edit_message_text(
                     "✅ تم حفظ نوع الحساب والدفعة موجودة، لكن تعذر تحديد الباقة تلقائياً.\n"
                     "اختَر باقة ChatGPT التي دفعها الزبون:",
-                    reply_markup=build_link_debt_plan_keyboard(chat_id),
+                    reply_markup=(await run_io(lambda: build_link_debt_plan_keyboard(chat_id))),
                 )
             return
         scheduled = await schedule_subscription_feedback(activated)
-        invite_scheduled = schedule_continuity_invite(chat_id, state.get("business_connection_id"))
+        invite_scheduled = (await run_io(lambda: schedule_continuity_invite(chat_id, state.get("business_connection_id"))))
         end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=activated["duration_days"])
         schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
         if invite_scheduled:
@@ -8917,7 +8927,7 @@ async def handle_link_compensation_duration_input(update: Update, context: Conte
             "reminder_disabled": False,
             "is_debt": False,
         }
-        if not save_subscription_reminder(reminder_state, status="active"):
+        if not (await run_io(lambda: save_subscription_reminder(reminder_state, status="active"))):
             await message.reply_text(
                 "⚠️ تم الربط، لكن تعذر إنشاء تنبيه التعويض. "
                 "تم إغلاق وضع التعويض ولن يعترض بقية أوامرك."
@@ -8925,9 +8935,9 @@ async def handle_link_compensation_duration_input(update: Update, context: Conte
             return True
         created_new = True
     scheduled = await schedule_subscription_feedback(reminder_state)
-    invite_scheduled = schedule_continuity_invite(
+    invite_scheduled = (await run_io(lambda: schedule_continuity_invite(
         int(state["customer_chat_id"]), state.get("business_connection_id"),
-    )
+    )))
     end = datetime.now(timezone(timedelta(hours=3))) + timedelta(days=duration_days)
     schedule_text = "✅ تم حجز رسالة المتابعة." if scheduled else "⚠️ انحفظت المدة، لكن تعذر حجز رسالة المتابعة."
     if invite_scheduled:
@@ -8947,12 +8957,12 @@ async def handle_manual_subscription_callback(update: Update, context: ContextTy
     try:
         plan_id = (query.data or "").removeprefix("subrem_plan_")
         rows = (
-            supabase.table("catalog_plans")
+            (await run_io(lambda: supabase.table("catalog_plans")
             .select("id, product_id, name, duration, is_active")
-            .eq("id", plan_id).limit(1).execute().data or []
+            .eq("id", plan_id).limit(1).execute())).data or []
         )
         plan = rows[0] if rows else None
-        product = get_catalog_product(str(plan["product_id"])) if plan else None
+        product = (await run_io(lambda: get_catalog_product(str(plan["product_id"])))) if plan else None
     except Exception:
         logger.exception("Failed to read manual subscription catalog plan")
         plan = product = None
@@ -8995,7 +9005,7 @@ async def handle_manual_subscription_input(update: Update, context: ContextTypes
         "customer_username": username or None,
         **state,
     }
-    saved = save_subscription_reminder(reminder_state)
+    saved = (await run_io(lambda: save_subscription_reminder(reminder_state)))
     if saved:
         await schedule_subscription_feedback(reminder_state)
     if saved:
@@ -9025,7 +9035,7 @@ async def handle_personal_reminder_input(update: Update, context: ContextTypes.D
         )
         return True
     due_at, purpose = parsed
-    if save_personal_reminder(due_at, purpose):
+    if (await run_io(lambda: save_personal_reminder(due_at, purpose))):
         context.user_data.pop("pending_personal_reminder", None)
         await message.reply_text(
             f"✅ تم حفظ التذكير.\nوقت التنبيه: {due_at.strftime('%Y-%m-%d %H:%M')} بتوقيت بغداد\n"
@@ -9095,16 +9105,16 @@ async def handle_manual_product_entry(update: Update, context: ContextTypes.DEFA
     })
 
     customer_chat_id = state.get("customer_chat_id")
-    has_debt = payment_state_has_matching_debt(state)
+    has_debt = (await run_io(lambda: payment_state_has_matching_debt(state)))
 
     try:
         await context.bot.edit_message_caption(
             chat_id=OWNER_USER_ID,
             message_id=replied_id,
             caption=format_payment_summary(state),
-            reply_markup=build_summary_keyboard(
+            reply_markup=(await run_io(lambda: build_summary_keyboard(
                 has_product=True, has_payment=bool(state["payments"]), show_debt_repayment=has_debt
-            ),
+            ))),
         )
     except Exception:
         logger.exception("Failed to update caption after manual product entry")
@@ -9149,7 +9159,7 @@ async def handle_manual_amount_entry(update: Update, context: ContextTypes.DEFAU
                 reply_markup=(build_debt_payment_ready_keyboard()
                               if state.get("payment_purpose") == "debt"
                               else build_catalog_payment_ready_keyboard(
-                                  show_debt_repayment=payment_state_has_matching_debt(state))),
+                                  show_debt_repayment=(await run_io(lambda: payment_state_has_matching_debt(state))))),
             )
         except Exception:
             logger.exception("Failed to update catalog payment amount")
@@ -9250,7 +9260,7 @@ async def handle_expense_photo_callback(update: Update, context: ContextTypes.DE
 
     if data == "expphoto_refund":
         chat_id = pending.get("customer_chat_id")
-        payment = get_latest_customer_payment(chat_id) if chat_id is not None else None
+        payment = (await run_io(lambda: get_latest_customer_payment(chat_id))) if chat_id is not None else None
         if payment is None:
             await query.edit_message_caption(
                 caption="⚠️ ما لكيت دفعة فعّالة لهذا الزبون، لذلك ما انطبق أي تعويض.",
@@ -9318,7 +9328,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
     if query.from_user.id != OWNER_USER_ID:
         await query.answer("هذا الزر مخصص للأونر بس.", show_alert=True)
         return
-    if finance_active():
+    if (await run_io(lambda: finance_active())):
         await query.answer()
         await query.message.reply_text('هذه بطاقة بالنظام السابق. افتح مصروفاً جديداً من المالية؛ لم أثبت هذه البطاقة.')
         return
@@ -9399,7 +9409,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
     if data.startswith("exp_vault_"):
         vault_key = data[len("exp_vault_"):]
         expense["vault"] = None if vault_key == "none" else vault_key
-        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
+        await edit_expense_message(query, expense, format_expense_summary(expense), (await run_io(lambda: build_expense_reason_keyboard())))
         return
 
     if data == "exp_reason_noop":
@@ -9408,7 +9418,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("exp_reason_catalog_"):
         product_id = data[len("exp_reason_catalog_"):]
-        product = get_catalog_product(product_id)
+        product = (await run_io(lambda: get_catalog_product(product_id)))
         if product is None or not product.get("is_active"):
             await query.answer("هذا المنتج لم يعد مفعّلاً. اختَر غيره أو استخدم إدخال حر.", show_alert=True)
             return
@@ -9428,9 +9438,9 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
                 build_compensation_confirmation_keyboard(),
             )
             return
-        saved = append_expense_row(expense["amount"], reason)
+        saved = (await run_io(lambda: append_expense_row(expense["amount"], reason)))
         if saved and expense.get("vault"):
-            adjust_vault_balance(expense["vault"], -expense["amount"])
+            (await run_io(lambda: adjust_vault_balance(expense["vault"], -expense["amount"])))
         if saved:
             await send_expense_notification(context, expense)
         final_text = format_expense_summary(expense) + (
@@ -9445,12 +9455,12 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "exp_reason_list":
         await edit_expense_message(
-            query, expense, format_expense_summary(expense), build_expense_reason_list_keyboard()
+            query, expense, format_expense_summary(expense), (await run_io(lambda: build_expense_reason_list_keyboard()))
         )
         return
 
     if data == "exp_back_to_reason":
-        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
+        await edit_expense_message(query, expense, format_expense_summary(expense), (await run_io(lambda: build_expense_reason_keyboard())))
         return
 
     if data == "exp_reason_manual":
@@ -9467,7 +9477,7 @@ async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "exp_cancel_manual_reason":
         expense["awaiting_manual_reason"] = False
-        await edit_expense_message(query, expense, format_expense_summary(expense), build_expense_reason_keyboard())
+        await edit_expense_message(query, expense, format_expense_summary(expense), (await run_io(lambda: build_expense_reason_keyboard())))
         return
 
 
@@ -9484,7 +9494,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     await query.answer()
 
-    if finance_active():
+    if (await run_io(lambda: finance_active())):
         from statistics_manager import open_statistics
         page = 'products:0' if 'products' in data else 'subscriptions' if 'chatgpt' in data or 'account_' in data else 'wallets:0' if 'vault' in data else 'home'
         await open_statistics(query.message, context, page=page)
@@ -9498,7 +9508,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "stats_totals_default":
-        text = calculate_totals_summary("month")
+        text = (await run_io(lambda: calculate_totals_summary("month")))
         await query.edit_message_text(
             text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
         )
@@ -9531,15 +9541,15 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data=back_target)]])
 
         if next_action == "totals":
-            text = calculate_totals_summary(period_key)
+            text = (await run_io(lambda: calculate_totals_summary(period_key)))
         else:
-            text = calculate_product_breakdown(period_key)
+            text = (await run_io(lambda: calculate_product_breakdown(period_key)))
 
         await query.edit_message_text(text=text, reply_markup=back_keyboard)
         return
 
     if data == "stats_chatgpt_main":
-        private_count, shared_count = calculate_chatgpt_account_stats()
+        private_count, shared_count = (await run_io(lambda: calculate_chatgpt_account_stats()))
         await query.edit_message_text(
             text="حسابات ChatGPT",
             reply_markup=build_chatgpt_main_keyboard(private_count, shared_count),
@@ -9547,7 +9557,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "stats_chatgpt_private":
-        private_count, _ = calculate_chatgpt_account_stats()
+        private_count, _ = (await run_io(lambda: calculate_chatgpt_account_stats()))
         await query.edit_message_text(
             text=f"عدد الحسابات الخاصة: {private_count}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_chatgpt_main")]]),
@@ -9555,7 +9565,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "stats_chatgpt_shared":
-        accounts = get_shared_accounts_list()
+        accounts = (await run_io(lambda: get_shared_accounts_list()))
         if not accounts:
             await query.edit_message_text(
                 text="ماكو حسابات مشتركة مسجلة.",
@@ -9567,7 +9577,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("stats_account_relogin_"):
         account_id = data[len("stats_account_relogin_"):]
-        accounts = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).limit(1).execute().data or []
+        accounts = (await run_io(lambda: supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).limit(1).execute())).data or []
         account_name = (accounts[0].get("label") if accounts else None) or (accounts[0].get("link_code") if accounts else "الحساب المشترك")
         sent, failed = await send_legacy_shared_account_relogin_notifications(context, account_id, account_name)
         await query.edit_message_text(
@@ -9579,12 +9589,12 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("stats_native_account_"):
         account_id = data[len("stats_native_account_"):]
-        accounts = supabase.table("chatgpt_shared_accounts").select("email, capacity").eq("id", account_id).limit(1).execute().data or []
+        accounts = (await run_io(lambda: supabase.table("chatgpt_shared_accounts").select("email, capacity").eq("id", account_id).limit(1).execute())).data or []
         if not accounts:
             await query.edit_message_text("الحساب غير موجود.")
             return
-        assignments = supabase.table("chatgpt_account_assignments").select("customer_chat_id").eq("account_id", account_id).eq("status", "active").execute().data or []
-        instagram_sales = get_instagram_account_sales(account_id)
+        assignments = (await run_io(lambda: supabase.table("chatgpt_account_assignments").select("customer_chat_id").eq("account_id", account_id).eq("status", "active").execute())).data or []
+        instagram_sales = (await run_io(lambda: get_instagram_account_sales(account_id)))
         capacity = min(int(accounts[0].get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
         total_used = len(assignments) + len(instagram_sales)
         instagram_lines = "\n".join(f"@{row[2]} — {row[19] if len(row) > 19 else '—'}" for row in instagram_sales) or "لا توجد مبيعات Instagram"
@@ -9601,8 +9611,8 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("stats_account_"):
         account_id = data[len("stats_account_"):]
-        customer_chat_ids = get_customers_for_account(account_id)
-        instagram_sales = get_instagram_account_sales(f"legacy:{account_id}")
+        customer_chat_ids = (await run_io(lambda: get_customers_for_account(account_id)))
+        instagram_sales = (await run_io(lambda: get_instagram_account_sales(f"legacy:{account_id}")))
         total_used = len(customer_chat_ids) + len(instagram_sales)
         instagram_lines = "\n".join(f"@{row[2]} — {row[19] if len(row) > 19 else '—'}" for row in instagram_sales) or "لا توجد مبيعات Instagram"
         text = (
@@ -9622,7 +9632,7 @@ async def handle_stats_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "stats_vaults_view":
-        text = format_vault_balances()
+        text = (await run_io(lambda: format_vault_balances()))
         await query.edit_message_text(
             text=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
         )
@@ -9698,9 +9708,9 @@ async def handle_chatgpt_account_reply(update: Update, context: ContextTypes.DEF
         await message.reply_text("⚠️ ما لكيت بيانات الزبون لهذي العملية.")
         return True
 
-    saved = upsert_chatgpt_account(
+    saved = (await run_io(lambda: upsert_chatgpt_account(
         chat_id, completed["customer_name"], completed.get("customer_username"), account_text
-    )
+    )))
 
     if saved:
         completed["awaiting_chatgpt_account"] = False
@@ -9732,7 +9742,7 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
     حسب أي خطوة بانتظار إدخال. يرجع True لو عالج الرسالة.
     """
     global _pending_expense
-    if finance_active():
+    if (await run_io(lambda: finance_active())):
         _pending_expense = None
         return False
 
@@ -9786,9 +9796,9 @@ async def handle_expense_manual_entry(update: Update, context: ContextTypes.DEFA
             except Exception:
                 logger.exception("Failed to show compensation confirmation after manual reason")
             return True
-        saved = append_expense_row(expense["amount"], reason)
+        saved = (await run_io(lambda: append_expense_row(expense["amount"], reason)))
         if saved and expense.get("vault"):
-            adjust_vault_balance(expense["vault"], -expense["amount"])
+            (await run_io(lambda: adjust_vault_balance(expense["vault"], -expense["amount"])))
         if saved:
             await send_expense_notification(context, expense)
         final_text = format_expense_summary(expense) + (
@@ -9827,7 +9837,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
     if text == BTN_EXPENSE:
         try:
-            if finance_active():
+            if (await run_io(lambda: finance_active())):
                 cancel_debt_input(context)
                 from expense_manager import start_expense
                 await start_expense(context)
@@ -9843,7 +9853,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         context.user_data.pop('statistics_input', None)
         cancel_debt_input(context)
         try:
-            suspend_finance_inputs()
+            (await run_io(lambda: suspend_finance_inputs()))
         except Exception:
             logger.warning('Could not suspend financial text input while navigating')
 
@@ -9893,7 +9903,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         context.user_data.pop("pending_manual_subscription", None)
         await message.reply_text(
             "اختَر نوع ومدة الاشتراك اللي تريد تضيفه يدوياً:",
-            reply_markup=build_manual_subscription_keyboard(),
+            reply_markup=(await run_io(lambda: build_manual_subscription_keyboard())),
         )
         return True
 
@@ -9921,19 +9931,19 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_CONTINUITY_STATS:
-        if finance_active():
+        if (await run_io(lambda: finance_active())):
             from statistics_manager import open_statistics
             await open_statistics(message, context, page='rewards')
             return True
-        await message.reply_text(get_continuity_bot_stats())
+        await message.reply_text((await run_io(lambda: get_continuity_bot_stats())))
         return True
 
     if text == BTN_AUTO_REPLY:
-        paused = get_auto_reply_paused()
+        paused = (await run_io(lambda: get_auto_reply_paused()))
         # نفس زر لوحة المفاتيح هو تبديل مباشر: ما نطلب ضغطة ثانية أو
         # تأكيداً لأن الغرض منه إيقاف سريع عند انشغال الأونر.
         next_paused = not paused
-        if not set_auto_reply_paused(next_paused):
+        if not (await run_io(lambda: set_auto_reply_paused(next_paused))):
             await message.reply_text("⚠️ تعذر حفظ التغيير؛ حالة الردود لم تتبدل.")
             return True
         if next_paused:
@@ -9963,11 +9973,11 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_INCOME:
-        if finance_active():
+        if (await run_io(lambda: finance_active())):
             from statistics_manager import open_statistics
             await open_statistics(message, context)
             return True
-        report = calculate_income_report()
+        report = (await run_io(lambda: calculate_income_report()))
         await message.reply_text(report)
         return True
 
@@ -9981,7 +9991,7 @@ async def handle_reply_keyboard_button(update: Update, context: ContextTypes.DEF
         return True
 
     if text == BTN_STATS:
-        if finance_active():
+        if (await run_io(lambda: finance_active())):
             from statistics_manager import open_statistics
             await open_statistics(message, context)
             return True
@@ -10048,9 +10058,9 @@ async def handle_add_account_flow(update: Update, context: ContextTypes.DEFAULT_
         _pending_add_account = None
 
         try:
-            supabase.table("totp_accounts").insert(
+            (await run_io(lambda: supabase.table("totp_accounts").insert(
                 {"link_code": link_code, "secret": secret, "label": label}
-            ).execute()
+            ).execute()))
             await message.reply_text(f"✅ تمت اضافة الحساب.\nرمز الربط: {link_code}\nملاحظة: {label or '—'}")
             try:
                 await context.bot.send_message(
@@ -10100,9 +10110,9 @@ async def handle_stats_manual_period_entry(update: Update, context: ContextTypes
     back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data=back_target)]])
 
     if next_action == "totals":
-        text = calculate_totals_summary(period_key)
+        text = (await run_io(lambda: calculate_totals_summary(period_key)))
     else:
-        text = calculate_product_breakdown(period_key)
+        text = (await run_io(lambda: calculate_product_breakdown(period_key)))
 
     await message.reply_text(text, reply_markup=back_keyboard)
     return True
@@ -10134,15 +10144,15 @@ async def handle_vault_edit_manual_entry(update: Update, context: ContextTypes.D
         return True
 
     if mode == "set":
-        saved = set_vault_balance(vault_name, amount)
+        saved = (await run_io(lambda: set_vault_balance(vault_name, amount)))
     elif mode == "add":
-        saved = adjust_vault_balance(vault_name, amount)
+        saved = (await run_io(lambda: adjust_vault_balance(vault_name, amount)))
     else:  # sub
-        saved = adjust_vault_balance(vault_name, -amount)
+        saved = (await run_io(lambda: adjust_vault_balance(vault_name, -amount)))
 
     back_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_BACK, callback_data="stats_back_to_main")]])
     if saved:
-        text = format_vault_balances()
+        text = (await run_io(lambda: format_vault_balances()))
     else:
         text = "⚠️ فشل تحديث الرصيد بـ Google Sheet — تحقق من الاتصال يدوياً."
 
@@ -10180,7 +10190,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     photo_outside_payment_flow = False
     if message.photo:
         user_text = message.caption or "[صورة مرفقة]"
-        state = get_interactive_sale_state(customer_chat_id)
+        state = (await run_io(lambda: get_interactive_sale_state(customer_chat_id)))
         if not should_review_payment_photo(state.get("workflow_state", "observing")):
             # ما نصرف فحص رؤية على أي صورة خارج مسار الدفع، ولا نفسرها
             # تلقائياً على أنها وصل تحويل.
@@ -10213,30 +10223,30 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
         user_text = message.text
 
     # نؤرشف رسالتك أول (كـ "customer" بالمعنى الوظيفي — طرف المحادثة)
-    archive_message(
+    (await run_io(lambda: archive_message(
         customer_chat_id, "تجربة", None, sender_type="customer",
         message_text=user_text, image_description=image_description,
-    )
+    )))
 
     # الذكاء الاصطناعي يختار الإجراء فقط؛ الرد النهائي دائماً ثابت ومخزن.
     if photo_outside_payment_flow:
         action_key = "clarify"
     elif image_description:
         if payment_analysis is None:
-            set_interactive_sale_state(customer_chat_id, "payment_review")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "payment_review")))
             action_key = "payment_under_review"
         else:
-            save_interactive_payment_proof(customer_chat_id, payment_analysis)
+            (await run_io(lambda: save_interactive_payment_proof(customer_chat_id, payment_analysis)))
             await notify_interactive_payment_review(context, payment_analysis)
             decision = payment_analysis.get("decision")
             if decision == "approved":
-                set_interactive_sale_state(customer_chat_id, "payment_verified")
+                (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "payment_verified")))
                 action_key = "payment_proof_approved"
             elif decision == "rejected":
-                set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")
+                (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "awaiting_payment_proof")))
                 action_key = "payment_proof_rejected"
             else:
-                set_interactive_sale_state(customer_chat_id, "payment_review")
+                (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "payment_review")))
                 action_key = "payment_under_review"
     else:
         action_key = await choose_test_response_action(customer_chat_id, user_text)
@@ -10247,7 +10257,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     # بوابة أخيرة مستقلة عن المصنف: حتى لو أخطأ الموديل، لا يظهر سعر أو
     # دفع بلا باقة مثبتة، ولا يرجع مسار الدعم إلى البيع، ولا يصدر كود قبل
     # تسليم الحساب. هذه invariants وليست مجرد تعليمات prompt.
-    guarded_state = get_interactive_sale_state(customer_chat_id)
+    guarded_state = (await run_io(lambda: get_interactive_sale_state(customer_chat_id)))
     guarded_workflow = guarded_state.get("workflow_state", "observing")
     action_key = guard_interactive_action(
         action_key,
@@ -10263,22 +10273,22 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     if action_key == "no_reply":
         return
     if action_key == "payment_proof_approved":
-        _, plan_name = get_expected_payment_for_interactive_session(customer_chat_id)
-        selected_product = get_selected_catalog_product(customer_chat_id)
+        _, plan_name = (await run_io(lambda: get_expected_payment_for_interactive_session(customer_chat_id)))
+        selected_product = (await run_io(lambda: get_selected_catalog_product(customer_chat_id)))
         if selected_product and not is_chatgpt_product(selected_product):
             # بقية المنتجات تستخدم نفس التحقق والدفع، لكن لا يجوز أن تقع
             # في مسار تسليم حساب ChatGPT. تجهيزها له فلو خاص لاحقاً.
-            set_interactive_sale_state(customer_chat_id, "fulfillment_pending")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "fulfillment_pending")))
             reply = "تم تأكيد التحويل، راح أجهز طلبك وأرجعلك."
         elif is_private_chatgpt_plan(plan_name):
             # تفعيل الخاص يحتاج صاحب المتجر؛ لا نشارك بيانات حساب مشترك ولا
             # نسمح بمسار الكود قبل أن يتم التفعيل فعلياً.
-            set_interactive_sale_state(customer_chat_id, "private_activation_pending")
+            (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "private_activation_pending")))
             reply = "تم تأكيد التحويل، راح أفعّله إلك وأرجعلك."
         else:
-            account = assign_shared_chatgpt_account(customer_chat_id)
+            account = (await run_io(lambda: assign_shared_chatgpt_account(customer_chat_id)))
             if account:
-                set_interactive_sale_state(customer_chat_id, "account_delivered")
+                (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "account_delivered")))
                 reply = CHATGPT_DELIVERY_TEMPLATE.format(email=account["email"], password=account["password"])
             else:
                 # لا يوجد مقعد متاح؛ لا نرسل أي بيانات حساب.
@@ -10286,7 +10296,7 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
     elif action_key == "code_request":
         # الكود لا ينرسل إلا للحساب الذي سُلّم داخل هذه الجلسة. العداد نفسه
         # المستخدم بالبوت الحقيقي يطبق قواعد إعادة المحاولة أيضاً.
-        reply, stopped = process_code_request(customer_chat_id)
+        reply, stopped = (await run_io(lambda: process_code_request(customer_chat_id)))
         if reply:
             if reply.startswith(CODE_REPLY_MARKER):
                 _marker, _separator, selected_account_id = reply.partition(":")
@@ -10294,17 +10304,17 @@ async def on_interactive_topic_message(update: Update, context: ContextTypes.DEF
                     customer_chat_id, selected_account_id or None
                 )
             if not reply:
-                reply = render_test_response("handoff", user_text, customer_chat_id)
+                reply = (await run_io(lambda: render_test_response("handoff", user_text, customer_chat_id)))
             else:
-                set_interactive_sale_state(customer_chat_id, "code_sent")
+                (await run_io(lambda: set_interactive_sale_state(customer_chat_id, "code_sent")))
         else:
-            reply = render_test_response("handoff", user_text, customer_chat_id)
+            reply = (await run_io(lambda: render_test_response("handoff", user_text, customer_chat_id)))
             if stopped:
                 logger.warning("Interactive test code retries stopped for session %s", customer_chat_id)
     else:
-        reply = render_test_response(action_key, user_text, customer_chat_id)
+        reply = (await run_io(lambda: render_test_response(action_key, user_text, customer_chat_id)))
 
-    archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)
+    (await run_io(lambda: archive_message(customer_chat_id, "تجربة", None, sender_type="bot", message_text=reply)))
 
     try:
         await context.bot.send_message(
@@ -10471,14 +10481,14 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
     # ------------------------------------------------------------------
     if session["customer_chat_id"] is not None:
         archive_sender_type = "owner" if session["awaiting_reply"] else "customer"
-        archive_message(
+        (await run_io(lambda: archive_message(
             session["customer_chat_id"],
             None,
             None,
             sender_type=archive_sender_type,
             message_text=None if is_image else text,
             image_description=text if is_image else None,
-        )
+        )))
 
     if not session["awaiting_reply"]:
         session["customer_messages"].append(text)
@@ -10490,7 +10500,7 @@ async def handle_teaching_message(update: Update, context: ContextTypes.DEFAULT_
 
     # awaiting_reply=True — هذا النص/الوصف هو الرد، نحفظ المثال ونبدأ مثال جديد
     combined_customer_message = "\n".join(session["customer_messages"])
-    saved = save_style_example(session["session_id"], session["customer_chat_id"], combined_customer_message, text, source="manual")
+    saved = (await run_io(lambda: save_style_example(session["session_id"], session["customer_chat_id"], combined_customer_message, text, source="manual")))
 
     session["customer_messages"] = []
     session["awaiting_reply"] = False
@@ -10651,38 +10661,38 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             "account_display": state.get("account_display"),
         }
         if sale.get("account_source") == "shared":
-            selected_accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == str(sale.get("account_id"))]
+            selected_accounts = (await run_io(lambda: [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == str(sale.get("account_id"))]))
             if not selected_accounts:
                 await query.edit_message_text("⚠️ الحساب المشترك لم يعد متاحاً.")
                 return
             capacity = min(int(selected_accounts[0].get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
-            if get_instagram_shared_account_usage(selected_accounts[0]) >= capacity:
+            if (await run_io(lambda: get_instagram_shared_account_usage(selected_accounts[0]))) >= capacity:
                 await query.edit_message_text("⚠️ هذا الحساب امتلأ أثناء التسجيل. ابدأ العملية واختر حساباً آخر.")
                 return
         # مبيعات إنستغرام تدخل مباشرة إلى الخزنة التي اختارها المدير.
         try:
-            financial_saved = record_instagram_finance(sale, state)
+            financial_saved = (await run_io(lambda: record_instagram_finance(sale, state)))
         except FinanceError as exc:
             await query.message.reply_text(f'⚠️ {exc}')
             return
-        wallet_added = financial_saved or adjust_vault_balance(sale["wallet"], sale["amount"])
+        wallet_added = financial_saved or (await run_io(lambda: adjust_vault_balance(sale["wallet"], sale["amount"])))
         if not wallet_added:
             await query.edit_message_text("⚠️ تعذر تحديث الخزنة. لم يتم حفظ عملية البيع.")
             return
-        saved = financial_saved or append_instagram_sale(sale)
+        saved = financial_saved or (await run_io(lambda: append_instagram_sale(sale)))
         if not saved:
             # إذا فشل سجل المبيعات، نرجع الزيادة حتى لا يبقى الرصيد خاطئاً.
-            adjust_vault_balance(sale["wallet"], -sale["amount"])
-        reminder_saved = bool(financial_saved) or (save_instagram_subscription_reminder(sale, state) if saved else False)
+            (await run_io(lambda: adjust_vault_balance(sale["wallet"], -sale["amount"])))
+        reminder_saved = bool(financial_saved) or ((await run_io(lambda: save_instagram_subscription_reminder(sale, state))) if saved else False)
         if saved and sale.get("instagram_account"):
             # هذا الحقل هو المعرف الذي يدخله مدير مبيعات الإنستغرام.
             # إذا كان يوزر الزبون، يبقى محفوظاً ضمن سجل العملاء للرسائل المستقبلية.
-            upsert_customer_contact(
+            (await run_io(lambda: upsert_customer_contact(
                 platform="instagram",
                 external_id=sale["instagram_account"].lstrip("@"),
                 display_name=sale["instagram_account"],
                 username=sale["instagram_account"].lstrip("@"),
-            )
+            )))
         context.user_data.pop("instagram_sale", None)
         if saved:
             if sale.get("account_source") in {"shared", "private_ours"}:
@@ -10734,7 +10744,7 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             if not code_ref:
                 await query.answer("انتهت صلاحية زر الكود.", show_alert=True)
                 return
-            secret = get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])
+            secret = (await run_io(lambda: get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])))
             if not secret:
                 await query.answer("تعذر جلب كود الحساب.", show_alert=True)
                 return
@@ -10752,7 +10762,7 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
             # Keep the authorization bound to the exact sale message/session.
             await query.answer("انتهت صلاحية زر الكود.", show_alert=True)
             return
-        secret = get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])
+        secret = (await run_io(lambda: get_instagram_account_secret(code_ref["account_source"], code_ref["account_id"])))
         if not secret:
             await query.answer("تعذر جلب كود الحساب.", show_alert=True)
             return
@@ -10776,20 +10786,20 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
         state["chat_type"] = normalize_chat_type(data[len("ig_type_"):])
         if state["chat_type"] == "مشترك":
             state.update({"account_source": "shared", "account_source_label": "مشترك من عدنا", "step": "shared_account"})
-            await query.edit_message_text("اختَر الحساب المشترك:", reply_markup=instagram_shared_accounts_keyboard())
+            await query.edit_message_text("اختَر الحساب المشترك:", reply_markup=(await run_io(lambda: instagram_shared_accounts_keyboard())))
         else:
             state["step"] = "private_source"
             await query.edit_message_text("الخاص من عدنا لو من الزبون؟", reply_markup=instagram_account_source_keyboard())
         return
     if data.startswith("ig_shared_"):
         account_id = data[len("ig_shared_"):]
-        accounts = [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]
+        accounts = (await run_io(lambda: [account for account in get_chatgpt_shared_accounts() if str(account.get("id")) == account_id]))
         if not accounts:
             await query.answer("الحساب غير موجود أو متوقف.", show_alert=True)
             return
         account = accounts[0]
         capacity = min(int(account.get("capacity") or SHARED_CHATGPT_ACCOUNT_CAPACITY), SHARED_CHATGPT_ACCOUNT_CAPACITY)
-        if get_instagram_shared_account_usage(account) >= capacity:
+        if (await run_io(lambda: get_instagram_shared_account_usage(account))) >= capacity:
             await query.answer("هذا الحساب امتلأ، اختَر حساباً متوفراً.", show_alert=True)
             return
         state.update({"account_source": "shared", "account_source_label": "مشترك من عدنا", "account_id": account_id, "account_display": accounts[0].get("email") or "حساب مشترك", "step": "duration"})
@@ -10799,14 +10809,14 @@ async def handle_instagram_callback(update: Update, context: ContextTypes.DEFAUL
         source = data[len("ig_source_private_"):]
         if source == "ours":
             state.update({"account_source": "private_ours", "account_source_label": "خاص من عدنا", "step": "private_account"})
-            await query.edit_message_text("اختَر الإيميل الخاص من عدنا:", reply_markup=instagram_private_accounts_keyboard())
+            await query.edit_message_text("اختَر الإيميل الخاص من عدنا:", reply_markup=(await run_io(lambda: instagram_private_accounts_keyboard())))
         else:
             state.update({"account_source": "private_customer", "account_source_label": "خاص من الزبون", "account_id": None, "account_display": "خاص من الزبون", "step": "duration"})
             await query.edit_message_text("اختَر مدة الاشتراك:", reply_markup=instagram_duration_keyboard())
         return
     if data.startswith("ig_private_"):
         account_id = data[len("ig_private_"):]
-        accounts = [account for account in get_instagram_private_accounts() if str(account.get("id")) == account_id]
+        accounts = (await run_io(lambda: [account for account in get_instagram_private_accounts() if str(account.get("id")) == account_id]))
         if not accounts:
             await query.answer("الحساب غير موجود.", show_alert=True)
             return
@@ -10851,15 +10861,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ):
         chat_id = update.effective_chat.id
         try:
-            supabase.table("continuity_bot_contacts").upsert({
+            (await run_io(lambda: supabase.table("continuity_bot_contacts").upsert({
                 "customer_chat_id": chat_id,
                 "customer_name": update.effective_user.full_name or "زبون",
                 "customer_username": update.effective_user.username,
                 "started_at": datetime.now(timezone.utc).isoformat(),
-            }, on_conflict="customer_chat_id").execute()
-            supabase.table("continuity_bot_invites").update({
+            }, on_conflict="customer_chat_id").execute()))
+            (await run_io(lambda: supabase.table("continuity_bot_invites").update({
                 "status": "started", "started_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("customer_chat_id", chat_id).in_("status", ["scheduled", "sent", "failed"]).execute()
+            }).eq("customer_chat_id", chat_id).in_("status", ["scheduled", "sent", "failed"]).execute()))
         except Exception:
             logger.exception("Failed to save continuity bot contact %s", chat_id)
             await update.message.reply_text("⚠️ تعذر حفظ التسجيل حالياً، حاول مرة ثانية بعد قليل.")
@@ -10878,12 +10888,12 @@ async def cmd_instagram_report(update: Update, context: ContextTypes.DEFAULT_TYP
     """Owner-only quick totals for confirmed Instagram sales."""
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
         return
-    sheet = get_instagram_sales_worksheet()
+    sheet = (await run_io(lambda: get_instagram_sales_worksheet()))
     if sheet is None:
         await update.message.reply_text("⚠️ تعذر الاتصال بشيت مبيعات الإنستغرام.")
         return
     try:
-        rows = sheet.get_all_values()[1:]
+        rows = (await run_io(lambda: sheet.get_all_values()))[1:]
         total = sum(int(re.sub(r"[^0-9]", "", row[6])) for row in rows if len(row) > 8 and row[6])
         commission = sum(int(re.sub(r"[^0-9]", "", row[8])) for row in rows if len(row) > 8 and row[8])
         await update.message.reply_text(
@@ -10916,7 +10926,7 @@ def get_instagram_commission_rows(unpaid_only: bool = False) -> list[tuple[int, 
 async def show_instagram_admin(message) -> None:
     """Owner-only commission control panel."""
     try:
-        rows = get_instagram_commission_rows(unpaid_only=True)
+        rows = (await run_io(lambda: get_instagram_commission_rows(unpaid_only=True)))
         total = sum(int(re.sub(r"[^0-9]", "", row[8])) for _, row in rows if len(row) > 8 and row[8])
         text = (
             "📲 إدارة عمولات الإنستغرام\n\n"
@@ -10946,12 +10956,12 @@ async def handle_instagram_admin_callback(update: Update, context: ContextTypes.
     if not query.data.startswith("igadmin_sale_"):
         return
     sale_id = query.data[len("igadmin_sale_"):]
-    sheet = get_instagram_sales_worksheet()
+    sheet = (await run_io(lambda: get_instagram_sales_worksheet()))
     if sheet is None:
         await query.edit_message_text("⚠️ تعذر الاتصال بالشيت.")
         return
     try:
-        rows = get_instagram_commission_rows(unpaid_only=False)
+        rows = (await run_io(lambda: get_instagram_commission_rows(unpaid_only=False)))
         match = next(((row_number, row) for row_number, row in rows if row[0] == sale_id), None)
         if match is None:
             await query.edit_message_text("العملية غير موجودة.")
@@ -10983,12 +10993,12 @@ async def handle_instagram_commission_paid_callback(update: Update, context: Con
         return
     await query.answer()
     sale_id = (query.data or "")[len("igadmin_paid_"):]
-    sheet = get_instagram_sales_worksheet()
+    sheet = (await run_io(lambda: get_instagram_sales_worksheet()))
     if sheet is None:
         await query.edit_message_text("⚠️ تعذر الاتصال بالشيت.")
         return
     try:
-        match = next(((row_number, row) for row_number, row in get_instagram_commission_rows(False) if row[0] == sale_id), None)
+        match = (await run_io(lambda: next(((row_number, row) for row_number, row in get_instagram_commission_rows(False) if row[0] == sale_id), None)))
         if match is None:
             await query.edit_message_text("العملية غير موجودة.")
             return
@@ -11001,19 +11011,19 @@ async def handle_instagram_commission_paid_callback(update: Update, context: Con
         if wallet not in VAULT_NAMES or commission is None:
             await query.edit_message_text("⚠️ بيانات الخزنة أو العمولة غير صالحة لهذه العملية.")
             return
-        if record_instagram_commission(sale_id, wallet, commission):
+        if (await run_io(lambda: record_instagram_commission(sale_id, wallet, commission))):
             await query.edit_message_text('✅ تم حفظ تسديد العمولة بالسجل المالي. مزامنة الشيت تلقائية.')
             return
-        if not adjust_vault_balance(wallet, -commission):
+        if not (await run_io(lambda: adjust_vault_balance(wallet, -commission))):
             await query.edit_message_text("⚠️ تعذر خصم العمولة من الخزنة. لم يتم تأكيد الدفع.")
             return
         expense_reason = f"عمولة إنستغرام — العملية {sale_id} — @{row[2]}"
-        if not append_expense_row(commission, expense_reason):
-            adjust_vault_balance(wallet, commission)
+        if not (await run_io(lambda: append_expense_row(commission, expense_reason))):
+            (await run_io(lambda: adjust_vault_balance(wallet, commission)))
             await query.edit_message_text("⚠️ تعذر تسجيل العمولة كمصروف. لم يتم تأكيد الدفع.")
             return
-        sheet.update_cell(row_number, 11, "نعم")
-        sheet.update_cell(row_number, 19, datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+        (await run_io(lambda: sheet.update_cell(row_number, 11, "نعم")))
+        (await run_io(lambda: sheet.update_cell(row_number, 19, datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"))))
         await send_expense_notification(context, {
             "amount": commission, "reason": expense_reason, "vault": wallet,
         })
@@ -11039,7 +11049,7 @@ async def cmd_import_archive(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text("⏳ دا أرتب الأرشيف وأحوّل ردودك وردود البوت إلى أمثلة تلقين...")
     try:
-        added, skipped_duplicates, total_candidates = import_archive_as_style_examples()
+        added, skipped_duplicates, total_candidates = (await run_io(lambda: import_archive_as_style_examples()))
     except Exception:
         logger.exception("Archive-to-style import failed")
         await update.message.reply_text("⚠️ فشل الاستيراد. تحقق من اتصال Supabase والـ logs.")
@@ -11058,7 +11068,7 @@ async def cmd_income_report(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """أمر /دخل — يعرض تقرير الدخل (اليوم/الأسبوع/الشهر) من Google Sheet."""
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
         return
-    report = calculate_income_report()
+    report = (await run_io(lambda: calculate_income_report()))
     await update.message.reply_text(report)
 
 
@@ -11066,14 +11076,14 @@ async def cmd_sheet_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """يشخّص ملف وتبويب المدفوعات الفعليين وآخر سطر محفوظ."""
     if update.effective_user is None or update.effective_user.id != OWNER_USER_ID:
         return
-    sheet = get_google_sheet()
+    sheet = (await run_io(lambda: get_google_sheet()))
     if sheet is None:
         await update.message.reply_text(
             "❌ تعذر الاتصال بـ Google Sheet. راجع سجل Render وملف خدمة Google."
         )
         return
     try:
-        rows = sheet.get_all_values()
+        rows = (await run_io(lambda: sheet.get_all_values()))
         last_row_number = len(rows)
         last_row = rows[-1] if len(rows) > 1 else []
         last_date = last_row[SHEET_COL_DATE - 1] if len(last_row) >= SHEET_COL_DATE else "—"
@@ -11139,7 +11149,7 @@ async def cmd_getcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if update.message is None or update.message.message_thread_id != TOPIC_INTERACTIVE:
         return  # يشتغل بس بفرع التفاعل، نتجاهل أي استخدام بمكان ثاني
 
-    accounts = get_all_accounts_with_secrets()
+    accounts = (await run_io(lambda: get_all_accounts_with_secrets()))
     if not accounts:
         await update.message.reply_text("ماكو حسابات مسجلة حالياً.")
         return
@@ -11186,10 +11196,10 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
         account_id = data[len("getcode_show_"):]
         try:
             if account_id.startswith("native:"):
-                res = supabase.table("chatgpt_shared_accounts").select("totp_secret, email").eq("id", account_id[len("native:"):]).execute()
+                res = (await run_io(lambda: supabase.table("chatgpt_shared_accounts").select("totp_secret, email").eq("id", account_id[len("native:"):]).execute()))
                 secret = res.data[0].get("totp_secret") if res.data else None
             else:
-                res = supabase.table("totp_accounts").select("secret, label, link_code").eq("id", account_id).execute()
+                res = (await run_io(lambda: supabase.table("totp_accounts").select("secret, label, link_code").eq("id", account_id).execute()))
                 secret = res.data[0].get("secret") if res.data else None
         except Exception:
             logger.exception("Failed to fetch account secret for getcode")
@@ -11215,9 +11225,9 @@ async def handle_getcode_callback(update: Update, context: ContextTypes.DEFAULT_
         account_id = data[len("getcode_back_"):]
         try:
             if account_id.startswith("native:"):
-                res = supabase.table("chatgpt_shared_accounts").select("email").eq("id", account_id[len("native:"):]).execute()
+                res = (await run_io(lambda: supabase.table("chatgpt_shared_accounts").select("email").eq("id", account_id[len("native:"):]).execute()))
             else:
-                res = supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).execute()
+                res = (await run_io(lambda: supabase.table("totp_accounts").select("label, link_code").eq("id", account_id).execute()))
         except Exception:
             logger.exception("Failed to fetch account label for getcode back")
             await query.answer("صار خطأ.", show_alert=True)
@@ -11342,20 +11352,20 @@ async def _send_delayed_initial_greeting(
         reply = get_exact_test_faq_reply(text)
         if not reply:
             return
-        if not should_send_faq_reply(chat_id, "سلام" if "وعليكم" in reply else "ترحيب", reply):
-            archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        if not (await run_io(lambda: should_send_faq_reply(chat_id, "سلام" if "وعليكم" in reply else "ترحيب", reply))):
+            (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
             return
         await human_like_reply_sequence(context, chat_id, business_connection_id, message_id)
         if (chat_id, message_id) in _suppressed_auto_reply_keys:
-            archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+            (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
             return
         await context.bot.send_message(
             business_connection_id=business_connection_id,
             chat_id=chat_id,
             text=reply,
         )
-        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
-        archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=reply)
+        (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
+        (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=reply)))
         await notify_owner(context, chat_id, customer_name, customer_username, text, reply)
     except asyncio.CancelledError:
         raise
@@ -11375,34 +11385,52 @@ def cancel_pending_customer_text_batch(chat_id: int) -> None:
         task.cancel()
 
 
-def mark_owner_took_over_customer_chat(chat_id: int) -> None:
-    """يلغي الرد التلقائي للرسالة الأخيرة فقط عندما يسبق الأونر البوت."""
-    message_id = _latest_customer_message_ids.get(chat_id)
+def suppress_customer_reply_on_owner_arrival(chat_id: int, message_id: int | None) -> None:
+    """Immediate in-memory takeover; no network or finance writes here."""
     # أول رد منك يعني أن المشكلة التي سلّمتها للبشر انتهت؛ من الرسالة
     # التالية يرجع البوت لخدمته المعتادة (كود، شكر، إلخ).
     _support_context_until.pop(chat_id, None)
     _support_context_resolved_at[chat_id] = datetime.now(timezone.utc)
+    # Cancel pending automatic replies before the first network await.
+    if message_id is not None:
+        _suppressed_auto_reply_keys.add((chat_id, message_id))
+        pending = _pending_customer_text_batches.get(chat_id)
+        if pending and any(part.get("message_id") == message_id for part in pending.get("parts", [])):
+            cancel_pending_customer_text_batch(chat_id)
+        pending_greeting = _pending_initial_greetings.get(chat_id)
+        if pending_greeting and pending_greeting.get("message_id") == message_id:
+            _pending_initial_greetings.pop(chat_id, None)
+            task = pending_greeting.get("task")
+            if task and not task.done():
+                task.cancel()
+
+
+def observe_business_update_arrival(update: Update) -> None:
+    bm = update.business_message or update.edited_business_message
+    if not bm or not bm.from_user:
+        return
+    chat_id = bm.chat.id
+    if bm.from_user.id != OWNER_USER_ID:
+        _latest_customer_message_ids[chat_id] = max(bm.message_id,_latest_customer_message_ids.get(chat_id,0))
+    elif bm.text:
+        target = _latest_customer_message_ids.get(chat_id)
+        _owner_arrival_reply_targets[(chat_id,bm.message_id)] = (True,target)
+        suppress_customer_reply_on_owner_arrival(chat_id,target)
+
+
+async def mark_owner_took_over_customer_chat(chat_id: int, target=None) -> None:
+    """Persist takeover after suppressing only the message seen at arrival."""
+    message_id = target[1] if target else _latest_customer_message_ids.get(chat_id)
+    suppress_customer_reply_on_owner_arrival(chat_id,message_id)
     # إذا كانت الردود العامة متوقفة، رد الأونر يعني أن الرسالة المعلّقة
     # عولجت يدوياً. نحذفها من الطابور الدائم حتى لا يرد عليها البوت عند
     # الاستئناف، حتى لو أُعيد تشغيل Render قبل ذلك.
     try:
-        supabase.table("paused_customer_messages").delete().eq(
+        await run_io(lambda: supabase.table("paused_customer_messages").delete().eq(
             "owner_user_id", OWNER_USER_ID
-        ).eq("customer_chat_id", chat_id).execute()
+        ).eq("customer_chat_id", chat_id).execute())
     except Exception:
         logger.exception("Failed to clear paused message after owner reply for %s", chat_id)
-    if message_id is None:
-        return
-    _suppressed_auto_reply_keys.add((chat_id, message_id))
-    pending = _pending_customer_text_batches.get(chat_id)
-    if pending and any(part.get("message_id") == message_id for part in pending.get("parts", [])):
-        cancel_pending_customer_text_batch(chat_id)
-    pending_greeting = _pending_initial_greetings.get(chat_id)
-    if pending_greeting and pending_greeting.get("message_id") == message_id:
-        _pending_initial_greetings.pop(chat_id, None)
-        task = pending_greeting.get("task")
-        if task and not task.done():
-            task.cancel()
 
 
 def get_latest_archived_customer_text(chat_id: int) -> str:
@@ -11448,11 +11476,11 @@ async def send_owner_conversation_shortcut(
     if shortcut == "س":
         greeting = infer_greeting_category(
             customer_text if customer_text is not None
-            else get_latest_customer_text_for_owner_shortcut(chat_id)
+            else (await run_io(lambda: get_latest_customer_text_for_owner_shortcut(chat_id)))
         )
         reply = "وعليكم السلام ورحمة الله وبركاته" if greeting == "سلام" else "أهلاً وسهلاً"
     elif shortcut == "ع":
-        reply = contextual_thanks_reply(has_fulfilled_service_context(chat_id))
+        reply = contextual_thanks_reply((await run_io(lambda: has_fulfilled_service_context(chat_id))))
     else:
         return False
     try:
@@ -11502,20 +11530,20 @@ async def _deliver_customer_text_batch(
             _pending_customer_text_batches.pop(chat_id, None)
             bm = update.business_message or update.edited_business_message
             if bm:
-                archive_message(
+                (await run_io(lambda: archive_message(
                     chat_id,
                     bm.chat.full_name or bm.chat.first_name or "غير معروف",
                     bm.chat.username,
                     sender_type="customer",
                     message_text=combined_text,
-                )
+                )))
             return
         _pending_customer_text_batches.pop(chat_id, None)
         ready_key = (chat_id, message_id)
         _ready_customer_texts[ready_key] = combined_text
         if greeting_only:
             _delayed_greeting_delivery_keys.add(ready_key)
-        await on_business_message(update, context)
+        await dispatch_deferred_reply(update,context,on_business_message(update,context))
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -11580,22 +11608,23 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     is_from_owner = sender_id == OWNER_USER_ID
     chat_id = bm.chat.id
     ready_key = (chat_id, bm.message_id)
+    owner_reply_target = _owner_arrival_reply_targets.pop(ready_key,None)
     ready_customer_text = _ready_customer_texts.pop(ready_key, None)
     was_delayed_greeting = ready_key in _delayed_greeting_delivery_keys
     _delayed_greeting_delivery_keys.discard(ready_key)
 
     # سجل دائم للمستخدم من أول تعامل، مستقل عن أرشيف الرسائل.
     if not is_from_owner:
-        upsert_customer_contact(
+        (await run_io(lambda: upsert_customer_contact(
             platform="telegram",
             external_id=str(chat_id),
             display_name=bm.chat.full_name or bm.chat.first_name or "غير معروف",
             username=bm.chat.username,
             chat_id=chat_id,
             business_connection_id=bm.business_connection_id,
-        )
+        )))
         if ready_customer_text is None:
-            _latest_customer_message_ids[chat_id] = bm.message_id
+            _latest_customer_message_ids[chat_id] = max(bm.message_id,_latest_customer_message_ids.get(chat_id,0))
 
     # حماية محادثة متفق عليها: لا تمرر النص للذكاء الاصطناعي ولا تحفظه في
     # الأرشيف. نحذف فقط من المحادثة المحددة في Render، سواء كانت الرسالة
@@ -11626,7 +11655,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # اختيار الإجراء. إصدار الكود يبقى محمياً بالربط والاشتراك والعداد.
     if bm.photo and not is_from_owner:
         cancel_pending_customer_text_batch(chat_id)
-        remember_latest_customer_business_photo(bm)
+        (await run_io(lambda: remember_latest_customer_business_photo(bm)))
         photo_key = (chat_id, bm.message_id, False)
         if photo_key in _processed_business_photo_keys:
             logger.info("Ignoring duplicate business photo update: %s", photo_key)
@@ -11674,8 +11703,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_from_owner and ready_customer_text is None:
         # إيقاف يدوي عام: نستقبل النص ونحفظه، لكن لا نحلله ولا نرد عليه.
         # الصور تبقى قبل هذا الموضع حتى لا تضيع مراجعة إثباتات الدفع.
-        if get_auto_reply_paused():
-            hold_customer_message_while_paused(bm, text)
+        if (await run_io(lambda: get_auto_reply_paused())):
+            (await run_io(lambda: hold_customer_message_while_paused(bm, text)))
             return
         # وقت التوقف يحجب جميع الردود، حتى طلب الكود السريع.
         if seconds_until_customer_replies_allowed():
@@ -11695,9 +11724,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # بطلب تغيير واضح، أو بعد كودين ثم شكوى من الكود. وإذا رد الزبون على
     # رسالة فيها إيميل حساب وقال «أريد أسجل هذا» نختاره مباشرة.
     if not is_from_owner:
-        totp_accounts = get_customer_totp_accounts(chat_id)
+        totp_accounts = (await run_io(lambda: get_customer_totp_accounts(chat_id)))
         if len(totp_accounts) > 1:
-            replied_account_id = replied_totp_account_id(chat_id, bm)
+            replied_account_id = (await run_io(lambda: replied_totp_account_id(chat_id, bm)))
             normalized_account_text = normalize_arabic_text(text)
             points_to_replied_account = bool(replied_account_id) and any(
                 phrase in normalized_account_text
@@ -11705,10 +11734,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             should_rechoose_account = (
                 is_totp_account_change_request(text)
-                or is_totp_code_failure_after_retries(chat_id, text)
+                or (await run_io(lambda: is_totp_code_failure_after_retries(chat_id, text)))
             )
             if points_to_replied_account:
-                remember_selected_totp_account(chat_id, str(replied_account_id))
+                (await run_io(lambda: remember_selected_totp_account(chat_id, str(replied_account_id))))
                 await human_like_code_reply_sequence(
                     context, chat_id, bm.business_connection_id, bm.message_id
                 )
@@ -11721,17 +11750,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         chat_id=chat_id,
                         text=code,
                     )
-                    archive_message(
+                    (await run_io(lambda: archive_message(
                         chat_id, customer_name, customer_username,
                         sender_type="customer", message_text=text,
-                    )
-                    archive_message(
+                    )))
+                    (await run_io(lambda: archive_message(
                         chat_id, customer_name, customer_username,
                         sender_type="bot", message_text=code,
-                    )
+                    )))
                 return
             if should_rechoose_account:
-                picker = build_totp_account_picker(chat_id)
+                picker = (await run_io(lambda: build_totp_account_picker(chat_id)))
                 if picker is not None:
                     await human_like_reply_sequence(
                         context, chat_id, bm.business_connection_id, bm.message_id
@@ -11742,19 +11771,19 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         text="أي حساب تريد تسجل؟",
                         reply_markup=picker,
                     )
-                    archive_message(
+                    (await run_io(lambda: archive_message(
                         chat_id, customer_name, customer_username,
                         sender_type="customer", message_text=text,
-                    )
+                    )))
                 return
 
     # إذا بدأت مشكلة ضمن الجلسة الحالية، كل المتابعات تبقى بلا رد تلقائي
     # حتى تمر 30 دقيقة سكوت. نؤرشفها وننبه الأونر حتى يكمل هو الحوار.
-    if not is_from_owner and is_live_support_context_active(chat_id):
-        archive_message(
+    if not is_from_owner and (await run_io(lambda: is_live_support_context_active(chat_id))):
+        (await run_io(lambda: archive_message(
             chat_id, customer_name, customer_username,
             sender_type="customer", message_text=text,
-        )
+        )))
         await notify_owner(
             context,
             chat_id,
@@ -11766,17 +11795,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not is_from_owner and await handle_feedback_followup(context, bm, text):
-        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
         return
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
     if is_from_owner:
         shortcut = text.strip()
         shortcut_customer_text = (
-            get_latest_customer_text_for_owner_shortcut(chat_id)
+            (await run_io(lambda: get_latest_customer_text_for_owner_shortcut(chat_id)))
             if shortcut in {"س", "ع"} else None
         )
-        mark_owner_took_over_customer_chat(chat_id)
+        await mark_owner_took_over_customer_chat(chat_id,owner_reply_target)
         # اختصارات يدوية س/ع: تتعرف على آخر رسالة زبون بلا حاجة للرد عليها.
         if shortcut in {"س", "ع"}:
             await send_owner_conversation_shortcut(
@@ -11793,7 +11822,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # اختصار المالك: «دفع» أو «طرق الدفع» وحدها تستبدل برسالة فيها
         # الطرق المفعلة حالياً من لوحة التحكم، فلا يحتاج ينسخها كل مرة.
         if is_owner_payment_shortcut(text):
-            payment_text = format_customer_payment_methods(get_payment_methods())
+            payment_text = format_customer_payment_methods((await run_io(lambda: get_payment_methods())))
             if not payment_text:
                 await context.bot.send_message(
                     chat_id=OWNER_USER_ID,
@@ -11827,7 +11856,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # «حسابات» يعرض للأونر حسابات هذا الزبون ليختار مصدر الكود
         # يدوياً. القائمة نفسها تُحذف بعد الاختيار.
         if text.strip() in {"حسابات", "الحسابات"}:
-            picker = build_totp_account_picker(chat_id, owner=True)
+            picker = (await run_io(lambda: build_totp_account_picker(chat_id, owner=True)))
             if picker is None:
                 await context.bot.send_message(
                     chat_id=OWNER_USER_ID,
@@ -11864,7 +11893,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             except Exception:
                 logger.warning("Could not delete owner code shortcut for %s", chat_id)
-            linked_account = get_secret_for_chat(chat_id)
+            linked_account = (await run_io(lambda: get_secret_for_chat(chat_id)))
             if linked_account is None:
                 await context.bot.send_message(
                     chat_id=OWNER_USER_ID,
@@ -11893,10 +11922,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         # اختصارات المنتجات: «ج» يختار ChatGPT، وأي منتج آخر يحتاج اسمه
         # أو أحد أسمائه البديلة كاملاً كما هو مسجل في مركز التحكم.
-        product = find_owner_catalog_shortcut(text, get_catalog_products())
+        product = find_owner_catalog_shortcut(text, (await run_io(lambda: get_catalog_products())))
         if product:
             product_reply = format_customer_catalog_reply(
-                product, get_catalog_plans(str(product["id"]))
+                product, (await run_io(lambda: get_catalog_plans(str(product["id"]))))
             )
             if not product_reply:
                 await context.bot.send_message(
@@ -11929,10 +11958,10 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not handled:
             # ردود الأونر الحقيقية هي أهم مصدر للتعلم. الأوامر لا نؤرشفها
             # حتى لا تتحول إلى أمثلة أسلوب أو تدخل بسياق الزبون.
-            archive_message(
+            (await run_io(lambda: archive_message(
                 chat_id, customer_name, customer_username,
                 sender_type="owner", message_text=text,
-            )
+            )))
         return
 
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
@@ -11968,7 +11997,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # «السلام عليكم، أريد جات» لا تستحق رد سلام إذا كانت باقات جات كلها
     # موقوفة (أو المنتج نفسه متوقف). لا نريد أن تبدو التحية كأن البوت قبل
     # الطلب؛ نترك المحادثة كاملة للأونر في هذه الحالة.
-    if is_greeting_with_only_unavailable_catalog_request(categories):
+    if (await run_io(lambda: is_greeting_with_only_unavailable_catalog_request(categories))):
         categories = []
     # نحافظ على تحية واحدة قبل الطلب الحقيقي؛ الشكر العرضي وحده يُحذف.
     # رد السلام واجب ولا يجوز أن تسقطه أولوية المنتج.
@@ -11997,7 +12026,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if category == "طلب_كود":
             # طلب كود — الشرط الأساسي يضل الربط المسبق بـ /link، وبعده
             # عداد المحاولات (process_code_request) يقرر شنو الرد بالضبط
-            reply_text, stopped = process_code_request(chat_id)
+            reply_text, stopped = (await run_io(lambda: process_code_request(chat_id)))
             if reply_text:
                 replies_to_send.append(reply_text)
             if stopped:
@@ -12006,18 +12035,18 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         product_id = catalog_product_id(category)
         if product_id:
-            product = get_catalog_product(product_id)
+            product = (await run_io(lambda: get_catalog_product(product_id)))
             if not product or not product.get("is_active"):
                 continue
             reply_text = format_customer_catalog_reply(
                 product,
-                get_catalog_plans(product_id),
+                (await run_io(lambda: get_catalog_plans(product_id))),
             )
             if not reply_text:
                 continue
-            if not is_edited_message and not should_send_faq_reply(
+            if not is_edited_message and not (await run_io(lambda: should_send_faq_reply(
                 chat_id, category, reply_text
-            ):
+            ))):
                 continue
             replies_to_send.append(reply_text)
             continue
@@ -12027,7 +12056,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # يجب أن يشغّل رد Canva حتى لو كانت المحاولة الأولى قبل دقائق.
         if category == "شكر":
             reply_text = contextual_thanks_reply(
-                has_fulfilled_service_context(chat_id)
+                (await run_io(lambda: has_fulfilled_service_context(chat_id)))
             )
         else:
             reply_text = get_reply_for_category(category)
@@ -12036,7 +12065,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # طلبات الدفع مباشرة وحساسة للسياق؛ لا نمنع تكرارها إذا كتب الزبون
         # «ممكن الماستر؟» أو سأل عن طريقة دفع ثانية بعد رد سابق.
         repeatable_category = category in {"سلام", "ترحيب", "طرق_الدفع", "دفع_رصيد"}
-        if not is_edited_message and not repeatable_category and not should_send_faq_reply(chat_id, category, reply_text):
+        if not is_edited_message and not repeatable_category and not (await run_io(lambda: should_send_faq_reply(chat_id, category, reply_text))):
             continue
         if reply_text:
             replies_to_send.append(reply_text)
@@ -12078,7 +12107,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to send stopped-retry notification to owner")
 
     if not replies_to_send:
-        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
         return
 
     has_code_reply = any(reply.startswith(CODE_REPLY_MARKER) for reply in replies_to_send)
@@ -12094,7 +12123,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     # الكود مستثنى لأنه يطلع خلال ثانية؛ بقية الردود تتوقف إذا سبقك الأونر.
     if not has_code_reply and (chat_id, bm.message_id) in _suppressed_auto_reply_keys:
-        archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
+        (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
         return
     outgoing_replies = replies_to_send if (has_code_reply or has_account_picker) else (
         ["\n\n".join(replies_to_send)]
@@ -12111,7 +12140,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 continue
         elif reply_text == CODE_ACCOUNT_PICKER_MARKER:
             reply_text = "أي حساب تريد تسجل؟"
-            reply_markup = build_totp_account_picker(chat_id)
+            reply_markup = (await run_io(lambda: build_totp_account_picker(chat_id)))
             if reply_markup is None:
                 continue
         await context.bot.send_message(
@@ -12125,8 +12154,8 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     logger.info(f"Sent {len(sent_replies)} reply(ies) to chat_id={chat_id}")
     combined_reply = "\n---\n".join(sent_replies)
-    archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)
-    archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=combined_reply)
+    (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
+    (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="bot", message_text=combined_reply)))
     await notify_owner(context, chat_id, customer_name, customer_username, text, combined_reply)
 
 
@@ -12454,7 +12483,7 @@ def start_health_server() -> None:
 
 async def on_bot_initialized(app: Application) -> None:
     """يشغّل إصلاح الجدولات القديمة فور إقلاع الخدمة، لا بعد انتظار الـJobQueue."""
-    payment_sheet = get_google_sheet()
+    payment_sheet = (await run_io(lambda: get_google_sheet()))
     if payment_sheet is None:
         await app.bot.send_message(
             chat_id=OWNER_USER_ID,
@@ -12513,7 +12542,12 @@ def main() -> None:
     ))
     start_health_server()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(on_bot_initialized).build()
+    app = (Application.builder().token(BOT_TOKEN)
+           .concurrent_updates(customer_first_processor(
+               OWNER_USER_ID,code_request=lambda text: "طلب_كود" in keyword_match_categories(text),
+               before_update=observe_business_update_arrival))
+           .post_stop(drain_customer_updates)
+           .post_init(on_bot_initialized).build())
 
     # يفحص كل 15 دقيقة؛ لذلك التنبيه يصل خلال ربع ساعة كحد أقصى من النهاية.
     if app.job_queue is None:

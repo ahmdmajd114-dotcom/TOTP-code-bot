@@ -1,4 +1,5 @@
 """Owner statistics UI. Frozen snapshots, reusable filters and read-only drilldown."""
+from runtime_scheduler import run_io, background_job
 from pathlib import Path
 import logging
 import re
@@ -50,17 +51,18 @@ def session(context):
     return s
 
 
+@background_job
 async def open_statistics(message, context, *, page='home', period=None):
     from finance_ui import suspend_finance_inputs
     from debt_manager import cancel_debt_input
     cancel_debt_input(context)
     for key in ('pending_catalog_input','pending_payment_input','pending_shared_account','campaign_draft','pending_manual_subscription','pending_personal_reminder'):
         context.user_data.pop(key,None)
-    suspend_finance_inputs()
+    (await run_io(lambda: suspend_finance_inputs()))
     context.user_data.pop('finance_report_input',None)
     context.user_data.pop('statistics_input',None)
     try:
-        snapshot=read_snapshot()  # Replace the session only after a complete read.
+        snapshot=(await run_io(lambda: read_snapshot()))  # Replace the session only after a complete read.
     except FinanceError as exc:
         await message.reply_text(f'⚠️ {exc}',reply_markup=buttons([[('إعادة القراءة','open'),('ملف إضافة الإحصائيات','sql')]]))
         return False
@@ -198,6 +200,7 @@ async def render(message,context,view='home'):
     await message.reply_text(text,reply_markup=buttons(rows,back))
 
 
+@background_job
 async def handle_statistics_callback(update,context):
     q=update.callback_query
     if q.from_user.id!=services().owner_id:
@@ -214,7 +217,8 @@ async def handle_statistics_callback(update,context):
         if data.startswith('event:'):s['event_back']=s.get('view','metrics')
         if data=='export':
             from statistics_export import export_report
-            await context.bot.send_document(chat_id=services().owner_id,document=export_report(build_report(s['snapshot'],s['filters'])),caption='نفس القراءة والفلاتر. بيانات CSV تشمل جميع النتائج دون قص؛ البداية التاريخية المجهولة موضحة.')
+            document=await run_io(lambda: export_report(build_report(s['snapshot'],s['filters'])))
+            await context.bot.send_document(chat_id=services().owner_id,document=document,caption='نفس القراءة والفلاتر. بيانات CSV تشمل جميع النتائج دون قص؛ البداية التاريخية المجهولة موضحة.')
             return
         if data in {'custom','customer'}:
             context.user_data['statistics_input']=data

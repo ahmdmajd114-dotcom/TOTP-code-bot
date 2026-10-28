@@ -5,11 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 import logging
+import asyncio
+from weakref import WeakSet
+from runtime_scheduler import run_io, background_job
 
 from financial_ledger import FinanceError, KINDS, ledger, now_iso, operation_id
 
 logger = logging.getLogger(__name__)
 _services = None
+_worker_loops = WeakSet()
 
 
 @dataclass
@@ -86,7 +90,7 @@ def card_rows(state, rows):
 
 async def display(context, state, text, rows, query=None):
     state['revision'] += 1
-    ledger().save_draft(state)
+    (await run_io(lambda: ledger().save_draft(state)))
     markup = card_rows(state, rows)
     if state.get('photo') and len(text)>1000:
         # Telegram photo captions have a lower limit than normal messages.
@@ -96,7 +100,7 @@ async def display(context, state, text, rows, query=None):
         state['photo']=False
         sent=await context.bot.send_message(chat_id=_services.owner_id,text=text[:4000],reply_markup=markup)
         state['message_id']=sent.message_id
-        ledger().save_draft(state)
+        (await run_io(lambda: ledger().save_draft(state)))
         return
     if query and getattr(query.message,'message_id',state.get('message_id'))!=state.get('message_id'):
         query=None
@@ -112,7 +116,7 @@ async def display(context, state, text, rows, query=None):
     else:
         sent = await context.bot.send_message(chat_id=_services.owner_id, text=text, reply_markup=markup)
         state['message_id'] = sent.message_id
-        ledger().save_draft(state)
+        (await run_io(lambda: ledger().save_draft(state)))
 
 
 def customer_text(state):
@@ -137,9 +141,15 @@ async def handle_finance_callback(update, context):
         return
     try:
         prefix, key, revision, action = query.data.split(':', 3)
-        state = ledger().draft(key)
-        await query.answer()
-        saved = ledger().operation(state['operation_id'])
+        # A late Telegram acknowledgement must never discard a valid payment.
+        try:
+            await query.answer()
+        except Exception:
+            logger.warning('Financial callback acknowledgement expired; continuing safely')
+        state = (await run_io(lambda: ledger().draft(key)))
+        saved = None
+        if action=='commit' or state.get('prepared_payload') or state.get('committed'):
+            saved = await run_io(lambda: ledger().operation(state['operation_id']))
         if saved:
             state['committed'] = True
         if state.get('committed'):
@@ -147,13 +157,13 @@ async def handle_finance_callback(update, context):
             return
         if action == 'cancel':
             state['closed'], state['awaiting'] = True, False
-            ledger().save_draft(state)
+            (await run_io(lambda: ledger().save_draft(state)))
             markup=menu_keyboard([])
             await query.edit_message_caption(caption='تم الإلغاء قبل التثبيت.', reply_markup=markup) if state.get('photo') else await query.edit_message_text('تم الإلغاء قبل التثبيت.', reply_markup=markup)
             return
         if state.get('closed'):
             raise FinanceError('هذه البطاقة ملغاة. افتح عملية جديدة.')
-        suspend_finance_inputs(state['draft_id'])
+        (await run_io(lambda: suspend_finance_inputs(state['draft_id'])))
         from income_manager import handle_income_action, render_income
         from expense_manager import handle_expense_action, render_expense
         from vault_manager import handle_vault_action, render_vault
@@ -162,7 +172,7 @@ async def handle_finance_callback(update, context):
             if action == 'back':
                 if not state.get('history'):
                     state['awaiting']=False
-                    ledger().save_draft(state)
+                    (await run_io(lambda: ledger().save_draft(state)))
                     if state.get('return_to'):
                         from reports_manager import handle_report_menu
                         await handle_report_menu(state['return_to'],query,context)
@@ -187,11 +197,11 @@ async def handle_finance_input(update, context):
     if not message or not message.text or not update.effective_user or update.effective_user.id != _services.owner_id:
         return False
     try:
-        if not ledger().active():
+        if not (await run_io(lambda: ledger().active())):
             return False
         # A reply selects that card exactly. Otherwise only one waiting draft
         # may consume input, including after a process restart.
-        rows = ledger().client.table('finance_drafts').select('state').eq('owner_id', _services.owner_id).contains('state', {'awaiting': True}).order('updated_at', desc=True).limit(30).execute().data or []
+        rows = (await run_io(lambda: ledger().client.table('finance_drafts').select('state').eq('owner_id', _services.owner_id).contains('state', {'awaiting': True}).order('updated_at', desc=True).limit(30).execute())).data or []
         candidates = [r['state'] for r in rows if not r['state'].get('closed') and not r['state'].get('committed')]
         if message.reply_to_message:
             candidates = [s for s in candidates if s.get('message_id') == message.reply_to_message.message_id]
@@ -205,7 +215,7 @@ async def handle_finance_input(update, context):
         from expense_manager import expense_input, render_expense
         from vault_manager import vault_input, render_vault
         handler, render = {'income': (income_input, render_income), 'expense': (expense_input, render_expense), 'vault': (vault_input, render_vault)}[state['flow']]
-        handler(state, message.text)
+        await run_io(handler,state,message.text)
         state['awaiting'] = False
         await render(state, context)
         return True
@@ -219,70 +229,78 @@ async def handle_finance_input(update, context):
 
 
 async def commit_card(state, payload, context, query):
-    validate_card_wallets(payload)
+    (await run_io(lambda: validate_card_wallets(payload)))
     if state.get('correction_of'):
         payload['correction_of'] = state['correction_of']
     # Save the final immutable request before submitting it. Lost responses and
     # restarts then retry the exact same ID/date/amount, never a new operation.
     state['operation_id']=payload['id']
     state['prepared_payload']=payload
-    ledger().save_draft(state)
-    ledger().post(payload, correction=state.get('correction_of'))
+    (await run_io(lambda: ledger().save_draft(state)))
+    (await run_io(lambda: ledger().post(payload, correction=state.get('correction_of'))))
     state['committed'], state['awaiting'] = True, False
-    ledger().save_draft(state)
-    pending = False
-    job=None
     try:
-        job=ledger().claim_outbox(payload['id'])
-        if job:
-            await _services.project(job['payload'])
-            ledger().ack_outbox(job)
-        else:
-            pending=True
-    except Exception:
-        logger.exception('Immediate financial projection pending')
-        if job:
-            try:ledger().ack_outbox(job,'projection unavailable')
-            except FinanceError:pass
-        pending = True
-    message = f"✅ تم حفظ العملية كاملة.\nرقم العملية: {payload['id']}"
-    if pending:
-        message += '\nمزامنة الشيت والمتابعة بالانتظار؛ النظام يعيدها تلقائياً.'
+        await run_io(lambda: ledger().save_draft(state))
+    except FinanceError:
+        # The atomic operation + outbox succeeded. Its ID is authoritative even
+        # if the optional draft's status cannot be refreshed.
+        logger.exception('Committed finance operation; draft status refresh pending')
+    # finance_post creates the durable outbox in the same transaction. The
+    # periodic worker owns Sheets/subscription retries; confirmation never waits
+    # on Google. A restart between here and the worker loses no queued work.
+    message = (f"✅ تم حفظ العملية المالية.\nرقم العملية: {payload['id']}"
+               '\nمزامنة الشيت والمتابعة بالطابور وتكتمل بالخلفية.')
     rows=[[('تفاصيل العملية','finance_view_'+payload['id'])]]
     if payload['kind']!='reversal':rows.append([('↩️ التراجع عن العملية','finance_reverse_'+payload['id'])])
     markup=menu_keyboard(rows)
     if state.get('photo'):
-        await query.edit_message_caption(caption=message, reply_markup=markup)
+        try:
+            await query.edit_message_caption(caption=message, reply_markup=markup)
+        except Exception:
+            await query.message.reply_text(message,reply_markup=markup)
     else:
-        await query.edit_message_text(message, reply_markup=markup)
+        try:
+            await query.edit_message_text(message, reply_markup=markup)
+        except Exception:
+            await query.message.reply_text(message,reply_markup=markup)
+    application=getattr(context,'application',None)
+    if application is not None and application.running:
+        application.create_task(finance_worker(context))
     try:
         await _services.notify(context, payload)
     except Exception:
         logger.exception('Financial notification failed after commit')
 
 
+@background_job
 async def finance_worker(context):
+    loop=asyncio.get_running_loop()
+    if loop in _worker_loops:
+        return
+    _worker_loops.add(loop)
     try:
-        if not ledger().active():
+        if not (await run_io(lambda: ledger().active())):
             return
-        job = ledger().claim_outbox()
+        job = (await run_io(lambda: ledger().claim_outbox()))
         if not job:
             return
         try:
             await _services.project(job['payload'])
         except Exception as exc:
             logger.exception('Financial projection retry queued: %s', job['id'])
-            ledger().ack_outbox(job, str(type(exc).__name__))
+            (await run_io(lambda: ledger().ack_outbox(job, str(type(exc).__name__))))
         else:
-            ledger().ack_outbox(job)
+            (await run_io(lambda: ledger().ack_outbox(job)))
     except FinanceError:
         logger.warning('Financial worker unavailable; no money fallback performed')
+    finally:
+        _worker_loops.discard(loop)
 
 
 async def show_finance(message):
     try:
-        mode = ledger().mode(refresh=True)
-        if mode=='active':suspend_finance_inputs()
+        mode = (await run_io(lambda: ledger().mode(refresh=True)))
+        if mode=='active':(await run_io(lambda: suspend_finance_inputs()))
         if mode != 'active':
             text = ('المالية الجديدة جاهزة للتهيئة. بعد قراءة البيانات يعرض البوت أرقام البداية قبل اعتمادها.\n'
                     'يلزم تشغيل ملف supabase_financial_ledger.sql مرة واحدة إذا لم تُثبّت الجداول.')
@@ -292,7 +310,7 @@ async def show_finance(message):
                 rows += [[('✅ اعتماد أرقام البداية', 'finance_activate')], [('إلغاء التهيئة', 'finance_setup_cancel')]]
         else:
             from reports_manager import financial_report
-            text = financial_report('today')
+            text = (await run_io(lambda: financial_report('today')))
             rows = [[('💵 قبض', 'finance_income'), ('💸 مصروف', 'finance_expense')],
                     [('💳 الديون والأرصدة', 'finance_customers'), ('📊 التقارير', 'finance_reports')],
                     [('🏦 الخزن والتحويل', 'finance_vaults'), ('📋 سجل العمليات', 'finance_records')],
@@ -318,12 +336,12 @@ async def handle_finance_menu(update, context):
             with Path(__file__).with_name('supabase_financial_ledger.sql').open('rb') as document:
                 await context.bot.send_document(chat_id=_services.owner_id, document=document, caption='شغّل الملف مرة واحدة في SQL Editor بمشروع Supabase نفسه، ثم اضغط تهيئة ومراجعة.')
         elif data == 'finance_setup':
-            ledger().setup('begin')
+            (await run_io(lambda: ledger().setup('begin')))
             try:
-                snapshot = _services.legacy_snapshot()
-                ledger().setup('stage', snapshot)
+                snapshot = (await run_io(lambda: _services.legacy_snapshot()))
+                (await run_io(lambda: ledger().setup('stage', snapshot)))
             except Exception:
-                ledger().setup('cancel')
+                (await run_io(lambda: ledger().setup('cancel')))
                 raise
             accounts = '\n'.join(f"{a['key'].replace('wallet:', '')}: {a['balance']:,}" for a in snapshot['accounts'] if a['key'].startswith('wallet:'))
             text = (f"مراجعة البداية\nحركات قديمة: {len(snapshot['operations'])}\nديون مفتوحة: {sum(d['remaining']>0 for d in snapshot['debts'])}\n{accounts}\n\n"
@@ -334,10 +352,10 @@ async def handle_finance_menu(update, context):
             text += '\n\nالمالية متوقفة حتى تعتمد هذه الأرقام أو تلغي التهيئة.'
             await query.edit_message_text(text[:4000], reply_markup=menu_keyboard([[('✅ اعتماد أرقام البداية', 'finance_activate')], [('إلغاء والعودة للنظام السابق', 'finance_setup_cancel')]]))
         elif data == 'finance_activate':
-            ledger().setup('activate')
+            (await run_io(lambda: ledger().setup('activate')))
             await show_finance(query.message)
         elif data == 'finance_setup_cancel':
-            ledger().setup('cancel')
+            (await run_io(lambda: ledger().setup('cancel')))
             await query.edit_message_text('أُلغيت التهيئة؛ البيانات القديمة بقيت كما هي.',reply_markup=menu_keyboard([]))
         elif data == 'finance_income':
             from debt_manager import cancel_debt_input
@@ -360,7 +378,7 @@ async def handle_finance_menu(update, context):
             from customer_balance_manager import start_credit_adjustment
             await start_credit_adjustment(context,int(data[len('finance_credit_'):]))
         elif data.startswith('finance_draft_'):
-            state=ledger().draft(data[len('finance_draft_'):])
+            state=(await run_io(lambda: ledger().draft(data[len('finance_draft_'):])))
             from income_manager import render_income
             from expense_manager import render_expense
             from vault_manager import render_vault

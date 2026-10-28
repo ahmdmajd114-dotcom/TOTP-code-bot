@@ -1,5 +1,6 @@
 """Small adapters between existing store flows and the financial feature modules."""
 from __future__ import annotations
+from runtime_scheduler import run_io, background_job
 from dataclasses import dataclass
 from datetime import datetime,timezone
 from typing import Callable
@@ -112,7 +113,7 @@ async def intercept_payment(update,context,state):
     if not configured():return False
     query=update.callback_query
     try:
-        if not active():return False
+        if not (await run_io(lambda: active())):return False
         from debt_manager import cancel_debt_input
         cancel_debt_input(context)
         context.user_data.pop('statistics_input',None)
@@ -123,7 +124,7 @@ async def intercept_payment(update,context,state):
         # never committed via the old wallet-increment path.
         await query.answer()
         if state.get('finance_draft_id'):
-            s=ledger().draft(state['finance_draft_id'])
+            s=(await run_io(lambda: ledger().draft(state['finance_draft_id'])))
             await render_income(s,context,query)
             return True
         s=await start_income(context,customer_id=state.get('customer_chat_id'),customer_name=state.get('customer_name'),photo_message=query.message)
@@ -131,7 +132,7 @@ async def intercept_payment(update,context,state):
         if state.get('product'):
             s.update(product=state['product'],sales=state.get('plan_price') or sum(a for _,a in state.get('payments',[])),
                 payments=[{'wallet':w,'amount':a} for w,a in state.get('payments',[])],step='summary')
-        ledger().save_draft(s)
+        (await run_io(lambda: ledger().save_draft(s)))
         state['finance_draft_id']=s['draft_id']
         await render_income(s,context,query)
         return True
@@ -143,12 +144,12 @@ async def intercept_expense_photo(update,context,pending):
     if not configured():return False
     query=update.callback_query
     try:
-        if not active():return False
+        if not (await run_io(lambda: active())):return False
         from expense_manager import start_expense
         await query.answer()
         if query.data=='expphoto_no':await query.message.delete()
         elif query.data=='expphoto_refund':
-            cid=pending.get('customer_chat_id');rows=[r for r in ledger().operations(cid) if r['kind']=='sale' and not r['historical']]
+            cid=pending.get('customer_chat_id');rows=(await run_io(lambda: [r for r in ledger().operations(cid) if r['kind']=='sale' and not r['historical']]))
             await query.edit_message_caption(caption='اختَر عملية البيع الأصلية حتى يرتبط الاسترجاع بها:',reply_markup=keyboard([[((r.get('product') or 'بيع')+' — '+str(r['sales']),'finance_refund_'+r['id'])] for r in rows[-15:]]))
         else:
             s=await start_expense(context,customer_id=pending.get('customer_chat_id'),photo_message=query.message)
@@ -166,7 +167,7 @@ async def financial_shortcut(context,bm,chat_id,text,customer_name=None):
         await context.bot.delete_business_messages(business_connection_id=bm.business_connection_id,message_ids=[bm.message_id])
     except Exception:logger.warning('Cannot delete financial shortcut for %s',chat_id)
     try:
-        ledger().require_active()
+        (await run_io(lambda: ledger().require_active()))
         from debt_manager import cancel_debt_input
         cancel_debt_input(context)
         context.user_data.pop('statistics_input',None)
@@ -192,20 +193,20 @@ async def finance_owner_input(update,context):
         if text.startswith(('قبض ','مصروف ')):
             context.user_data.pop('statistics_input',None)
             context.user_data.pop('finance_report_input',None)
-        if ledger().mode()!='active':
+        if (await run_io(lambda: ledger().mode()))!='active':
             if not text.startswith(('قبض ','مصروف ')):return False
-            ledger().require_active()
+            (await run_io(lambda: ledger().require_active()))
         from statistics_manager import statistics_input
         if await statistics_input(update,context):return True
         from reports_manager import report_input
         if await report_input(update,context):return True
         if await handle_finance_input(update,context):return True
         if not text.startswith(('قبض ','مصروف ')):return False
-        ledger().require_active()
+        (await run_io(lambda: ledger().require_active()))
         # Deterministic parsing only. A nonunique product or wallet asks for
         # explicit selection instead of silently guessing a financial amount.
         prefix,body=text.split(' ',1)
-        wallets=[w for w in financial_wallet_names() if body.endswith(' '+w)]
+        wallets=(await run_io(lambda: [w for w in financial_wallet_names() if body.endswith(' '+w)]))
         if len(wallets)!=1:raise FinanceError('اكتب اسم المحفظة بنهاية النص، مثل: مصروف سكريبت 15 ألف ماستر.')
         wallet=wallets[0];body=body[:-len(wallet)].strip()
         match=re.fullmatch(r'(.+?)\s+([\d٠-٩۰-۹][\d٠-٩۰-۹,.٬٫]*(?:\s+(?:ألف|الف|آلاف|مليون))?)',body)

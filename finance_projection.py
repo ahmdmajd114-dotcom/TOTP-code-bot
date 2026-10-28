@@ -9,12 +9,14 @@ from dataclasses import dataclass
 from datetime import datetime,timezone
 from threading import RLock
 import asyncio
+from weakref import WeakKeyDictionary
 from typing import Callable
 from financial_ledger import ledger,FinanceError,KINDS
+from runtime_scheduler import run_io
 
 _services=None
 _lock=RLock()
-_async_lock=asyncio.Lock()
+_async_locks=WeakKeyDictionary()
 
 
 @dataclass
@@ -91,11 +93,16 @@ def mirror_debts(payload):
 
 
 async def project_operation(payload):
-    async with _async_lock:
-        await _project_operation(payload)
+    loop=asyncio.get_running_loop()
+    async with _async_locks.setdefault(loop,asyncio.Lock()):
+        await run_io(_project_sheets,payload)
+        if payload.get('subscription') and not payload.get('correction_of'):
+            await _services.subscription(payload)
+        if payload.get('instagram_sale') or payload.get('instagram_commission'):
+            await run_io(_services.instagram,payload)
 
 
-async def _project_operation(payload):
+def _project_sheets(payload):
     oid=payload['id'];kind=payload['kind'];payments=payload.get('payments',[])
     stamp=payload['occurred_at'];total=sum(p['amount'] for p in payments)
     payment_text=' + '.join(f"{p['wallet']} {p['amount']}" for p in payments)
@@ -128,7 +135,3 @@ async def _project_operation(payload):
     cid=payload.get('customer_id') or record.get('customer_id')
     if cid is not None:upsert_row(credit_sheet,[str(cid),accounts.get('credit:'+str(cid),0)],0,replace=True)
     mirror_debts(payload)
-    if payload.get('subscription') and not payload.get('correction_of'):
-        await _services.subscription(payload)
-    if payload.get('instagram_sale') or payload.get('instagram_commission'):
-        _services.instagram(payload)
