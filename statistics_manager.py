@@ -86,9 +86,9 @@ def pager(rows,page,action):
 
 
 async def render(message,context,view='home'):
-    s=session(context);r=build_report(s['snapshot'],s['filters']);context.user_data['statistics_filters']=dict(s['filters'])
+    s=session(context);r=await run_io(build_report,s['snapshot'],s['filters']);context.user_data['statistics_filters']=dict(s['filters'])
     s['view']=view
-    op=operational_report(s['snapshot'],r['as_of']);t=r['totals'];rows=[];back='home'
+    op=await run_io(operational_report,s['snapshot'],r['as_of']);t=r['totals'];rows=[];back='home'
     parts=view.split(':');action=parts[0];page=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 0
     if action=='home':
         text=summary_text(r)
@@ -110,7 +110,7 @@ async def render(message,context,view='home'):
         dimension='products' if 'product' in action else 'plans' if 'plan' in action else 'sources'
         if action.startswith('filter'):
             f=dict(s['filters']);f.pop('product' if dimension=='products' else 'plan',None)
-            groups=build_report(s['snapshot'],f)[dimension];back='filters'
+            groups=(await run_io(build_report,s['snapshot'],f))[dimension];back='filters'
         else:groups=r[dimension]
         page,shown=pages(groups,page);text=f"📦 {dimension} — {len(groups)} مجموعة\nالفترة: {NAMES.get(s['filters']['period'],s['filters']['period'])}"
         for g in shown:
@@ -228,7 +228,7 @@ async def handle_statistics_callback(update,context):
         if data=='clear':s['filters']={'period':s['filters']['period']};data='home'
         if data.startswith(('product:','plan:')):
             dimension,token=data.split(':',1);f=dict(s['filters']);f.pop(dimension,None)
-            groups=build_report(s['snapshot'],f)['products' if dimension=='product' else 'plans']
+            groups=(await run_io(build_report,s['snapshot'],f))['products' if dimension=='product' else 'plans']
             key=next((g['key'] for g in groups if source_id('K',g['key'])==token),None)
             if key is None:raise FinanceError('الخيار غير موجود في هذه القراءة.')
             s['filters'][dimension]=key;data='home'
@@ -249,7 +249,7 @@ async def statistics_input(update,context):
         s=session(context);filters=dict(s['filters']);filters['period' if mode=='custom' else 'customer']=text
         if mode=='customer' and not re.fullmatch(r'-?\d+|instagram:[\w.]+',text):
             raise FinanceError('أرسل معرف الزبون الرقمي أو instagram:username، وليس الاسم الظاهر.')
-        build_report(s['snapshot'],filters)  # Preserve previous selection on error.
+        await run_io(build_report,s['snapshot'],filters)  # Preserve previous selection on error.
         s['filters']=filters;context.user_data.pop('statistics_input',None)
         await render(update.message,context)
     except (FinanceError,ValueError) as exc:await update.message.reply_text(f'⚠️ {exc}',reply_markup=buttons([],back='filters'))

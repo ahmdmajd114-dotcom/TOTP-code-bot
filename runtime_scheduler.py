@@ -14,6 +14,8 @@ import logging
 from pathlib import Path
 from time import monotonic
 from weakref import WeakKeyDictionary
+from catalog_read_cache import customer_catalog_reads
+from performance_diagnostics import record_timing
 
 logger = logging.getLogger(__name__)
 _lane = ContextVar('store_work_lane', default='owner')
@@ -28,11 +30,12 @@ async def run_io(function, *args, **kwargs):
     loop = asyncio.get_running_loop()
     gates = _gates.setdefault(loop, {})
     gate = gates.setdefault(lane, asyncio.Semaphore(_limits[lane]))
+    queued_at = monotonic()
     async with gate:
-        return await _execute_io(lane,function,args,kwargs)
+        return await _execute_io(lane,function,args,kwargs,monotonic()-queued_at)
 
 
-async def _execute_io(lane, function, args, kwargs):
+async def _execute_io(lane, function, args, kwargs,waiting):
     if lane not in _pools:
         _pools[lane] = ThreadPoolExecutor(max_workers=_limits[lane], thread_name_prefix='store-'+lane)
     ctx = copy_context()
@@ -50,9 +53,10 @@ async def _execute_io(lane, function, args, kwargs):
         raise
     finally:
         elapsed = monotonic()-start
+        code=getattr(function,'__code__',None)
+        site=f'{Path(code.co_filename).name}:{code.co_firstlineno}' if code else type(function).__name__
+        record_timing('io',lane,site,elapsed,waiting)
         if elapsed >= 2:
-            code=getattr(function,'__code__',None)
-            site=f'{Path(code.co_filename).name}:{code.co_firstlineno}' if code else type(function).__name__
             logger.warning('Slow store I/O lane=%s site=%s seconds=%.2f',lane,site,elapsed)
 
 
@@ -131,11 +135,13 @@ class CustomerFirstDispatcher:
         token = _lane.set(lane)
         start = monotonic()
         try:
-            await coroutine
+            with customer_catalog_reads(enabled=lane in {'customer','code'}):
+                await coroutine
         except Exception:
             logger.exception('Store update failed in %s lane',lane)
         finally:
             elapsed = monotonic()-start
+            record_timing('update',lane,'Telegram update',elapsed,start-queued_at)
             if elapsed >= 5 or start-queued_at >= 2:
                 logger.warning('Slow store update lane=%s queue=%.2f seconds=%.2f',lane,start-queued_at,elapsed)
             _lane.reset(token)

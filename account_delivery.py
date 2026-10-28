@@ -3,10 +3,11 @@ from dataclasses import dataclass
 from datetime import datetime,timezone
 from html import escape
 from pathlib import Path
-import asyncio,base64,re,uuid
+import base64,re,uuid
 
 from financial_ledger import BAGHDAD, FinanceError, source_id
 from finance_ui import keyboard,services
+from runtime_scheduler import run_io
 
 GUIDE='https://t.me/+IcHCjNi8_ilkZjdi'
 CHANNEL='https://t.me/+M8XsrznhCNJkNTA6'
@@ -174,7 +175,7 @@ async def show_card(message,context,data):
             rows.append([('💳 تسجيل دين صريح عند التثبيت','debt')])
         elif step=='plan':
             text+='\nاختر الباقة والمدة:'
-            for p in catalog_options():rows.append([(f"{p['plan_name']} — {p['allocated']:,}",'plan_'+compact(p['plan_id']))])
+            for p in await run_io(catalog_options):rows.append([(f"{p['plan_name']} — {p['allocated']:,}",'plan_'+compact(p['plan_id']))])
         elif step in ('days','payer','seats'):
             text+='\n'+{'days':'اكتب مدة التعويض بالأيام (1 إلى 3650).','payer':'اكتب chat_id المشتري؛ المستفيد يبقى الزبون الحالي.','seats':'اكتب عدد المقاعد لهذا الاشتراك (1 إلى 20).'}[step]
             context.user_data['delivery_input']={'id':r['id'],'revision':r['revision'],'step':step}
@@ -195,7 +196,7 @@ async def start_link(context,bm,chat_id,text):
         except Exception:pass
     if bm is None:raise FinanceError('استخدم /link داخل محادثة المستفيد.')
     try:
-        data=await asyncio.to_thread(rpc,'start',id=str(uuid.uuid4()),code=match[1],customer_id=chat_id,
+        data=await run_io(rpc,'start',id=str(uuid.uuid4()),code=match[1],customer_id=chat_id,
             customer_name=bm.chat.full_name or bm.chat.first_name or str(chat_id),business_id=bm.business_connection_id,message_id=bm.message_id)
     except FinanceError as exc:
         # Explicitly missing extension leaves untouched legacy behavior. Native
@@ -207,11 +208,11 @@ async def start_link(context,bm,chat_id,text):
         state={'mode':'new','step':'funding','seats':1,'payer_id':chat_id}
         eligible=[f for f in data['funding'] if f['available']>0 and _services.is_chatgpt(f.get('product'))]
         if len(eligible)==1:
-            f=eligible[0];plans=catalog_options()
+            f=eligible[0];plans=await run_io(catalog_options)
             matching=[p for p in plans if p['plan_id']==f['payload'].get('plan_id') and p['allocated']<=f['available']]
             if not matching:matching=[p for p in plans if p['allocated']==f['available']]
             if len(matching)==1:state.update(matching[0],funding_id=f['id'],available=f['available'],step='summary')
-        data=await asyncio.to_thread(rpc,'edit',id=data['request']['id'],revision=data['request']['revision'],state=state)
+        data=await run_io(rpc,'edit',id=data['request']['id'],revision=data['request']['revision'],state=state)
     await show_card(SimpleMessage(context),context,data);return True
 
 
@@ -223,7 +224,7 @@ class SimpleMessage:
 
 async def finish_delivery(context,message,data):
     r=data['request']
-    result=await asyncio.to_thread(rpc,'finish',id=r['id'])
+    result=await run_io(rpc,'finish',id=r['id'])
     await show_card(message,context,result)
     if r['state'].get('mode')=='resend':return
     await retry_followup(context,message,result)
@@ -237,40 +238,40 @@ async def retry_followup(context,message,result):
     if reminder:
         try:
             state={'customer_chat_id':r['customer_id'],'reminder_id':reminder,'duration_days':r['state'].get('days') or 1}
-            existing=await asyncio.to_thread(lambda:_services.client.table('subscription_reminders').select('scheduled_message_id,status').eq('id',reminder).eq('customer_chat_id',r['customer_id']).execute().data)
+            existing=await run_io(lambda:_services.client.table('subscription_reminders').select('scheduled_message_id,status').eq('id',reminder).eq('customer_chat_id',r['customer_id']).execute().data)
             if existing and existing[0].get('scheduled_message_id'):
                 await _services.cancel_schedule(r['customer_id'],existing[0]['scheduled_message_id'])
-                await asyncio.to_thread(lambda:_services.client.table('subscription_reminders').update({'scheduled_message_id':None,'scheduled_message_status':'none'}).eq('id',reminder).execute())
+                await run_io(lambda:_services.client.table('subscription_reminders').update({'scheduled_message_id':None,'scheduled_message_status':'none'}).eq('id',reminder).execute())
             if existing and existing[0]['status']=='cancelled':return
             ok=await _services.schedule(state)
             if not ok:await message.reply_text('⚠️ المدة والربط محفوظان؛ جدولة المتابعة تحتاج إعادة محاولة من /delivery.')
-            await asyncio.to_thread(_services.invite,r['customer_id'],r['business_id'])
+            await run_io(_services.invite,r['customer_id'],r['business_id'])
         except Exception:await message.reply_text('⚠️ التسليم مثبت؛ متابعة الاشتراك تحتاج مراجعة. لا تعد إرسال البيانات.')
 
 
 async def send_delivery(context,message,data):
     r=data['request']
-    claimed=await asyncio.to_thread(rpc,'claim',id=r['id'])
+    claimed=await run_io(rpc,'claim',id=r['id'])
     try:
-        creds=await asyncio.to_thread(lambda:_services.client.rpc('delivery_credentials',{'p_owner':_services.owner_id,'p_id':r['id']}).execute().data)
+        creds=await run_io(lambda:_services.client.rpc('delivery_credentials',{'p_owner':_services.owner_id,'p_id':r['id']}).execute().data)
         if not creds:raise FinanceError('تعذرت قراءة بيانات الحساب المحجوز.')
         text=delivery_text(creds['email'],creds['password'],claimed['request']['state'].get('template'))
     except Exception:
         # Before issuing Telegram request, delivery is known not to have happened.
-        await asyncio.to_thread(rpc,'resolve_unsent',id=r['id'])
+        await run_io(rpc,'resolve_unsent',id=r['id'])
         raise FinanceError('لم أرسل بيانات الدخول؛ افتح العملية وأعد مراجعتها.') from None
     if r['state'].get('mode')=='renew':
         # Renewal changes the period, not credential disclosure.
-        sent_data=await asyncio.to_thread(rpc,'sent',id=r['id'])
+        sent_data=await run_io(rpc,'sent',id=r['id'])
     else:
         try:
             sent=await context.bot.send_message(chat_id=r['customer_id'],business_connection_id=r['business_id'],text=text,parse_mode='HTML',disable_web_page_preview=True)
         except Exception:
             await message.reply_text('⚠️ نتيجة الإرسال تحتاج تحقق. لم أكررها تلقائياً.')
-            await show_card(message,context,await asyncio.to_thread(rpc,'get',id=r['id']));return
+            await show_card(message,context,await run_io(rpc,'get',id=r['id']));return
         # If this write fails, request stays sending; owner can confirm receipt
         # and finish without sending the password again.
-        sent_data=await asyncio.to_thread(rpc,'sent',id=r['id'],message_id=sent.message_id)
+        sent_data=await run_io(rpc,'sent',id=r['id'],message_id=sent.message_id)
     await finish_delivery(context,message,sent_data)
 
 
@@ -280,34 +281,34 @@ async def handle_delivery_callback(update,context):
     await q.answer();context.user_data.pop('delivery_input',None)
     try:
         _,key,revision,action=q.data.split(':',3);rid=expanded(key)
-        data=await asyncio.to_thread(rpc,'get',id=rid);r=data['request'];state=dict(r['state'])
+        data=await run_io(rpc,'get',id=rid);r=data['request'];state=dict(r['state'])
         if int(revision)!=r['revision']:
             await show_card(q.message,context,data);return
         if action=='send':await send_delivery(context,q.message,data);return
         if action=='finish':await finish_delivery(context,q.message,data);return
         if action=='followup':await retry_followup(context,q.message,data);return
         if action=='received':
-            data=await asyncio.to_thread(rpc,'resolve_sent',id=rid)
+            data=await run_io(rpc,'resolve_sent',id=rid)
             await finish_delivery(context,q.message,data);return
-        if action=='not_received':data=await asyncio.to_thread(rpc,'resolve_unsent',id=rid)
-        elif action=='cancel':data=await asyncio.to_thread(rpc,'cancel',id=rid)
-        elif action=='reserve':data=await asyncio.to_thread(rpc,'reserve',id=rid)
+        if action=='not_received':data=await run_io(rpc,'resolve_unsent',id=rid)
+        elif action=='cancel':data=await run_io(rpc,'cancel',id=rid)
+        elif action=='reserve':data=await run_io(rpc,'reserve',id=rid)
         elif action=='undo_review':
             await q.message.reply_text('التراجع يعكس تغيير الاشتراك والحجز فقط؛ لا يرجع الأموال تلقائياً. بيانات الدخول وصلت وتحتاج تغييرها إذا كان التسليم خاطئاً.',reply_markup=markups(r,[[('تأكيد التراجع','undo')],[('رجوع','reload')]]));return
         elif action=='undo':
-            data=await asyncio.to_thread(rpc,'undo',id=rid)
+            data=await run_io(rpc,'undo',id=rid)
             await retry_followup(context,q.message,data)
             await q.message.reply_text('⚠️ بيانات الدخول سبق إرسالها. حرر الجلسة فعلياً أو غيّر بيانات الدخول قبل إعادة بيع المقعد. لم أغيّر الدفعة أو الدين تلقائياً.')
         elif action=='reload':pass
         else:
             if action=='release':
-                data=await asyncio.to_thread(rpc,'release',id=rid)
+                data=await run_io(rpc,'release',id=rid)
                 await show_card(q.message,context,data);return
             if action.startswith('import_'):
                 await q.message.reply_text('هذا يعتمد الاشتراك القديم على الحساب المختار مع الحفاظ على مدته ودفعه. يجب أن يكون هذا هو الحساب المرتبط فعلاً.',
                     reply_markup=markups(r,[[('اعتماد الربط القديم','adopt_'+action[7:])],[('رجوع','reload')]]));return
             if action.startswith('adopt_'):
-                data=await asyncio.to_thread(rpc,'import_reminder',id=rid,reminder_id=int(action[6:]))
+                data=await run_io(rpc,'import_reminder',id=rid,reminder_id=int(action[6:]))
                 await show_card(q.message,context,data);return
             previous=state.get('step','purpose')
             if action.startswith('mode_'):
@@ -321,13 +322,14 @@ async def handle_delivery_callback(update,context):
                 state.update(funding_id=f['id'],available=f['available'],step='plan')
             elif action=='debt':state.update(funding_id='debt',step='plan')
             elif action.startswith('plan_'):
-                plan=next(p for p in catalog_options() if compact(p['plan_id'])==action[5:]);state.update(plan,step='summary')
+                options=await run_io(catalog_options)
+                plan=next(p for p in options if compact(p['plan_id'])==action[5:]);state.update(plan,step='summary')
                 if state['funding_id']!='debt' and state['allocated']>state['available']:raise FinanceError('قيمة الباقة أعلى من المتاح بالدفعة؛ راجع المالية أو اختر تسجيل دين صريح.')
             elif action in ('days','payer','seats'):state['step']=action
             elif action=='back':state['step']=state.get('history',['purpose'])[-1] if state.get('history') else 'purpose';state['history']=state.get('history',[])[:-1]
             else:raise FinanceError('خيار غير معروف.')
             if action!='back' and state.get('step')!=previous:state['history']=[*state.get('history',[]),previous]
-            data=await asyncio.to_thread(rpc,'edit',id=rid,revision=r['revision'],state=state)
+            data=await run_io(rpc,'edit',id=rid,revision=r['revision'],state=state)
         await show_card(q.message,context,data)
     except (FinanceError,ValueError,StopIteration) as exc:
         await q.message.reply_text('⚠️ '+(str(exc) if isinstance(exc,FinanceError) else 'الخيار تغير؛ افتح العملية مجدداً من /delivery.'))
@@ -342,15 +344,15 @@ async def handle_delivery_input(update,context):
     text=(update.message.text or '').strip()
     try:
         value=int(text.translate(str.maketrans('٠١٢٣٤٥٦٧٨٩','0123456789')))
-        data=await asyncio.to_thread(rpc,'get',id=pending['id']);r=data['request'];state=dict(r['state'])
+        data=await run_io(rpc,'get',id=pending['id']);r=data['request'];state=dict(r['state'])
         if r['revision']!=pending['revision']:raise FinanceError('البطاقة تغيرت؛ أعد فتح العملية.')
         key=pending['step'];limit=3650 if key=='days' else 20 if key=='seats' else 10**16
         if not 1<=value<=limit:raise FinanceError('القيمة خارج الحدود.')
         state['payer_id' if key=='payer' else key]=value;state['step']='purpose' if key=='payer' else 'summary'
         if key=='payer' and _services.identity:
-            name,_=await asyncio.to_thread(_services.identity,value)
+            name,_=await run_io(_services.identity,value)
             state['payer_name']=name or str(value)
-        data=await asyncio.to_thread(rpc,'edit',id=r['id'],revision=r['revision'],state=state)
+        data=await run_io(rpc,'edit',id=r['id'],revision=r['revision'],state=state)
         context.user_data.pop('delivery_input',None);await show_card(update.message,context,data)
     except (ValueError,FinanceError) as exc:await update.message.reply_text('⚠️ '+(str(exc) if isinstance(exc,FinanceError) else 'اكتب رقماً صحيحاً.'))
     return True
@@ -360,10 +362,10 @@ async def show_admin(message,context,page=0):
     from finance_ui import suspend_finance_inputs
     from debt_manager import cancel_debt_input
     cancel_debt_input(context)
-    await asyncio.to_thread(suspend_finance_inputs)
+    await run_io(suspend_finance_inputs)
     for key in ('statistics_input','finance_report_input','pending_catalog_input','pending_payment_input','pending_shared_account','campaign_draft','pending_manual_subscription','pending_personal_reminder'):
         context.user_data.pop(key,None)
-    data=await asyncio.to_thread(rpc,'list')
+    data=await run_io(rpc,'list')
     text='🔗 تسليم الحسابات\nاستخدم /link رمز_الحساب داخل محادثة المستفيد.\n'
     rows=[[('➕ تخزين/تجهيز حساب للتسليم','deliveryadmin:add')],[('📝 معاينة وتعديل روابط القالب','deliveryadmin:template')],[('📄 ملف تهيئة التسليم','deliveryadmin:sql')]]
     for a in data['accounts']:
@@ -404,9 +406,9 @@ async def handle_admin_callback(update,context):
             await show_admin(q.message,context,page=int(action[8:]))
         elif action.startswith(('account:','toggle:','capacity:','credentials:')):
             task,key=action.split(':',1);aid=expanded(key)
-            accounts=(await asyncio.to_thread(rpc,'list'))['accounts'];a=next(x for x in accounts if x['id']==aid)
+            accounts=(await run_io(rpc,'list'))['accounts'];a=next(x for x in accounts if x['id']==aid)
             if task=='toggle':
-                await asyncio.to_thread(rpc,'account',id=aid,revision=a['revision'],enabled=not a['enabled'])
+                await run_io(rpc,'account',id=aid,revision=a['revision'],enabled=not a['enabled'])
                 await show_admin(q.message,context);return
             if task=='capacity':
                 context.user_data['delivery_admin_input']='capacity'
@@ -417,7 +419,7 @@ async def handle_admin_callback(update,context):
                 context.user_data['delivery_admin_account']={'id':aid,'revision':a['revision'],'email':a['email'],'capacity':a['capacity'],'code':a['code']}
                 await q.message.reply_text(f"هذا الحساب مرتبط بـ{a['occupancy']['people']} شخص. التغيير لا يرسل بيانات جديدة لهم تلقائياً ولا يعيد المدد.\nأرسل سطرين: كلمة المرور الجديدة ثم مفتاح TOTP.\nأو ثلاثة أسطر لتعديل الإيميل أيضاً: الإيميل ثم كلمة المرور ثم المفتاح.\nإذا كلمة المرور ما تغيرت اكتب الحالية.",reply_markup=keyboard([[('رجوع','deliveryadmin:account:'+key)]]));return
             rows=[[('إيقاف/تفعيل التسليم والأكواد','deliveryadmin:toggle:'+key)],[('تعديل السعة','deliveryadmin:capacity:'+key)],[('تحديث كلمة المرور وTOTP','deliveryadmin:credentials:'+key)]]
-            holds=(await asyncio.to_thread(rpc,'list')).get('legacy_holds',[])
+            holds=(await run_io(rpc,'list')).get('legacy_holds',[])
             for hold in holds:
                 if hold['account_id']==aid:rows.append([('مراجعة تحرير وصول '+str(hold['customer_id']),f"deliveryadmin:logout:{key}:{hold['customer_id']}")])
             await q.message.reply_text(f"{a['email']}\nالسعة {a['capacity']}\nوصول قديم/مكشوف يحتاج مراجعة {a['occupancy']['unreviewed']}",
@@ -427,17 +429,17 @@ async def handle_admin_callback(update,context):
             if task=='logout':
                 await q.message.reply_text('هل تأكدت من خروج هذا الزبون فعلياً أو تغيير بيانات الدخول؟ هذا يحرر الحجز غير المراجع فقط، ولا يلغي اشتراكاً فعالاً أو يغير الأموال.',
                     reply_markup=keyboard([[('نعم، تأكدت من إنهاء الوصول',f'deliveryadmin:free:{key}:{customer}')],[('رجوع','deliveryadmin:account:'+key)]]));return
-            await asyncio.to_thread(rpc,'release_access',id=aid,customer_id=int(customer))
+            await run_io(rpc,'release_access',id=aid,customer_id=int(customer))
             await show_admin(q.message,context)
         elif action.startswith('save:'):
             preview=context.user_data.get('delivery_admin_preview')
             if not preview or preview.get('token')!=action[5:]:raise FinanceError('المعاينة انتهت أو تغيرت؛ افتح آخر معاينة.')
-            saved=await asyncio.to_thread(rpc,{'add':'register','template':'save_template','capacity':'account','credentials':'credentials'}[preview['kind']],**preview['data'])
+            saved=await run_io(rpc,{'add':'register','template':'save_template','capacity':'account','credentials':'credentials'}[preview['kind']],**preview['data'])
             context.user_data.pop('delivery_admin_preview',None)
             await q.message.reply_text('✅ تم الحفظ.'+(f"\n/link {saved['code']}" if saved.get('code') else ''))
             await show_admin(q.message,context)
         elif action.startswith('open:'):
-            await show_card(q.message,context,await asyncio.to_thread(rpc,'get',id=expanded(action[5:])))
+            await show_card(q.message,context,await run_io(rpc,'get',id=expanded(action[5:])))
         else:raise FinanceError('خيار غير معروف.')
     except (FinanceError,ValueError,StopIteration) as exc:
         await q.message.reply_text('⚠️ '+(str(exc) if isinstance(exc,FinanceError) else 'الخيار تغير؛ أعد فتح القائمة.'),reply_markup=keyboard([[('📄 ملف التهيئة','deliveryadmin:sql')],[('رجوع','deliveryadmin:home')]]))

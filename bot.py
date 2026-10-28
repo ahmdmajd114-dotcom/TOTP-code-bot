@@ -23,6 +23,8 @@ import re
 import uuid
 import base64
 import asyncio
+from catalog_read_cache import catalog_read
+from performance_diagnostics import configure_performance, show_performance
 import logging
 import json
 from html import escape
@@ -1471,6 +1473,7 @@ def instagram_sale_prompt(state: dict) -> str:
     )
 
 
+@catalog_read
 def get_catalog_products() -> list[dict]:
     try:
         return (supabase.table("catalog_products").select("*").order("name").execute().data or [])
@@ -1479,6 +1482,7 @@ def get_catalog_products() -> list[dict]:
         return []
 
 
+@catalog_read
 def get_catalog_product(product_id: str) -> dict | None:
     try:
         result = supabase.table("catalog_products").select("*").eq("id", product_id).execute()
@@ -1488,6 +1492,7 @@ def get_catalog_product(product_id: str) -> dict | None:
         return None
 
 
+@catalog_read
 def get_catalog_plans(product_id: str) -> list[dict]:
     try:
         return (
@@ -3869,7 +3874,7 @@ async def backfill_linked_chatgpt_schedules(_context: ContextTypes.DEFAULT_TYPE)
         pending_schedules: list[tuple[dict, int, datetime]] = []
         now = datetime.now(timezone.utc)
         for reminder in rows:
-            if delivery_reminder_managed(reminder['id']):
+            if await run_io(delivery_reminder_managed,reminder['id']):
                 continue
             chat_id = reminder.get("customer_chat_id")
             if (
@@ -11650,7 +11655,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     _delayed_greeting_delivery_keys.discard(ready_key)
 
     # سجل دائم للمستخدم من أول تعامل، مستقل عن أرشيف الرسائل.
-    if not is_from_owner:
+    if not is_from_owner and ready_customer_text is None:
         (await run_io(lambda: upsert_customer_contact(
             platform="telegram",
             external_id=str(chat_id),
@@ -12517,8 +12522,9 @@ def start_health_server() -> None:
     logger.info(f"Health check server running on port {port}")
 
 
-async def on_bot_initialized(app: Application) -> None:
-    """يشغّل إصلاح الجدولات القديمة فور إقلاع الخدمة، لا بعد انتظار الـJobQueue."""
+@background_job
+async def warm_store_connections(app: Application) -> None:
+    """The first customer must not wait for Google Sheets at startup."""
     payment_sheet = (await run_io(lambda: get_google_sheet()))
     if payment_sheet is None:
         await app.bot.send_message(
@@ -12531,10 +12537,16 @@ async def on_bot_initialized(app: Application) -> None:
             chat_id=OWNER_USER_ID,
             text=f"✅ {_payment_sheet_resolution_note}.\nالتسجيل المالي عاد للعمل.",
         )
+
+
+async def on_bot_initialized(app: Application) -> None:
+    """Start listeners without waiting for optional Sheets/backfill work."""
+    app.create_task(warm_store_connections(app))
     app.create_task(backfill_linked_chatgpt_schedules(None))
 
 
 def main() -> None:
+    configure_performance(OWNER_USER_ID)
     import income_manager as legacy_income_manager
     legacy_income_manager.configure_legacy(globals())
     import expense_manager as legacy_expense_manager
@@ -12684,6 +12696,7 @@ def main() -> None:
     # (تيليجرام يشترط أوامر بحروف إنكليزية بس، ما يقبل حروف عربية بأسماء الأوامر)
     app.add_handler(CommandHandler("income", cmd_income_report))
     app.add_handler(CommandHandler("sheetstatus", cmd_sheet_status))
+    app.add_handler(CommandHandler("performance", show_performance))
 
     # تصحيح دفعة حُفظت كعملية جديدة بدل تسديد دين، من دون تكرار الدخل.
     app.add_handler(CommandHandler("fixdebt", cmd_fix_existing_debt_payment))
