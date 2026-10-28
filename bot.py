@@ -325,6 +325,13 @@ def get_google_sheet():
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
         _google_sheet = spreadsheet.worksheet(GOOGLE_SHEET_WORKSHEET_NAME)
+        if getattr(_google_sheet, "col_count", 0) < 8:
+            _google_sheet.resize(
+                rows=max(getattr(_google_sheet, "row_count", 1000), 1000), cols=8
+            )
+        header = _google_sheet.row_values(1)
+        if len(header) < SHEET_COL_OPERATION_ID or not header[SHEET_COL_OPERATION_ID - 1].strip():
+            _google_sheet.update_cell(1, SHEET_COL_OPERATION_ID, "رقم العملية")
         logger.info("Google Sheets connection established successfully")
         return _google_sheet
     except Exception:
@@ -3926,6 +3933,7 @@ SHEET_COL_PRODUCT = 4
 SHEET_COL_CUSTOMER = 5
 SHEET_COL_CHATGPT_ACCOUNT = 6
 SHEET_COL_CHAT_ID = 7
+SHEET_COL_OPERATION_ID = 8
 
 CHATGPT_PRODUCT_NAME = "جات"
 CHATGPT_ROW_MATCH_WINDOW_DAYS = 7
@@ -4038,8 +4046,16 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
     customer_line = format_customer_line(state["customer_name"], state.get("customer_username"))
     product = state.get("product") or ""
     chat_id = state.get("customer_chat_id")
+    operation_id = state.setdefault("payment_operation_id", f"PAY-{uuid.uuid4().hex.upper()}")
 
     try:
+        # مفتاح العملية يجعل إعادة المحاولة آمنة: إذا نجح الإرسال للشيت
+        # وانقطع الرد قبل التحقق، لن نضيف الدخل مرة ثانية.
+        existing_rows = sheet.get_all_values()
+        for existing in existing_rows[1:]:
+            if (len(existing) >= SHEET_COL_OPERATION_ID
+                    and existing[SHEET_COL_OPERATION_ID - 1].strip() == operation_id):
+                return True
         target_row = None
         if not force_new and is_chatgpt_product_name(product) and chat_id is not None:
             target_row = find_completable_chatgpt_row(sheet, chat_id, missing="payment")
@@ -4049,6 +4065,7 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
             sheet.update_cell(target_row, SHEET_COL_DATE, date_time_str)
             sheet.update_cell(target_row, SHEET_COL_TOTAL, total)
             sheet.update_cell(target_row, SHEET_COL_PAYMENTS, payments_text)
+            sheet.update_cell(target_row, SHEET_COL_OPERATION_ID, operation_id)
         else:
             row = [
                 date_time_str,
@@ -4058,16 +4075,40 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
                 customer_line,
                 "",  # حسابات جات — تُعبى لاحقاً عن طريق accept/link
                 str(chat_id) if chat_id is not None else "",
+                operation_id,
             ]
             response = sheet.append_row(row, value_input_option="USER_ENTERED")
-            updated_range = str((response or {}).get("updates", {}).get("updatedRange", ""))
-            match = re.search(r"![A-Z]+(\d+):", updated_range)
+            response_data = response if isinstance(response, dict) else {}
+            updated_range = str(response_data.get("updates", {}).get("updatedRange", ""))
+            match = re.search(r"![^!]*?\$?[A-Z]+\$?(\d+):", updated_range)
             if match:
                 target_row = int(match.group(1))
 
         # لا نعلن النجاح قبل أن نقرأ السطر ونتأكد أن Google Sheets حفظه.
         if target_row is None:
-            target_row = len(sheet.get_all_values())
+            all_rows = sheet.get_all_values()
+            for index in range(len(all_rows) - 1, 0, -1):
+                candidate = all_rows[index]
+                if len(candidate) < SHEET_COL_PAYMENTS:
+                    continue
+                candidate_total = parse_sheet_amount(candidate[SHEET_COL_TOTAL - 1])
+                candidate_payments = candidate[SHEET_COL_PAYMENTS - 1].strip()
+                candidate_chat_id = (
+                    candidate[SHEET_COL_CHAT_ID - 1].strip()
+                    if len(candidate) >= SHEET_COL_CHAT_ID else ""
+                )
+                candidate_operation_id = (
+                    candidate[SHEET_COL_OPERATION_ID - 1].strip()
+                    if len(candidate) >= SHEET_COL_OPERATION_ID else ""
+                )
+                if (candidate_total == total and candidate_payments == payments_text
+                        and (chat_id is None or candidate_chat_id == str(chat_id))
+                        and candidate_operation_id == operation_id):
+                    target_row = index + 1
+                    break
+        if target_row is None:
+            logger.error("Payment was appended but its row could not be resolved for verification")
+            return False
         saved_row = sheet.row_values(target_row)
         saved_total = parse_sheet_amount(
             saved_row[SHEET_COL_TOTAL - 1] if len(saved_row) >= SHEET_COL_TOTAL else None
@@ -4080,6 +4121,10 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
             saved_row[SHEET_COL_CHAT_ID - 1].strip()
             if len(saved_row) >= SHEET_COL_CHAT_ID else ""
         )
+        saved_operation_id = (
+            saved_row[SHEET_COL_OPERATION_ID - 1].strip()
+            if len(saved_row) >= SHEET_COL_OPERATION_ID else ""
+        )
         if saved_total != total or saved_payments != payments_text:
             logger.error(
                 "Payment sheet verification failed row=%s expected_total=%s actual_total=%s",
@@ -4090,6 +4135,12 @@ def append_payment_row(state: dict, force_new: bool = False) -> bool:
             logger.error(
                 "Payment sheet chat-id verification failed row=%s expected=%s actual=%s",
                 target_row, chat_id, saved_chat_id,
+            )
+            return False
+        if saved_operation_id != operation_id:
+            logger.error(
+                "Payment sheet operation-id verification failed row=%s expected=%s actual=%s",
+                target_row, operation_id, saved_operation_id,
             )
             return False
         logger.info(
@@ -9843,8 +9894,24 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=build_debt_overpayment_keyboard(credit_overage),
             )
             return
+        payment_stats_saved = bool(state.get("debt_income_saved"))
+        if not payment_stats_saved:
+            payment_stats_saved = append_payment_row(state, force_new=True)
+            if payment_stats_saved:
+                state["debt_income_saved"] = True
+        if not payment_stats_saved:
+            await query.edit_message_caption(
+                caption=(format_payment_summary(state)
+                         + "\n\n⚠️ لم يتغير الدين لأن تسجيل الدخل فشل."
+                           "\nراجع اتصال Google Sheet ثم اضغط إعادة المحاولة."),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة المحاولة", callback_data="pay_debt_repay")],
+                    [InlineKeyboardButton(BTN_BACK, callback_data="pay_back_from_catalog_payment")],
+                ]),
+            )
+            return
+
         saved, new_remaining = process_debt_repayment(debt_row, remaining_before, repay_amount)
-        payment_stats_saved = False
         credit_saved = False
         credit_balance = 0
 
@@ -9853,9 +9920,6 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
             for method, amount in state["payments"]:
                 if method in VAULT_NAMES:
                     adjust_vault_balance(method, amount)
-            # تسديد الدين دخل جديد اليوم، حتى لو كان أصل الدين قديماً.
-            # force_new يمنع دمجه مع سطر ChatGPT قديم أو ناقص.
-            payment_stats_saved = append_payment_row(state, force_new=True)
             if credit_overage > 0 and state.get("debt_overage_decision") == "credit":
                 credit_saved, credit_balance = append_customer_credit(
                     int(customer_chat_id),
@@ -9898,10 +9962,16 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
                     f"المبلغ المسدد: {repay_amount}\nالمتبقي: {new_remaining}",
                 )
                 final_text = format_payment_summary(state) + f"\n\n✅ تم تسديد جزء من الدين. المتبقي: {new_remaining}"
-            if not payment_stats_saved:
-                final_text += "\n⚠️ تم تحديث الدين، لكن تعذر إضافة التسديد لإحصائيات الدخل."
         else:
-            final_text = format_payment_summary(state) + "\n\n⚠️ فشل تحديث حالة الدين بـ Google Sheet — تحقق من الاتصال يدوياً."
+            await query.edit_message_caption(
+                caption=(format_payment_summary(state)
+                         + "\n\n⚠️ تم تسجيل الدخل بنجاح، لكن لم يتغير الدين."
+                           "\nاضغط إعادة المحاولة؛ لن يُسجل الدخل مرتين."),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 إعادة تحديث الدين", callback_data="pay_debt_repay")],
+                ]),
+            )
+            return
 
         del _pending_payments[message_id]
 
