@@ -9,6 +9,8 @@ import unittest
 import uuid
 
 from payment_storage import PaymentWorksheet, locate_payment_row, payment_datetime
+from debt_manager import is_debt_payment_row, is_debt_repayment_row
+from payment_link_logic import find_current_paid_delivery_row
 
 
 HEADER = ["التاريخ والوقت", "المبلغ الكلي", "طرق الدفع", "المنتج", "الزبون", "الحساب", "Chat ID", "رقم العملية"]
@@ -63,11 +65,16 @@ def bot_functions(sheet):
         "get_payment_rows_in_period", "calculate_totals_summary",
         "calculate_income_report", "format_period_label", "payment_stats_date_warning",
         "calculate_product_breakdown",
+        "get_current_chatgpt_delivery_payment", "find_completable_chatgpt_row",
     }
     tree = ast.parse((Path(__file__).resolve().parents[1] / "bot.py").read_text())
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     ns = {
         "get_google_sheet": lambda: sheet,
+        "is_debt_payment_row": is_debt_payment_row,
+        "is_debt_repayment_row": is_debt_repayment_row,
+        "find_current_paid_delivery_row": find_current_paid_delivery_row,
+        "CHATGPT_ROW_MATCH_WINDOW_DAYS": 7,
         "datetime": datetime, "timedelta": timedelta, "timezone": timezone,
         "STATS_TIMEZONE": timezone(timedelta(hours=3)),
         "PERIOD_LABELS": {"all": "كل الوقت", "today": "اليوم"},
@@ -203,6 +210,17 @@ class PaymentLocationTests(unittest.TestCase):
         self.assertIn("الدخل: 50000", ns["calculate_totals_summary"]("all"))
         self.assertIn("الدخل: 50000", ns["calculate_totals_summary"]("2026-10-28"))
         self.assertIn("الدخل: 0", ns["calculate_totals_summary"]("2026-10-27"))
+
+    def test_repayment_counts_as_income_without_becoming_new_subscription_payment(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        purchase = [today, "8000", "ماستر 8000", "ChatGPT", ".", "", "8686963327", "PAY-NEW"]
+        repayment = [today, "50000", "زين كاش 50000", "ChatGPT", ".", "", "8686963327", "PAY-DEBT-SETTLEMENT"]
+        sheet = PaymentWorksheet(FakeWorksheet([HEADER, purchase, repayment]))
+        ns = bot_functions(sheet)
+        ns["is_chatgpt_product_name"] = lambda product: product == "ChatGPT"
+        self.assertIn("الدخل: 58000", ns["calculate_totals_summary"]("all"))
+        self.assertEqual(ns["get_current_chatgpt_delivery_payment"](8686963327), (2, sheet.row_values(2)))
+        self.assertEqual(ns["find_completable_chatgpt_row"](sheet, 8686963327, missing="account"), 2)
 
     def test_bad_date_is_counted_in_all_time_and_flagged_for_periods(self):
         row = list(PAYMENT)
