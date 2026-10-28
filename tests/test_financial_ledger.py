@@ -151,6 +151,18 @@ class PostgresTransactionTests(unittest.TestCase):
         self.rpc(self.op(payments=[{'wallet':'master','amount':5000}],credit_used=3000))
         self.assertEqual(self.balances()['credit:123'],0)
 
+    def test_debt_paid_from_credit_changes_no_treasury_and_retries_once(self):
+        did=self.debt()
+        p=self.op('debt_repayment',customer_id=123,settlements=[{'debt_id':did,'amount':8000}],credit_used=8000,payments=[])
+        self.rpc(p,False)
+        self.assertEqual(self.remaining(did),8000)
+        self.rpc(self.op('credit_deposit',customer_id=123,credit_added=8000,payments=[{'wallet':'master','amount':8000}]))
+        before=self.balances();self.rpc(p);self.assertIn('true',self.rpc(p))
+        after=self.balances()
+        self.assertEqual(after['wallet:master'],before['wallet:master'])
+        self.assertEqual(after['wallet:zain'],before['wallet:zain'])
+        self.assertEqual(after['credit:123'],0);self.assertEqual(self.remaining(did),0)
+
     def test_transfer_expense_and_capital(self):
         self.rpc(self.op('transfer',to_wallet='zain',payments=[{'wallet':'master','amount':5000}]))
         self.assertEqual(self.balances()['wallet:master'],95000);self.assertEqual(self.balances()['wallet:zain'],55000)

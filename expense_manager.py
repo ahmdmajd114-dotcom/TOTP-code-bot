@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from financial_ledger import FinanceError, ledger, money, parse_wallets, transaction_date
-from finance_ui import services, draft, navigate, display, customer_text, commit_card, suspend_finance_inputs
+from finance_ui import services, draft, navigate, display, customer_text, commit_card, suspend_finance_inputs, selected_wallet
 
 EXPENSE_KINDS = {'cost':'تكلفة منتج','operating':'تشغيل المتجر','fee':'رسوم وعمولات','general':'مصروف عام'}
 
@@ -46,7 +46,7 @@ async def render_expense(state,context,query=None):
     elif step=='wallet':
         state['wallet_options']=list(services().wallets())
         rows=[[(w,f'wallet{i}')] for i,w in enumerate(state['wallet_options'])]
-        text+='\nاختَر المحفظة التي خرج منها المبلغ:'
+        text+='\nاختَر الخزنة التي خرج منها المبلغ:'
     elif step in {'amount','free','date','split'}:
         text+='\n'+{'amount':'اكتب المبلغ المصروف فعلياً، مثل 15000 أو 15 ألف:',
                       'free':'اكتب سبب المصروف:', 'date':'اكتب تاريخ الصرف: 2026-10-28 14:30 بتوقيت بغداد:',
@@ -80,7 +80,8 @@ async def handle_expense_action(state,action,context,query):
         state.update(plan_id=pid,plan_name=plan['name']);navigate(state,'amount')
     elif action=='noplan':state.update(plan_id=None,plan_name=None);navigate(state,'amount')
     elif action.startswith('wallet') and action[6:].isdigit():
-        state['payments']=[{'wallet':state['wallet_options'][int(action[6:])],'amount':state['amount']}];navigate(state,'summary')
+        wallet=selected_wallet(state,action)
+        state['payments']=[{'wallet':wallet,'amount':state['amount']}];navigate(state,'summary')
     elif action.startswith('category'):
         state.update(category=action[8:],product=None,product_id=None);navigate(state,'free')
     elif action=='editamount':navigate(state,'amount')

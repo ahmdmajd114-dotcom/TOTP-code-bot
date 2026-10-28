@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from financial_ledger import FinanceError,ledger,money,transaction_date,source_id,KINDS,BAGHDAD
 from datetime import datetime
-from finance_ui import services,draft,navigate,display,keyboard,menu_keyboard,commit_card,suspend_finance_inputs
+from finance_ui import services,draft,navigate,display,keyboard,menu_keyboard,commit_card,suspend_finance_inputs,selected_wallet
 
 
 def audit_balances(snapshot):
@@ -109,7 +109,7 @@ async def render_vault(state,context,query=None):
     if step in {'wallet','to'}:
         state['wallet_options']=list(services().wallets())
         rows=[[(w,f'wallet{i}')] for i,w in enumerate(state['wallet_options']) if step!='to' or w!=state.get('wallet')]
-        text+='\nاختَر المحفظة '+('المستلمة:' if step=='to' else 'المصدر:')
+        text+='\nاختَر الخزنة '+('المستلمة:' if step=='to' else 'المصدر:')
     elif step in {'amount','reason','date'}:
         state['awaiting']=True
         text+='\n'+('اكتب فرق تسوية رصيد الزبون، مثال 7000 أو -2000:' if step=='amount' and state['kind']=='credit_adjustment' else 'اكتب الرصيد الفعلي الكامل:' if step=='amount' and state['kind']=='vault_adjustment' else 'اكتب المبلغ:' if step=='amount' else 'اكتب سبب الحركة أو الفرق:' if step=='reason' else 'اكتب تاريخ الحركة بتوقيت بغداد:')
@@ -125,7 +125,7 @@ async def render_vault(state,context,query=None):
 
 async def handle_vault_action(state,action,context,query):
     if action.startswith('wallet'):
-        wallet=state['wallet_options'][int(action[6:])]
+        wallet=selected_wallet(state,action)
         if state['step']=='to':state['to_wallet']=wallet;navigate(state,'amount')
         else:
             state['wallet']=wallet;navigate(state,'to' if state['kind']=='transfer' else 'amount')

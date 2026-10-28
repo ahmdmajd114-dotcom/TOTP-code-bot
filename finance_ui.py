@@ -44,6 +44,24 @@ def menu_keyboard(rows, back='finance_home'):
     return keyboard([*rows,[('◀️ رجوع',back)]])
 
 
+def selected_wallet(state, action):
+    try:
+        name=state['wallet_options'][int(action[6:])]
+    except (KeyError,IndexError,ValueError) as exc:
+        raise FinanceError('قائمة الخزائن تغيّرت؛ اضغط رجوع وأعد اختيار الخزنة.') from exc
+    if name not in services().wallets():
+        raise FinanceError('هذه ليست خزنة معتمدة؛ اضغط رجوع وأعد اختيار الخزنة.')
+    return name
+
+
+def validate_card_wallets(payload):
+    names={item['wallet'] for item in payload.get('payments',[])}
+    for field in ('wallet','to_wallet'):
+        if payload.get(field):names.add(payload[field])
+    if names and not names.issubset(set(services().wallets())):
+        raise FinanceError('البطاقة تحتوي خزنة غير معتمدة؛ أعد اختيار الخزنة قبل التثبيت.')
+
+
 def draft(flow, **fields):
     return {'draft_id': operation_id('D')[2:12], 'operation_id': operation_id('PAY' if flow == 'income' else 'EXP'),
             'flow': flow, 'kind': 'sale' if flow == 'income' else 'expense', 'occurred_at': now_iso(),
@@ -201,6 +219,7 @@ async def handle_finance_input(update, context):
 
 
 async def commit_card(state, payload, context, query):
+    validate_card_wallets(payload)
     if state.get('correction_of'):
         payload['correction_of'] = state['correction_of']
     # Save the final immutable request before submitting it. Lost responses and

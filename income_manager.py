@@ -6,7 +6,7 @@ from datetime import datetime
 
 from financial_ledger import FinanceError, ledger, money, now_iso, parse_wallets, transaction_date
 from financial_ledger import BAGHDAD
-from finance_ui import services, draft, navigate, display, customer_text, commit_card, suspend_finance_inputs
+from finance_ui import services, draft, navigate, display, customer_text, commit_card, suspend_finance_inputs, selected_wallet
 
 
 def allocation(state):
@@ -122,9 +122,9 @@ async def render_income(state, context, query=None):
             rows = [[(f"{p['name']} — {money(p['price']):,}", f'plan{i}')] for i, p in enumerate(options)]
     elif step == 'wallet':
         state['wallet_options'] = list(services().wallets())
-        text = heading + '\nاختَر المحفظة:'
+        text = heading + '\nاختَر الخزنة:'
         rows = [[(name, f'wallet{i}')] for i, name in enumerate(state['wallet_options'])]
-        if state.get('customer_id') is not None and state.get('sales',0)>0:
+        if state.get('customer_id') is not None and state['kind']!='credit_deposit' and state.get('sales',0)+sum(s['amount'] for s in state.get('settlements',[]))>0:
             rows += [[('الدفع من رصيد الزبون فقط','creditonly')]]
     elif step=='debt_amount_select':
         text=heading+'\nاختَر التسديد الذي تريد تعديله:'
@@ -203,7 +203,7 @@ async def handle_income_action(state, action, context, query):
         if not plan: raise FinanceError('الباقة تغيرت؛ أعد اختيارها.')
         _choose_plan(state,plan)
     elif action.startswith('wallet') and action[6:].isdigit():
-        wallet = state['wallet_options'][int(action[6:])]
+        wallet = selected_wallet(state,action)
         expected = state.get('sales',0) + sum(p['amount'] for p in state.get('settlements',[])) - state.get('credit_used',0)
         state['payments'] = [{'wallet':wallet,'amount': max(0,expected)}]
         navigate(state,'summary' if expected>0 else 'amount')

@@ -12460,7 +12460,7 @@ def main() -> None:
         duration=duration_to_days, permanent=is_permanent_duration, is_chatgpt=is_chatgpt_product_name)
     configure_store_finance(StoreFinance(
         client=supabase, owner_id=OWNER_USER_ID, products=get_catalog_products,
-        plans=get_catalog_plans, wallets=lambda: PAYMENT_METHODS,
+        plans=get_catalog_plans, wallets=lambda: VAULT_NAMES,
         identity=get_telegram_customer_identity, button=InlineKeyboardButton, markup=InlineKeyboardMarkup,
         spreadsheet=open_store_spreadsheet, payment_sheet=get_google_sheet,
         expense_sheet=get_expenses_worksheet, instagram_sheet=get_instagram_sales_worksheet,

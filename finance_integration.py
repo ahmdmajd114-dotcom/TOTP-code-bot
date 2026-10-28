@@ -53,13 +53,14 @@ def configured():return _config is not None
 
 
 def financial_wallet_names():
+    """Owner treasuries are accounting accounts, not customer payment labels."""
     try:
-        rows=_config.client.table('payment_methods').select('name,is_active').order('display_order').execute().data or []
-        names=[r['name'] for r in rows if r.get('is_active')]
-        if not names:raise FinanceError('لا توجد طريقة دفع مفعلة؛ فعّل محفظة من طرق الدفع.')
+        names=list(_config.wallets())
+        if not names or any(not isinstance(name,str) or not name.strip() for name in names):
+            raise FinanceError('قائمة الخزائن المالية غير مكتملة؛ راجع إعداد الخزائن.')
         return list(dict.fromkeys(names))
     except FinanceError:raise
-    except Exception as exc:raise FinanceError('تعذر قراءة المحافظ المعتمدة؛ لم أختر محفظة افتراضية.') from exc
+    except Exception as exc:raise FinanceError('تعذر قراءة الخزائن المعتمدة؛ لم أختر خزنة افتراضية.') from exc
 
 
 def active():

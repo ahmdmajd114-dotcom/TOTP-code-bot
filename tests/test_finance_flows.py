@@ -126,6 +126,69 @@ class FinancialFlowTests(unittest.IsolatedAsyncioTestCase):
         p=income_payload(s);fl.validate(p)
         self.assertEqual(p['payments'],[]);self.assertEqual(p['credit_used'],8000)
 
+    async def test_income_buttons_use_treasuries_not_customer_payment_labels(self):
+        names=['ماستر','زين كاش','رصيد اثير','رصيد اسيا']
+        client=Mock();client.table.side_effect=AssertionError('Customer payment methods must not be read')
+        integration._config=SimpleNamespace(wallets=lambda:names,client=client)
+        ui.services().wallets=integration.financial_wallet_names
+        s=await start_income(self.context,customer_id=123)
+        await handle_income_action(s,'product0',self.context,None)
+        from income_manager import render_income
+        await render_income(s,self.context)
+        markup=self.context.bot.edit_message_text.call_args.kwargs['reply_markup']
+        labels=[b.text for line in markup.inline_keyboard for b in line]
+        self.assertEqual(labels[:4],names)
+        self.assertIn('الدفع من رصيد الزبون فقط',labels)
+        self.assertFalse(client.table.called);self.assertEqual(self.db.posts,[])
+
+    async def test_credit_only_repayment_button_and_payload_have_no_cash(self):
+        self.db.balances={'credit:123':8000}
+        self.db.debt_rows=[{'id':'D1','customer_id':123,'product':'ChatGPT','remaining':8000}]
+        s=await start_income(self.context,customer_id=123)
+        await handle_income_action(s,'repay',self.context,None)
+        s['debt_options']=['D1'];await handle_income_action(s,'debt0',self.context,None)
+        from income_manager import render_income
+        await render_income(s,self.context)
+        labels=[b.text for line in self.context.bot.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard for b in line]
+        self.assertIn('الدفع من رصيد الزبون فقط',labels)
+        await handle_income_action(s,'creditonly',self.context,None)
+        p=income_payload(s);fl.validate(p)
+        self.assertEqual(p['kind'],'debt_repayment');self.assertEqual(p['payments'],[])
+        self.assertEqual(p['credit_used'],8000);self.assertEqual(p['settlements'][0]['amount'],8000)
+
+    async def test_outdated_wallet_choice_cannot_redirect_income_expense_or_transfer(self):
+        from vault_manager import handle_vault_action
+        for flow,handler in [('income',handle_income_action),('expense',handle_expense_action),('vault',handle_vault_action)]:
+            s=ui.draft(flow,step='wallet',wallet_options=['ماستركي كارد/سوبركي'],amount=8000,sales=8000)
+            before=deepcopy(s)
+            with self.assertRaisesRegex(fl.FinanceError,'خزنة معتمدة'):
+                await handler(s,'wallet0',self.context,None)
+            self.assertEqual(s,before)
+        self.assertEqual(self.db.posts,[])
+
+    async def test_old_summary_cannot_post_unknown_treasury_then_retry_uses_same_id(self):
+        s=await start_income(self.context,customer_id=123)
+        s.update(step='summary',product='ChatGPT',sales=8000,payments=[{'wallet':'ماستركي كارد/سوبركي','amount':8000}])
+        self.db.save_draft(s)
+        await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(self.db.posts,[])
+        s=self.db.draft(s['draft_id']);s.update(step='wallet',wallet_options=['ماستر'])
+        await handle_income_action(s,'wallet0',self.context,None)
+        self.db.save_draft(s)
+        self.db.fail=True;await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(self.db.posts,[])
+        self.db.fail=False;await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        await ui.handle_finance_callback(self.query(s,'commit'),self.context)
+        self.assertEqual(len(self.db.posts),1)
+        self.assertEqual(self.db.posts[0]['id'],s['operation_id'])
+        self.assertEqual(self.db.posts[0]['payments'],[{'wallet':'ماستر','amount':8000}])
+
+    def test_missing_treasury_configuration_never_falls_back_to_payment_methods(self):
+        for getter in (lambda:[],Mock(side_effect=RuntimeError('unavailable'))):
+            client=Mock();integration._config=SimpleNamespace(wallets=getter,client=client)
+            with self.assertRaises(fl.FinanceError):integration.financial_wallet_names()
+            self.assertFalse(client.table.called)
+
     async def test_authorization_and_stale_buttons(self):
         s=await start_income(self.context,customer_id=123)
         await ui.handle_finance_callback(self.query(s,'purchase',owner=1),self.context)
