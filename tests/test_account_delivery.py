@@ -9,6 +9,24 @@ from financial_ledger import FinanceError
 
 
 class TemplateTests(unittest.TestCase):
+    def test_registration_confirms_capacity_with_original_server(self):
+        data=dict(email='a@example.com',password='Password',secret='JBSWY3DPEHPK3PXP',capacity=7,code='test_code')
+        old={'id':'account','capacity':3,'revision':2}
+        with patch.object(ad,'rpc',side_effect=[{'id':'account','code':'test_code'},{'accounts':[old]},None,{'accounts':[{**old,'capacity':7}]}]) as rpc:
+            self.assertEqual(ad.register_account(**data)['capacity'],7)
+            self.assertEqual(rpc.call_args_list[2].args,('account',))
+            self.assertEqual(rpc.call_args_list[2].kwargs,dict(id='account',revision=2,capacity=7))
+
+    def test_registration_failure_is_retryable_without_false_success(self):
+        data=dict(email='a@example.com',password='Password',secret='JBSWY3DPEHPK3PXP',capacity=7,code='test_code')
+        old={'id':'account','capacity':3,'revision':2}
+        for failure in (FinanceError('write failed'),None):
+            with patch.object(ad,'rpc',side_effect=[{'id':'account'},{'accounts':[old]},failure,{'accounts':[old]}]):
+                with self.assertRaises(FinanceError):ad.register_account(**data)
+        with patch.object(ad,'rpc',side_effect=[{'id':'account','duplicate':True},{'accounts':[{**old,'capacity':7}]}]) as rpc:
+            self.assertEqual(ad.register_account(**data)['capacity'],7)
+            self.assertEqual(rpc.call_count,2)
+
     def test_postgres_fractional_timestamp_precision_is_supported(self):
         for fraction in ('1','12','123','1234','12345','123456'):
             value=ad.parse_time('2026-10-28T23:44:03.'+fraction+'+03:00')
@@ -89,6 +107,26 @@ class DeliverySQLTests(unittest.TestCase):
     def test_duplicate_command_uses_same_persisted_request(self):
         a=self.start(message_id=99);b=self.start(message_id=99)
         self.assertEqual(a['request']['id'],b['request']['id'])
+    def test_register_existing_native_applies_seven_seats(self):
+        code='native_'+uuid.uuid4().hex[:12]
+        self.sql(f"insert into chatgpt_shared_accounts(email,password,totp_secret,capacity) values('{code}@example.com','Password','JBSWY3DPEHPK3PXP',3)")
+        saved=self.call('register',email=code+'@example.com',password='Password',secret='JBSWY3DPEHPK3PXP',capacity=7,code=code)
+        self.assertEqual(saved['capacity'],7)
+        self.assertEqual(next(a for a in self.call('list')['accounts'] if a['id']==saved['id'])['capacity'],7)
+
+    def test_reregister_updates_capacity_without_duplicate_or_overbooking(self):
+        data=dict(email=self.code+'@example.com',password='Password',secret='JBSWY3DPEHPK3PXP',capacity=7,code=self.code)
+        self.assertEqual(self.call('register',**data)['capacity'],7)
+        count=self.sql(f"select count(*) from delivery_accounts where owner_id={self.owner}")
+        self.assertTrue(self.call('register',**data)['duplicate'])
+        self.assertEqual(self.sql(f"select count(*) from delivery_accounts where owner_id={self.owner}"),count)
+        pending=self.prepare(seats=4);self.call('reserve',id=pending['request']['id'])
+        self.call('register',**{**data,'capacity':3},ok=False)
+        self.call('register',**{**data,'capacity':0},ok=False)
+        self.assertEqual(self.call('list')['accounts'][0]['capacity'],7)
+        other=self.owner;self.owner+=1
+        try:self.call('register',**data,ok=False)
+        finally:self.owner=other
     def test_new_delivery_has_one_contract_and_idempotent_finish(self):
         d=self.prepare();r=self.finish(d);again=self.call('finish',id=d['request']['id'])
         self.assertTrue(again['duplicate']);self.assertEqual(len(r['contracts']),1)

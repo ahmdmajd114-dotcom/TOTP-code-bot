@@ -93,6 +93,7 @@ declare a delivery_accounts%rowtype; n chatgpt_shared_accounts%rowtype;
 begin
  perform pg_advisory_xact_lock(p_owner);
  if p_action='register' then
+   if coalesce((p->>'capacity')::integer,0) not between 1 and 20 then raise exception 'Invalid account capacity';end if;
    if coalesce(p->>'email','')!~'^[^ @]+@[^ @]+\.[^ @]+$' or length(coalesce(p->>'password',''))<6
      or coalesce(p->>'secret','')!~'^[A-Z2-7]{16,128}$' or coalesce(p->>'code','')!~'^[A-Za-z0-9_-]{4,40}$' then
      raise exception 'Invalid account fields'; end if;
@@ -104,8 +105,16 @@ begin
      values(p->>'email',p->>'password',p->>'secret',(p->>'capacity')::integer) returning * into n;
    end if;
    if exists(select 1 from delivery_accounts where native_id=n.id) then
-     select * into a from delivery_accounts where native_id=n.id;
-     return jsonb_build_object('id',a.id,'code',a.code,'duplicate',true);
+     select * into a from delivery_accounts where native_id=n.id and owner_id=p_owner for update;
+     if not found then raise exception 'Account belongs to another owner';end if;
+     occ:=delivery_occupancy(a.id);
+     if (p->>'capacity')::integer<(occ->>'seats')::integer+(occ->>'held')::integer then raise exception 'Capacity below active reservations';end if;
+     if n.capacity<>(p->>'capacity')::integer then
+       update chatgpt_shared_accounts set capacity=(p->>'capacity')::integer where id=n.id;
+       update delivery_accounts set revision=revision+1 where id=a.id;
+       insert into delivery_events(owner_id,kind,details) values(p_owner,'account_update',jsonb_build_object('account_id',a.id,'capacity',(p->>'capacity')::integer));
+     end if;
+     return jsonb_build_object('id',a.id,'code',a.code,'capacity',(p->>'capacity')::integer,'duplicate',true);
    end if;
    select count(*) into rows_count from totp_accounts where lower(label)=lower(n.email);
    if rows_count>1 then raise exception 'Multiple legacy accounts match email; review required';end if;
@@ -122,8 +131,11 @@ begin
        union select chat_id from totp_links where account_id::text=legacy
        union select customer_chat_id from chatgpt_account_assignments where account_id=n.id and status='active'
      ) old_links on conflict do nothing;
+   occ:=delivery_occupancy(a.id);
+   if (p->>'capacity')::integer<(occ->>'seats')::integer+(occ->>'held')::integer then raise exception 'Capacity below active reservations';end if;
+   update chatgpt_shared_accounts set capacity=(p->>'capacity')::integer where id=n.id;
    insert into delivery_events(owner_id,kind,details) values(p_owner,'register',jsonb_build_object('account_id',a.id));
-   return jsonb_build_object('id',a.id,'code',a.code);
+   return jsonb_build_object('id',a.id,'code',a.code,'capacity',(p->>'capacity')::integer);
  end if;
  if p_action='list' then
    return jsonb_build_object('accounts',coalesce((select jsonb_agg(jsonb_build_object('id',da.id,'code',da.code,'email',na.email,'capacity',na.capacity,'enabled',da.enabled and na.is_active,'revision',da.revision,'occupancy',delivery_occupancy(da.id)))

@@ -63,6 +63,7 @@ def rpc(action,**payload):
         if code=='PGRST202':raise FinanceError('شغّل ملف supabase_account_delivery.sql أولاً. لم أنفّذ ربطاً جزئياً.') from None
         reasons={
             'capacity exceeded':'الحساب ممتلئ أو محجوز بعملية أخرى. لم أتجاوز السعة.',
+            'Capacity below active reservations':'السعة المطلوبة أقل من المقاعد المشغولة والمحجوزة؛ لم أغيّرها.',
             'allocation already used':'هذه الدفعة مستخدمة أو محجوزة؛ اختر دفعة أخرى أو راجع توزيعها.',
             'already activated':'هذه الدفعة مفعلة بالنظام السابق؛ راجع اشتراكها قبل استخدامها.',
             'Card changed':'البطاقة تغيّرت؛ أعد فتحها.',
@@ -80,6 +81,26 @@ def rpc(action,**payload):
             if marker in reason:raise FinanceError(message) from None
         # No DB exception string: account registration contains credentials.
         raise FinanceError('تعذّر تأكيد عملية التسليم. افتحها من /delivery وراجع حالتها؛ لا تعتبرها مكتملة.') from None
+
+
+def register_account(**data):
+    """Verify capacity even on servers running the original registration RPC.
+
+    Old SQL reuses an existing account without applying its requested capacity.
+    Use the revision-checked account update, which enforces occupancy, and only
+    report success after a read confirms it. A retry reuses the same account.
+    """
+    data=validate_account(data)
+    saved=rpc('register',**data)
+    accounts=rpc('list')['accounts']
+    account=next((a for a in accounts if a['id']==saved['id']),None)
+    if account is None:raise FinanceError('تم تجهيز الحساب لكن تعذّر تأكيد سعته؛ أعد الاعتماد للمراجعة.')
+    if int(account['capacity'])!=data['capacity']:
+        rpc('account',id=account['id'],revision=account['revision'],capacity=data['capacity'])
+        account=next((a for a in rpc('list')['accounts'] if a['id']==saved['id']),None)
+        if account is None or int(account['capacity'])!=data['capacity']:
+            raise FinanceError('لم تتأكد السعة المطلوبة؛ راجع الحساب من /delivery قبل التسليم.')
+    return {**saved,'capacity':int(account['capacity'])}
 
 
 def validate_account(state):
@@ -434,9 +455,10 @@ async def handle_admin_callback(update,context):
         elif action.startswith('save:'):
             preview=context.user_data.get('delivery_admin_preview')
             if not preview or preview.get('token')!=action[5:]:raise FinanceError('المعاينة انتهت أو تغيرت؛ افتح آخر معاينة.')
-            saved=await run_io(rpc,{'add':'register','template':'save_template','capacity':'account','credentials':'credentials'}[preview['kind']],**preview['data'])
+            if preview['kind']=='add':saved=await run_io(register_account,**preview['data'])
+            else:saved=await run_io(rpc,{'template':'save_template','capacity':'account','credentials':'credentials'}[preview['kind']],**preview['data'])
             context.user_data.pop('delivery_admin_preview',None)
-            await q.message.reply_text('✅ تم الحفظ.'+(f"\n/link {saved['code']}" if saved.get('code') else ''))
+            await q.message.reply_text('✅ تم الحفظ.'+(f"\nالسعة المعتمدة: {saved['capacity']}" if 'capacity' in saved else '')+(f"\n/link {saved['code']}" if saved.get('code') else ''))
             await show_admin(q.message,context)
         elif action.startswith('open:'):
             await show_card(q.message,context,await run_io(rpc,'get',id=expanded(action[5:])))
