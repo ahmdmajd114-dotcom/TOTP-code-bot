@@ -71,6 +71,25 @@ def _record_label(row):
     return f"{KINDS.get(row['kind'], 'سجل قديم')} | {row.get('product') or row.get('customer_id') or 'عام'} | {max(int(row.get('cash_in',0)),int(row.get('cash_out',0))):,}"
 
 
+def operation_wallet_text(row, entries):
+    """Display actual posted wallet effects, not an inferred payment method."""
+    wallets=[e for e in entries if e['account_key'].startswith('wallet:') and int(e['delta'])]
+    if wallets:
+        lines=['الخزائن — الأثر المسجل:']
+        for e in wallets:
+            amount=int(e['delta'])
+            lines.append(f"{e['account_key'][7:]}: {'دخل' if amount>0 else 'خرج'} {abs(amount):,} دينار")
+        return '\n'.join(lines)
+    if row.get('historical'):
+        payments=row['payload'].get('payments',[])
+        lines=['سجل تاريخي؛ لا يغيّر أرصدة الخزائن بعد البداية.']
+        for p in payments:
+            lines.append(f"الخزنة بالسجل القديم: {p['wallet']} — {int(p['amount']):,} دينار")
+        if not payments:lines.append('الخزنة غير محفوظة في السجل القديم.')
+        return '\n'.join(lines)
+    return 'الخزائن: لا توجد حركة نقدية مسجلة لهذه العملية.'
+
+
 async def show_record_search(message,context,text):
     rows=(await run_io(lambda: [r for r in ledger().operations() if text.casefold() in str(r['payload']).casefold() or text in str(r['cash_in']) or text in str(r['cash_out'])]))
     context.user_data['finance_search_text']=text
@@ -109,9 +128,13 @@ async def handle_report_menu(data,query,context):
         buttons.append([('بحث بالزبون أو المبلغ أو الرقم','finance_records_search')])
         await query.message.reply_text(f'سجل العمليات — {len(rows)}',reply_markup=menu_keyboard(buttons))
     elif data.startswith('finance_view_'):
-        oid=data[len('finance_view_'):];r=(await run_io(lambda: next((r for r in ledger().operations() if r['id']==oid),None)))
+        oid=data[len('finance_view_'):];r=(await run_io(lambda: ledger().operation(oid)))
         if not r:raise FinanceError('لم أجد العملية.')
+        entries=await run_io(lambda: ledger().operation_entries(oid))
         p=r['payload'];text=f"{KINDS.get(r['kind'],'سجل قديم')}\nرقم: {oid}\nالزبون: {p.get('customer_name') or r.get('customer_id') or 'عام'}\nالمنتج: {r.get('product') or '—'}\nقبض: {r['cash_in']:,}\nصرف: {r['cash_out']:,}\nوقت العملية: {r.get('occurred_at') or 'غير معروف'}\nوقت التسجيل: {r['recorded_at']}\nالسبب: {p.get('description') or '—'}"
+        # Keep wallet effects visible even when a long free-text description
+        # requires truncating the Telegram card.
+        text=text.replace('\nالزبون:', '\n'+operation_wallet_text(r,entries)+'\nالزبون:',1)
         buttons=[]
         if not r['historical'] and r['kind']!='reversal':
             buttons.append([('إلغاء مالي مرتبط','finance_reverse_'+oid)])

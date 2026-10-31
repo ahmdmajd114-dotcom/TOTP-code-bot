@@ -48,6 +48,7 @@ class FakeLedger:
     def save_draft(self,state):self.states[state['draft_id']]=deepcopy(state)
     def draft(self,key):return deepcopy(self.states[key])
     def operation(self,key):return self.records.get(key)
+    def operation_entries(self,key):return [e for e in self.snapshot()['entries'] if e['operation_id']==key]
     def claim_outbox(self,oid=None):return {'id':oid,'token':1,'payload':self.records[oid]}
     def ack_outbox(self,*args,**kwargs):pass
     def accounts(self):return deepcopy(self.balances)

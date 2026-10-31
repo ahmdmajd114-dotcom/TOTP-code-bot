@@ -1,9 +1,12 @@
 from copy import deepcopy
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, AsyncMock, patch
 
 from financial_ledger import FinanceError
 from vault_manager import audit_balances, wallet_statement
-from reports_manager import totals
+from reports_manager import totals, operation_wallet_text
+import reports_manager
 
 
 def snapshot():
@@ -22,7 +25,46 @@ def snapshot():
     }
 
 
+class OperationDetailsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_entry_read_does_not_show_misleading_no_cash(self):
+        db=Mock()
+        db.operation.return_value={'id':'PAY-1'}
+        db.operation_entries.side_effect=FinanceError('read failed')
+        query=SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
+        with patch.object(reports_manager,'ledger',return_value=db):
+            with self.assertRaises(FinanceError):
+                await reports_manager.handle_report_menu('finance_view_PAY-1',query,SimpleNamespace(user_data={}))
+        query.message.reply_text.assert_not_called()
+
+    async def test_detail_card_includes_committed_wallet_and_amount(self):
+        db=Mock()
+        db.operation.return_value=dict(id='PAY-1',kind='sale',payload={},cash_in=10000,cash_out=0,recorded_at='2026-10-31',historical=False)
+        db.operation_entries.return_value=[{'account_key':'wallet:رصيد اثير','delta':10000}]
+        query=SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
+        with patch.object(reports_manager,'ledger',return_value=db),patch.object(reports_manager,'menu_keyboard',return_value=None):
+            await reports_manager.handle_report_menu('finance_view_PAY-1',query,SimpleNamespace(user_data={}))
+        self.assertIn('رصيد اثير: دخل 10,000',query.message.reply_text.call_args.args[0])
+        db.operation_entries.assert_called_once_with('PAY-1')
+
+
 class TreasuryAuditTests(unittest.TestCase):
+    def test_operation_shows_posted_wallets_instead_of_payload_guess(self):
+        row={'payload':{'payments':[{'wallet':'wrong','amount':10000}]}}
+        text=operation_wallet_text(row,[{'account_key':'wallet:ماستر','delta':10000},{'account_key':'wallet:زين كاش','delta':-5000},{'account_key':'credit:1','delta':8000}])
+        self.assertIn('ماستر: دخل 10,000',text)
+        self.assertIn('زين كاش: خرج 5,000',text)
+        self.assertNotIn('wrong',text)
+        self.assertNotIn('credit:',text)
+
+    def test_historical_wallet_is_not_presented_as_new_cash(self):
+        text=operation_wallet_text({'historical':True,'payload':{'payments':[{'wallet':'ماستر','amount':10000}]}},[])
+        self.assertIn('لا يغيّر أرصدة',text)
+        self.assertIn('ماستر — 10,000',text)
+        self.assertIn('غير محفوظة',operation_wallet_text({'historical':True,'payload':{}},[]))
+
+    def test_credit_only_operation_has_no_invented_wallet(self):
+        self.assertIn('لا توجد حركة نقدية',operation_wallet_text({'payload':{}},[{'account_key':'credit:1','delta':8000}]))
+
     def test_balances_are_reconstructed_from_opening_and_signed_movements(self):
         result=audit_balances(snapshot())
         self.assertTrue(all(r['matched'] for r in result.values()))

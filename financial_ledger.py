@@ -213,6 +213,10 @@ class Ledger:
     def operations(self, customer_id=None):
         return self.rows('finance_operations', filters={'customer_id': int(customer_id)} if customer_id is not None else {})
 
+    def operation_entries(self, oid):
+        """Read committed effects for one operation, scoped to this owner."""
+        return self.rows('finance_entries', filters={'operation_id': oid}, order='account_key')
+
     def operation(self, oid):
         try:
             rows=self.client.table('finance_operations').select('*').eq('owner_id',self.owner_id).eq('id',oid).limit(1).execute().data or []
