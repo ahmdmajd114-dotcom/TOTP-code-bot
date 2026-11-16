@@ -90,6 +90,7 @@ declare a delivery_accounts%rowtype; n chatgpt_shared_accounts%rowtype;
  rid uuid; target uuid; cid bigint; payer bigint; days integer; seat_count integer;
  duration integer; funding text; mode text; allocated bigint; used bigint; occ jsonb; legacy text; migration_id uuid;
  start_time timestamptz; end_time timestamptz; saved jsonb; outcome jsonb; rows_count integer; was_complete boolean:=false;
+ legacy_before jsonb; legacy_replacement boolean:=false;
 begin
  perform pg_advisory_xact_lock(p_owner);
  if p_action='register' then
@@ -205,6 +206,34 @@ begin
  else raise exception 'Unknown delivery action';end if;
  select * into a from delivery_accounts where id=r.account_id for update;
  select * into n from chatgpt_shared_accounts where id=a.native_id for update;
+ -- A legacy subscription can be moved directly to the requested account.
+ -- Lock and revalidate its exact dates and source link before each send phase.
+ if p_action in ('reserve','claim','finish') and r.status<>'complete'
+    and r.state->>'mode'='replace' and r.state->>'legacy_reminder_id' is not null then
+   legacy_replacement:=true;
+   select * into rem from subscription_reminders
+     where id=(r.state->>'legacy_reminder_id')::bigint and customer_chat_id=r.customer_id
+       and status='active' and expires_at>now() and product_name in ('ChatGPT','جات','شات جي بي تي') for update;
+   if not found or exists(select 1 from delivery_contracts where reminder_id=rem.id)
+      or rem.expires_at is distinct from (r.state->>'legacy_ends_at')::timestamptz then
+     raise exception 'Legacy subscription changed';
+   end if;
+   legacy:=r.state->>'legacy_account_id';
+   if legacy is null or legacy=a.legacy_id or not exists(select 1 from totp_accounts where id::text=legacy)
+      or not (exists(select 1 from customer_totp_account_links where customer_chat_id=r.customer_id and account_id=legacy and status='active')
+        or exists(select 1 from totp_links where chat_id=r.customer_id and account_id::text=legacy)) then
+     raise exception 'Legacy subscription changed; select source account';
+   end if;
+   if exists(select 1 from delivery_requests x where x.owner_id=p_owner and x.id<>r.id
+       and x.state->>'legacy_reminder_id'=rem.id::text and x.status in ('reserved','sending','uncertain','sent')
+       and (x.status<>'reserved' or x.hold_until>now())) then raise exception 'Subscription has pending delivery';end if;
+   legacy_before:=jsonb_build_object('legacy_replacement',true,'legacy_account_id',legacy,
+       'reminder_id',rem.id,'starts_at',rem.started_at,'ends_at',rem.expires_at,'financial_operation_id',rem.financial_operation_id,
+       'primary_account',(select account_id::text from totp_links where chat_id=r.customer_id));
+   if p_action in ('claim','finish') and legacy_before is distinct from r.state->'legacy_before' then
+     raise exception 'Legacy subscription changed; review before sending';
+   end if;
+ end if;
  if p_action='import_reminder' then
    if r.status<>'draft' then raise exception 'Card changed';end if;
    select * into rem from subscription_reminders where id=(p->>'reminder_id')::bigint and customer_chat_id=r.customer_id and status='active' and expires_at>now() for update;
@@ -236,8 +265,9 @@ begin
      mode=r.state->>'mode';target=(r.state->>'target')::uuid;
      cid=r.customer_id;payer=coalesce((r.state->>'payer_id')::bigint,cid);
      seat_count=coalesce((r.state->>'seats')::integer,1);
+     if legacy_replacement then seat_count:=1;end if;
      if seat_count<1 or seat_count>20 or mode not in ('new','renew','replace','comp','resend') then raise exception 'Invalid delivery choice';end if;
-     if mode<>'new' then
+     if mode<>'new' and not legacy_replacement then
        select * into c from delivery_contracts where id=target and owner_id=p_owner and customer_id=cid for update;
        if not found or c.status<>'active' then raise exception 'Select exact subscription';end if;
        if exists(select 1 from delivery_requests x where x.id<>r.id and x.owner_id=p_owner and x.state->>'target'=target::text and x.status in ('reserved','sending','uncertain','sent') and (x.hold_until>now() or x.status<>'reserved')) then raise exception 'Subscription has pending delivery';end if;
@@ -282,7 +312,9 @@ begin
      update delivery_requests set status='reserved',hold_until=now()+interval '15 minutes',revision=revision+1,
        state=state||jsonb_build_object('seats',seat_count,'seat_delta',case when mode='resend' or (target is not null and c.account_id=a.id and c.ends_at>now()) then 0 else seat_count end,
           'allocated',allocated,'account_revision',a.revision,'template',to_jsonb(cfg),
-          'credentials_hash',md5(n.email||n.password||n.totp_secret),'target_before',case when target is not null then to_jsonb(c) else null end)
+          'credentials_hash',md5(n.email||n.password||n.totp_secret),'target_before',case when target is not null then to_jsonb(c) else null end,
+          'legacy_before',legacy_before,
+          'funding_id',case when legacy_replacement then rem.financial_operation_id else funding end)
        where id=r.id returning * into r;
    end if;
  end if;
@@ -331,10 +363,28 @@ begin
    end if;
    start_time:=r.sent_at;end_time:=start_time+make_interval(days=>days);
    if mode='renew' then start_time:=greatest(c.ends_at,r.sent_at);end_time:=start_time+make_interval(days=>days);end if;
-   if mode in ('replace','adopt','resend') then start_time:=c.starts_at;end_time:=c.ends_at;end if;
-   if mode='new' then
+   if legacy_replacement then
+     start_time:=rem.started_at;end_time:=rem.expires_at;
+     select * into op from finance_operations where owner_id=p_owner and id=rem.financial_operation_id and kind in ('sale','debt_issue');
+     if found then
+       if exists(select 1 from finance_operations where owner_id=p_owner and reference_id=op.id and kind in ('reversal','refund')) then raise exception 'Funding changed after sending; review';end if;
+       allocated:=greatest(op.sales-coalesce((select sum(dp.allocated) from delivery_periods dp where dp.owner_id=p_owner and dp.funding_id=op.id and not dp.voided),0),0);
+     else allocated:=0;end if;
+   elsif mode in ('replace','adopt','resend') then start_time:=c.starts_at;end_time:=c.ends_at;end if;
+   if mode='new' or legacy_replacement then
      insert into delivery_contracts(owner_id,customer_id,payer_id,customer_name,account_id,seats,starts_at,ends_at)
        values(p_owner,r.customer_id,payer,r.customer_name,a.id,seat_count,start_time,end_time) returning * into c;
+     if legacy_replacement then
+       update delivery_contracts set reminder_id=rem.id where id=c.id returning * into c;
+       -- Only the selected source is retired. Other subscriptions keep access.
+       if not exists(select 1 from delivery_contracts dc join delivery_accounts da on da.id=dc.account_id
+           where dc.customer_id=r.customer_id and da.legacy_id=legacy and dc.status='active' and dc.ends_at>now())
+          and not exists(select 1 from subscription_reminders sr where sr.customer_chat_id=r.customer_id and sr.id<>rem.id
+            and sr.status='active' and sr.expires_at>now() and sr.product_name in ('ChatGPT','جات','شات جي بي تي')
+            and not exists(select 1 from delivery_contracts where reminder_id=sr.id)) then
+         update customer_totp_account_links set status='cancelled',is_primary=false where customer_chat_id=r.customer_id and account_id=legacy;
+       end if;
+     end if;
    elsif mode<>'resend' then
      update delivery_contracts set account_id=a.id,starts_at=case when mode='renew' then starts_at else start_time end,
        ends_at=end_time,revision=revision+1 where id=c.id returning * into c;
@@ -351,11 +401,12 @@ begin
            values(r.customer_id,r.customer_name,r.business_id,'shared',days,coalesce(r.state->>'product','ChatGPT'),r.state->>'plan_name',days||' يوم',coalesce(r.state->>'funding_id'='debt',false),start_time,end_time,'active') returning * into rem;
        end if;
        update delivery_contracts set reminder_id=rem.id where id=c.id returning * into c;
-     else
+     elsif not legacy_replacement then
        update subscription_reminders set started_at=c.starts_at,expires_at=c.ends_at,status='active',feedback_status='none' where id=c.reminder_id;
      end if;
      insert into delivery_periods(owner_id,contract_id,request_id,funding_id,allocated,starts_at,ends_at,kind,snapshot)
-       values(p_owner,c.id,r.id,funding,allocated,start_time,end_time,mode,coalesce(r.state->'target_before','{}'));
+       values(p_owner,c.id,r.id,funding,allocated,start_time,end_time,mode,
+         case when legacy_replacement then legacy_before else coalesce(r.state->'target_before','{}') end);
    end if;
    -- Compatibility links are mirrors; ownership and permission stay contract-based.
    update customer_totp_account_links set is_primary=false where customer_chat_id=r.customer_id;
@@ -375,7 +426,16 @@ begin
    if oldp.kind='adopt' then raise exception 'Legacy adoption keeps existing entitlement; manual relationship review required';end if;
    if exists(select 1 from delivery_periods where contract_id=oldp.contract_id and not voided and request_id<>r.id and recorded_at>oldp.recorded_at) then raise exception 'Undo later subscription changes first';end if;
    select * into c from delivery_contracts where id=oldp.contract_id for update;
-   if oldp.kind='new' then
+   if coalesce((oldp.snapshot->>'legacy_replacement')::boolean,false) then
+     update delivery_contracts set status='cancelled',reminder_id=null,revision=revision+1 where id=c.id;
+     legacy:=oldp.snapshot->>'legacy_account_id';
+     update customer_totp_account_links set is_primary=false where customer_chat_id=r.customer_id;
+     insert into customer_totp_account_links(customer_chat_id,account_id,is_primary,status)
+       values(r.customer_id,legacy,true,'active') on conflict(customer_chat_id,account_id) do update set status='active',is_primary=true;
+     insert into totp_links(chat_id,account_id)
+       select x.chat_id,x.account_id from jsonb_populate_record(null::totp_links,jsonb_build_object('chat_id',r.customer_id,'account_id',coalesce(oldp.snapshot->>'primary_account',legacy))) x
+       on conflict(chat_id) do update set account_id=excluded.account_id;
+   elsif oldp.kind='new' then
      if oldp.funding_id is not null then
        select * into op from finance_operations where owner_id=p_owner and id=oldp.funding_id;
        if op.kind='debt_issue' and exists(select 1 from finance_debts where owner_id=p_owner and source_operation_id=op.id and remaining<>original) then raise exception 'Debt has repayments; review money separately';end if;
@@ -403,6 +463,9 @@ begin
    'legacy_reminders',coalesce((select jsonb_agg(jsonb_build_object('id',sr.id,'ends_at',sr.expires_at,'product',sr.product_name)) from subscription_reminders sr
      where sr.customer_chat_id=r.customer_id and sr.status='active' and sr.expires_at>now() and sr.product_name in ('ChatGPT','جات','شات جي بي تي')
        and not exists(select 1 from delivery_contracts where reminder_id=sr.id)),'[]'::jsonb),
+   'legacy_accounts',coalesce((select jsonb_agg(jsonb_build_object('id',t.id::text,'label',coalesce(t.label,t.id::text))) from totp_accounts t
+     where t.id::text<>a.legacy_id and (exists(select 1 from customer_totp_account_links l where l.customer_chat_id=r.customer_id and l.account_id=t.id::text and l.status='active')
+       or exists(select 1 from totp_links l where l.chat_id=r.customer_id and l.account_id=t.id))),'[]'::jsonb),
    'funding',coalesce((select jsonb_agg(jsonb_build_object('id',f.id,'product',f.product,'sales',f.sales,'payload',f.payload,
      'available',f.sales-coalesce((select sum(dp.allocated) from delivery_periods dp where dp.owner_id=p_owner and dp.funding_id=f.id and not dp.voided),0)))
      from finance_operations f where owner_id=p_owner and customer_id=coalesce((r.state->>'payer_id')::bigint,r.customer_id) and kind in ('sale','debt_issue') and not historical

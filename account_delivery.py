@@ -75,6 +75,7 @@ def rpc(action,**payload):
             'Possible credential':'قد تكون البيانات وصلت؛ تحقق من التسليم قبل الإلغاء.',
             'later subscription':'تراجع عن تعديلات الاشتراك اللاحقة أولاً.',
             'Account changed':'الحساب تغير أو تعطل؛ أعد مراجعته.',
+            'Legacy subscription changed':'الاشتراك القديم أو ربطه تغير؛ أعد اختيار الاشتراك والحساب السابق.',
         }
         reason=str(getattr(exc,'message',exc))
         for marker,message in reasons.items():
@@ -182,8 +183,13 @@ async def show_card(message,context,data):
                 rows += [[('🔄 تجديد اشتراك محدد','mode_renew')],[('🔁 استبدال حساب اشتراك','mode_replace'),('💝 تعويض','mode_comp')],[('📨 إعادة إرسال بلا مدة جديدة','mode_resend')]]
             rows += [[('💳 المشتري/الدافع شخص آخر','payer')]]
             for old in data.get('legacy_reminders',[]):
+                rows.append([(f"🔁 استبدال اشتراك {old['id']} بنفس الدفعة والمدة",'replaceold_'+str(old['id']))])
                 rows.append([(f"مراجعة اشتراك قديم {old['id']} — ينتهي {old['ends_at'][:10]}",'import_'+str(old['id']))])
             text+='\nاختر الغرض؛ الاشتراك المنتهي لا يُعد فعالاً، ويمكن تجديده بالاختيار.'
+        elif step=='legacy_source':
+            text+='\nاختر الحساب السابق لهذا الاشتراك:'
+            for old in data.get('legacy_accounts',[]):
+                rows.append([(old['label'],'oldaccount_'+funding_token(old['id']))])
         elif step=='target':
             text+='\nاختر الاشتراك المقصود:'
             for c in data['contracts']:
@@ -202,6 +208,8 @@ async def show_card(message,context,data):
             context.user_data['delivery_input']={'id':r['id'],'revision':r['revision'],'step':step}
         elif step=='summary':
             text+=f"\nنوع العملية: {state.get('mode')}\nالباقة: {state.get('plan_name','المدة الحالية')}\nالأيام: {state.get('days','تبقى كما هي')}\nالمبلغ المخصص: {state.get('allocated',0):,}\nالمقاعد: {state.get('seats',1)}\nالدافع: {state.get('payer_id',r['customer_id'])}"
+            if state.get('legacy_reminder_id'):
+                text+=f"\nاستبدال الاشتراك {state['legacy_reminder_id']} بنفس الدفعة.\nتاريخ الانتهاء المحفوظ: {display_date(state['legacy_ends_at'])}"
             rows=[[('✅ مراجعة وحجز السعة','reserve')]]
             if state.get('mode')=='new':rows.append([('تعديل عدد المقاعد','seats')])
         rows += [[('◀️ رجوع','back'),('إلغاء','cancel')]]
@@ -260,6 +268,8 @@ async def retry_followup(context,message,result):
         try:
             state={'customer_chat_id':r['customer_id'],'reminder_id':reminder,'duration_days':r['state'].get('days') or 1}
             existing=await run_io(lambda:_services.client.table('subscription_reminders').select('scheduled_message_id,status').eq('id',reminder).eq('customer_chat_id',r['customer_id']).execute().data)
+            if r['state'].get('legacy_reminder_id') and existing and existing[0].get('scheduled_message_id'):
+                return
             if existing and existing[0].get('scheduled_message_id'):
                 await _services.cancel_schedule(r['customer_id'],existing[0]['scheduled_message_id'])
                 await run_io(lambda:_services.client.table('subscription_reminders').update({'scheduled_message_id':None,'scheduled_message_status':'none'}).eq('id',reminder).execute())
@@ -332,7 +342,20 @@ async def handle_delivery_callback(update,context):
                 data=await run_io(rpc,'import_reminder',id=rid,reminder_id=int(action[6:]))
                 await show_card(q.message,context,data);return
             previous=state.get('step','purpose')
-            if action.startswith('mode_'):
+            if action.startswith('replaceold_'):
+                if 'legacy_accounts' not in data:
+                    raise FinanceError('تحديث الاستبدال يحتاج تشغيل ملف supabase_account_delivery.sql مرة واحدة في قاعدة المتجر. تحصل عليه من /delivery ← ملف التهيئة.')
+                old=next(x for x in data['legacy_reminders'] if str(x['id'])==action[11:])
+                if not data['legacy_accounts']:
+                    raise FinanceError('لم أجد ربط الحساب السابق لهذا الزبون؛ راجع حسابه المرتبط قبل تأكيد الاستبدال.')
+                state={'mode':'replace','legacy_reminder_id':old['id'],'legacy_ends_at':old['ends_at'],
+                       'step':'legacy_source','seats':1,'payer_id':r['customer_id']}
+                accounts=data.get('legacy_accounts',[])
+                if len(accounts)==1:state.update(legacy_account_id=accounts[0]['id'],step='summary')
+            elif action.startswith('oldaccount_'):
+                old=next(x for x in data['legacy_accounts'] if funding_token(x['id'])==action[11:])
+                state.update(legacy_account_id=old['id'],step='summary')
+            elif action.startswith('mode_'):
                 state={'mode':action[5:],'step':'funding' if action=='mode_new' else 'target','payer_id':state.get('payer_id',r['customer_id']),'payer_name':state.get('payer_name'),'seats':1}
             elif action.startswith('target_'):
                 target=next(c for c in data['contracts'] if compact(c['id'])==action[7:])

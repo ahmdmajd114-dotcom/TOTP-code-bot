@@ -235,6 +235,88 @@ class DeliverySQLTests(unittest.TestCase):
         self.assertEqual(r['occupancy']['seats'],1);self.assertEqual(r['occupancy']['unreviewed'],0)
         self.assertEqual(self.sql(f'select finance_read({self.owner})'),before)
 
+    def legacy_replacement(self):
+        """An old TOTP-only account needs no delivery registration."""
+        old=self.sql(f"insert into totp_accounts(label,secret,link_code) values('old@example.com','JBSWY3DPEHPK3PXP','old_{self.code}') returning id").splitlines()[0]
+        self.sql(f"insert into totp_links(chat_id,account_id) values({self.customer},{old});insert into customer_totp_account_links(customer_chat_id,account_id,is_primary) values({self.customer},'{old}',true)")
+        funding=self.sale()
+        reminder=self.sql(f"insert into subscription_reminders(customer_chat_id,customer_name,product_name,started_at,expires_at,status,financial_operation_id,scheduled_message_id,scheduled_message_status) values({self.customer},'Old','ChatGPT',now()-interval '23 days',now()+interval '7 days','active','{funding}',456,'scheduled') returning id").splitlines()[0]
+        d=self.start();oldrem=next(x for x in d['legacy_reminders'] if str(x['id'])==reminder)
+        self.assertIn(old,[x['id'] for x in d['legacy_accounts']])
+        d=self.select(d,mode='replace',legacy_reminder_id=int(reminder),legacy_account_id=old,legacy_ends_at=oldrem['ends_at'],seats=1,step='summary')
+        return d,old,reminder,funding
+
+    def test_direct_legacy_replacement_preserves_payment_dates_and_idempotency(self):
+        d,old,reminder,funding=self.legacy_replacement()
+        financial=self.sql(f'select finance_read({self.owner})')
+        rem_before=self.sql(f'select to_jsonb(r) from subscription_reminders r where id={reminder}')
+        result=self.finish(d)
+        self.assertEqual(self.sql(f'select finance_read({self.owner})'),financial)
+        self.assertEqual(result['request']['result']['ends_at'],json.loads(rem_before)['expires_at'])
+        self.assertEqual(result['request']['result']['funding_id'],funding)
+        self.assertEqual(self.sql(f'select count(*) from delivery_accounts where owner_id={self.owner}'),'1')
+        self.assertEqual(self.sql(f'select to_jsonb(r) from subscription_reminders r where id={reminder}'),rem_before)
+        self.assertTrue(self.call('finish',id=d['request']['id'])['duplicate'])
+        self.assertEqual(self.sql(f"select status from customer_totp_account_links where customer_chat_id={self.customer} and account_id='{old}'"),'cancelled')
+        undo=self.call('undo',id=d['request']['id'])
+        self.assertTrue(undo['request']['result']['undone'])
+        self.assertEqual(self.sql(f'select account_id from totp_links where chat_id={self.customer}'),old)
+        self.assertEqual(self.sql(f'select finance_read({self.owner})'),financial)
+        self.assertEqual(self.sql(f'select to_jsonb(r) from subscription_reminders r where id={reminder}'),rem_before)
+
+    def test_legacy_replacement_capacity_cancel_and_competing_reservation(self):
+        d,old,reminder,funding=self.legacy_replacement()
+        occupied=self.prepare(customer=self.customer+1,seats=3);self.call('reserve',id=occupied['request']['id'])
+        self.call('reserve',id=d['request']['id'],ok=False)
+        self.assertEqual(self.sql(f'select account_id from totp_links where chat_id={self.customer}'),old)
+        self.call('cancel',id=occupied['request']['id'])
+        self.call('reserve',id=d['request']['id'])
+        other=self.select(self.start(),**d['request']['state'])
+        self.call('reserve',id=other['request']['id'],ok=False)
+        self.call('cancel',id=d['request']['id'])
+        self.assertEqual(self.sql(f'select count(*) from delivery_contracts where owner_id={self.owner}'),'0')
+
+    def test_legacy_replacement_rejects_changed_dates_and_wrong_customer(self):
+        d,old,reminder,funding=self.legacy_replacement()
+        self.call('reserve',id=d['request']['id'])
+        self.sql(f"update subscription_reminders set expires_at=expires_at+interval '1 day' where id={reminder}")
+        self.call('claim',id=d['request']['id'],ok=False)
+        self.call('cancel',id=d['request']['id'])
+        other=self.select(self.start(customer=self.customer+1),**d['request']['state'])
+        self.call('reserve',id=other['request']['id'],ok=False)
+
+    def test_legacy_replacement_funding_is_not_spent_again(self):
+        d,old,reminder,funding=self.legacy_replacement();self.finish(d)
+        self.call('reserve',id=self.prepare(funding=funding)['request']['id'],ok=False)
+
+    def test_legacy_replacement_owner_button_uses_old_reminder_directly(self):
+        import asyncio
+        async def exercise():
+            selected,old,reminder,funding=self.legacy_replacement()
+            data=self.start();request=data['request'];saved_services=ad._services
+            ad._services=SimpleNamespace(owner_id=self.owner)
+            query=SimpleNamespace(from_user=SimpleNamespace(id=self.owner),answer=AsyncMock(),
+                data=f"dl:{ad.compact(request['id'])}:{request['revision']}:replaceold_{reminder}",
+                message=SimpleNamespace(reply_text=AsyncMock()))
+            try:
+                with patch.object(ad,'rpc',side_effect=lambda action,**p:self.call(action,**p)),patch.object(ad,'show_card',new_callable=AsyncMock):
+                    await ad.handle_delivery_callback(SimpleNamespace(callback_query=query),SimpleNamespace(user_data={}))
+                state=self.call('get',id=request['id'])['request']['state']
+                self.assertEqual(state['step'],'summary')
+                self.assertEqual(state['mode'],'replace')
+                self.assertEqual(state['legacy_reminder_id'],int(reminder))
+                self.assertEqual(state['legacy_account_id'],old)
+            finally:ad._services=saved_services
+        asyncio.run(exercise())
+
+    def test_legacy_replacement_keeps_other_subscriptions(self):
+        d,old,reminder,funding=self.legacy_replacement()
+        sibling=self.sql(f"insert into subscription_reminders(customer_chat_id,customer_name,product_name,started_at,expires_at,status) values({self.customer},'Other','ChatGPT',now(),now()+interval '9 days','active') returning id").splitlines()[0]
+        before=self.sql(f'select to_jsonb(r) from subscription_reminders r where id={sibling}')
+        self.finish(d)
+        self.assertEqual(self.sql(f'select to_jsonb(r) from subscription_reminders r where id={sibling}'),before)
+        self.assertEqual(self.sql(f"select status from customer_totp_account_links where customer_chat_id={self.customer} and account_id='{old}'"),'active')
+
     def test_failed_reservation_has_no_debt_or_subscription_side_effect(self):
         occupied=self.prepare(customer=self.customer+1,seats=3);self.call('reserve',id=occupied['request']['id'])
         d=self.prepare(funding='debt');self.call('reserve',id=d['request']['id'],ok=False)
