@@ -146,7 +146,14 @@ from intent_fallback import (
     normalize_arabic_text,
     prioritize_action_categories,
 )
-from photo_intent import PhotoIntent, is_confident_code_verification, parse_photo_intent
+from photo_intent import PhotoIntent, parse_photo_intent, CUSTOMER_PHOTO_INTENT_PROMPT
+from login_assistance import (LoginServices, configure_login, handle_login, start_delivery as start_login_delivery,
+    login_worker, owner_takeover as login_owner_takeover, LOGIN_PHOTOS, account_chosen as login_account_chosen)
+from work_hours_manager import (WorkHoursServices, configure_work_hours, route as work_hours_route,
+    hold as hold_work_hours_message, owner_answered as work_hours_owner_answered,
+    is_direct_reply as is_direct_work_hours_reply, cancel_immediately as cancel_work_hours_wait,
+    work_hours_worker, build_work_hours_bot, install_handler_tracking, track_handler as track_work_hours_handler,
+    stop_work_hours)
 from conversation_policy import is_within_context_gap
 from chatgpt_sales_flow import (
     asks_payment_guidance,
@@ -1341,6 +1348,7 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
             ),
             business_connection_id=business_connection_id,
             message_id=message_id,
+            date=datetime.fromisoformat(str(row['received_at']).replace('Z', '+00:00')),
             text=text,
             caption=None,
             photo=None,
@@ -1348,7 +1356,7 @@ async def resume_paused_customer_messages(context: ContextTypes.DEFAULT_TYPE) ->
         )
         _ready_customer_texts[(chat_id, message_id)] = text
         try:
-            await on_business_message(
+            await track_work_hours_handler(on_business_message)(
                 SimpleNamespace(business_message=synthetic_bm, edited_business_message=None),
                 context,
             )
@@ -4974,17 +4982,7 @@ PAYMENT_PROOF_ANALYSIS_PROMPT = (
     "انسخ التاريخ والوقت الظاهرين كما هما إلى receipt_datetime بعد تحويلهما للصيغة المطلوبة، ولا تكتب فرقاً زمنياً تقديرياً."
 )
 
-CUSTOMER_PHOTO_INTENT_PROMPT = (
-    "أنت مصنف صور لزبائن متجر اشتراكات. افحص ما يظهر فعلياً بالصورة، "
-    "واختر نية واحدة فقط. code_verification تعني أن الصورة شاشة تسجيل دخول "
-    "أو تحقق تخص ChatGPT أو OpenAI وتطلب بوضوح إدخال رمز/كود/OTP أو رمز مرسل "
-    "للبريد. payment_receipt تعني وصل أو تطبيق دفع يظهر عملية تحويل/دفع ومبلغاً "
-    "أو نجاح العملية. أي صورة أخرى = other. لا تعتبر وجود رقم من 6 خانات وحده "
-    "دليلاً على طلب كود، ولا تعتبر لقطة ChatGPT عادية طلب كود. "
-    "أخرج JSON فقط: "
-    '{"intent":"code_verification|payment_receipt|other",'
-    '"confidence":0.0,"description":"وصف عربي قصير لما يظهر"}'
-)
+
 
 
 async def describe_image(file_bytes: bytes) -> str | None:
@@ -7276,6 +7274,13 @@ async def handle_totp_account_picker_callback(update: Update, context: ContextTy
         await query.answer("هذا الحساب لم يعد متاحاً.", show_alert=True)
         return
     (await run_io(lambda: remember_selected_totp_account(chat_id, account_id)))
+    if picker_kind == "codeacct":
+        (await run_io(lambda: _save_retry_state(chat_id, 0, False)))
+        connection_id = getattr(query.message, "business_connection_id", None) or (await run_io(lambda: get_customer_business_connection_id(chat_id)))
+        await query.answer("تم اختيار الحساب.")
+        if connection_id:
+            await login_account_chosen(context, query.message, chat_id, account_id, connection_id)
+        return
     # الكود الذي يصدر بعد الاختيار هو المحاولة الأولى للحساب الجديد.
     (await run_io(lambda: _save_retry_state(chat_id, 1, False)))
     await query.answer("تم اختيار الحساب؛ أنتظر بداية الكود الجديد.")
@@ -7951,10 +7956,16 @@ async def handle_customer_photo(
         image_description=description,
     )))
 
-    if not is_confident_code_verification(result):
-        # الوصل المؤكد، والصور غير الواضحة، تبقى تحت مراجعة الأونر ولا
-        # يمكنها تشغيل مسار كود TOTP.
+    if result.intent not in LOGIN_PHOTOS:
         await handle_incoming_payment_photo(update, context, bm)
+        return
+    photo_route = await work_hours_route(context, bm, photo_intent=result.intent)
+    if photo_route == 'hold':
+        return
+    if photo_route != 'login' and (await run_io(lambda: is_live_support_context_active(chat_id))):
+        return
+    login_result = await handle_login(context, bm, photo=result)
+    if login_result != 'code':
         return
 
     reply_text, stopped = (await run_io(lambda: process_code_request(chat_id)))
@@ -11454,6 +11465,8 @@ def observe_business_update_arrival(update: Update) -> None:
     if bm.from_user.id != OWNER_USER_ID:
         _latest_customer_message_ids[chat_id] = max(bm.message_id,_latest_customer_message_ids.get(chat_id,0))
     elif bm.text:
+        if is_direct_work_hours_reply(bm, OWNER_USER_ID):
+            cancel_work_hours_wait(chat_id)
         target = _latest_customer_message_ids.get(chat_id)
         _owner_arrival_reply_targets[(chat_id,bm.message_id)] = (True,target)
         suppress_customer_reply_on_owner_arrival(chat_id,target)
@@ -11463,6 +11476,7 @@ async def mark_owner_took_over_customer_chat(chat_id: int, target=None) -> None:
     """Persist takeover after suppressing only the message seen at arrival."""
     message_id = target[1] if target else _latest_customer_message_ids.get(chat_id)
     suppress_customer_reply_on_owner_arrival(chat_id,message_id)
+    await login_owner_takeover(chat_id)
     # إذا كانت الردود العامة متوقفة، رد الأونر يعني أن الرسالة المعلّقة
     # عولجت يدوياً. نحذفها من الطابور الدائم حتى لا يرد عليها البوت عند
     # الاستئناف، حتى لو أُعيد تشغيل Render قبل ذلك.
@@ -11692,9 +11706,13 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # ولا فحص صور أو تحويلات أو إرسال إشعارات المتجر.
         return
 
+    if is_from_owner and is_direct_work_hours_reply(bm, OWNER_USER_ID):
+        await work_hours_owner_answered(context, chat_id, bm.business_connection_id, bm.message_id)
+
     # صورة جاية من الزبون: الرؤية تميز شاشة طلب الكود عن وصل الدفع قبل
     # اختيار الإجراء. إصدار الكود يبقى محمياً بالربط والاشتراك والعداد.
     if bm.photo and not is_from_owner:
+        await work_hours_route(context, bm, text=bm.caption)
         cancel_pending_customer_text_batch(chat_id)
         (await run_io(lambda: remember_latest_customer_business_photo(bm)))
         photo_key = (chat_id, bm.message_id, False)
@@ -11739,9 +11757,17 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     customer_name = bm.chat.full_name or bm.chat.first_name or "غير معروف"
     customer_username = bm.chat.username
 
+    work_route = 'normal'
+    if not is_from_owner:
+        work_route = await work_hours_route(context, bm, text=text)
+        if work_route == 'hold':
+            cancel_pending_customer_text_batch(chat_id)
+            await hold_work_hours_message(context, bm, text)
+            return
+
     # كل نص من الزبون ينتظر نافذة قصيرة حتى تكتمل الأجزاء المتتابعة.
     # التحية المنفردة تستخدم نفس النظام لكن بانتظار دقيقة كاملة.
-    if not is_from_owner and ready_customer_text is None:
+    if not is_from_owner and ready_customer_text is None and work_route != 'login':
         # إيقاف يدوي عام: نستقبل النص ونحفظه، لكن لا نحلله ولا نرد عليه.
         # الصور تبقى قبل هذا الموضع حتى لا تضيع مراجعة إثباتات الدفع.
         if (await run_io(lambda: get_auto_reply_paused())):
@@ -11779,27 +11805,6 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             if points_to_replied_account:
                 (await run_io(lambda: remember_selected_totp_account(chat_id, str(replied_account_id))))
-                await human_like_code_reply_sequence(
-                    context, chat_id, bm.business_connection_id, bm.message_id
-                )
-                code = await generate_current_totp_code_for_chat(
-                    chat_id, str(replied_account_id)
-                )
-                if code:
-                    await context.bot.send_message(
-                        business_connection_id=bm.business_connection_id,
-                        chat_id=chat_id,
-                        text=code,
-                    )
-                    (await run_io(lambda: archive_message(
-                        chat_id, customer_name, customer_username,
-                        sender_type="customer", message_text=text,
-                    )))
-                    (await run_io(lambda: archive_message(
-                        chat_id, customer_name, customer_username,
-                        sender_type="bot", message_text=code,
-                    )))
-                return
             if should_rechoose_account:
                 picker = (await run_io(lambda: build_totp_account_picker(chat_id)))
                 if picker is not None:
@@ -11820,7 +11825,7 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # إذا بدأت مشكلة ضمن الجلسة الحالية، كل المتابعات تبقى بلا رد تلقائي
     # حتى تمر 30 دقيقة سكوت. نؤرشفها وننبه الأونر حتى يكمل هو الحوار.
-    if not is_from_owner and (await run_io(lambda: is_live_support_context_active(chat_id))):
+    if not is_from_owner and work_route != 'login' and (await run_io(lambda: is_live_support_context_active(chat_id))):
         (await run_io(lambda: archive_message(
             chat_id, customer_name, customer_username,
             sender_type="customer", message_text=text,
@@ -11835,8 +11840,21 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if not is_from_owner and await handle_feedback_followup(context, bm, text):
+    if not is_from_owner and work_route != 'login' and await handle_feedback_followup(context, bm, text):
         (await run_io(lambda: archive_message(chat_id, customer_name, customer_username, sender_type="customer", message_text=text)))
+        return
+
+    login_result = False
+    if not is_from_owner:
+        login_result = await handle_login(context, bm, text=text,
+            code_request="طلب_كود" in keyword_match_categories(text))
+        if login_result is True:
+            (await run_io(lambda: archive_message(chat_id, customer_name, customer_username,
+                sender_type="customer", message_text=text)))
+            return
+
+    if work_route == 'login' and login_result != 'code':
+        # A sign-in exception cannot fall through into FAQ or AI sales replies.
         return
 
     # 1) اذا الرسالة منك انت (owner) — تحقق اذا هي أمر ربط/اضافة/accept
@@ -12007,11 +12025,11 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 2) تصنيف الرسالة — الأساس كلمات مفتاحية مباشرة، والذكاء الاصطناعي
     #    يتفعل بس لو فيه ذكر chatgpt + كلمة شكوى بنفس الرسالة
-    categories, is_chatgpt_complaint = await classify_intent(chat_id, text)
+    categories, is_chatgpt_complaint = (["طلب_كود"], False) if login_result == "code" else await classify_intent(chat_id, text)
     # أي مشكلة واضحة توقف البيع والـFAQ لكل المنتجات، مو ChatGPT فقط.
     # نجمع أجزاء الرسالة قبل هذا الفحص، لذلك «عندي / مشكلة / بالشات»
     # تصل هنا كسياق واحد وتتحول مباشرة لتدخل بشري.
-    if has_support_signal(text) and not is_support_cancellation(text):
+    if login_result != "code" and has_support_signal(text) and not is_support_cancellation(text):
         categories = ["شكوى_منتج"]
         is_chatgpt_complaint = True
     if is_chatgpt_complaint:
@@ -12571,10 +12589,18 @@ def main() -> None:
         instagram=project_financial_instagram,
     ))
     configure_financial_debts(active=finance_active, records=financial_debt_records, post=post_debt, repay=financial_repay)
+    configure_work_hours(WorkHoursServices(client=supabase,owner_id=OWNER_USER_ID,
+        paused=get_auto_reply_paused,archive=archive_message,
+        owner_replied_since=lambda chat, since: bool(supabase.table('conversation_archive')
+            .select('id').eq('customer_chat_id',chat).eq('sender_type','owner')
+            .gte('created_at',since).limit(1).execute().data)))
+    configure_login(LoginServices(client=supabase,owner_id=OWNER_USER_ID,
+        accounts=get_customer_totp_accounts,selected=get_selected_totp_account,select=remember_selected_totp_account,
+        paused=get_auto_reply_paused))
     configure_delivery(DeliveryServices(client=supabase,owner_id=OWNER_USER_ID,
         products=get_catalog_products,plans=get_catalog_plans,duration=duration_to_days,
         is_chatgpt=is_chatgpt_product_name,schedule=schedule_subscription_feedback,
-        cancel_schedule=cancel_personal_scheduled_message,invite=schedule_continuity_invite,identity=get_telegram_customer_identity))
+        cancel_schedule=cancel_personal_scheduled_message,invite=schedule_continuity_invite,identity=get_telegram_customer_identity,login_started=start_login_delivery))
     configure_debts(DebtServices(
         owner_id=OWNER_USER_ID,
         open_spreadsheet=open_store_spreadsheet,
@@ -12594,17 +12620,19 @@ def main() -> None:
     ))
     start_health_server()
 
-    app = (Application.builder().token(BOT_TOKEN)
+    app = (Application.builder().bot(build_work_hours_bot(BOT_TOKEN))
            .concurrent_updates(customer_first_processor(
                OWNER_USER_ID,code_request=lambda text: "طلب_كود" in keyword_match_categories(text),
                before_update=observe_business_update_arrival))
-           .post_stop(drain_customer_updates)
+           .post_stop(stop_work_hours(drain_customer_updates))
            .post_init(on_bot_initialized).build())
 
     # يفحص كل 15 دقيقة؛ لذلك التنبيه يصل خلال ربع ساعة كحد أقصى من النهاية.
     if app.job_queue is None:
         logger.error("JobQueue غير متوفر: ثبّت python-telegram-bot[job-queue] لتفعيل تنبيهات الاشتراكات.")
     else:
+        app.job_queue.run_repeating(work_hours_worker, interval=30, first=5)
+        app.job_queue.run_repeating(login_worker, interval=60, first=5)
         app.job_queue.run_repeating(finance_worker, interval=30, first=40)
         app.job_queue.run_repeating(check_expired_subscription_reminders, interval=15 * 60, first=10)
         app.job_queue.run_repeating(check_personal_reminders, interval=60, first=15)
@@ -12760,6 +12788,7 @@ def main() -> None:
         )
     )
 
+    install_handler_tracking(app)
     app.run_polling(
         allowed_updates=["business_message", "business_connection", "edited_business_message", "callback_query", "message"]
     )

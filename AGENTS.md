@@ -1,3 +1,10 @@
+# Project handoff
+
+Read `HANDOFF.md` before starting work to understand the store's purpose,
+system flows, data ownership, legacy integration and unresolved issues.
+Consult the feature-specific guides it links to, and verify current code and
+deployment state before treating historical observations as current facts.
+
 # Feature boundaries
 
 Keep each independent feature in its own clearly named module. New debt

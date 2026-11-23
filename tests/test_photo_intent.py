@@ -4,7 +4,7 @@ from photo_intent import PhotoIntent, is_confident_code_verification, parse_phot
 
 
 class PhotoIntentTests(unittest.TestCase):
-    def test_parses_code_verification_json_from_fenced_response(self):
+    def test_legacy_ambiguous_code_screen_parses_without_authorizing_totp(self):
         result = parse_photo_intent(
             '```json\n{"intent":"code_verification","confidence":0.94,'
             '"description":"شاشة ChatGPT تطلب رمز تحقق"}\n```'
@@ -13,7 +13,7 @@ class PhotoIntentTests(unittest.TestCase):
         self.assertEqual(result.intent, "code_verification")
         self.assertEqual(result.confidence, 0.94)
         self.assertIn("ChatGPT", result.description)
-        self.assertTrue(is_confident_code_verification(result))
+        self.assertFalse(is_confident_code_verification(result))
 
     def test_rejects_unknown_intent_as_safe_other(self):
         self.assertEqual(

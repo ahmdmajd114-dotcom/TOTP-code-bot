@@ -431,3 +431,35 @@ class DeliveryUITests(unittest.IsolatedAsyncioTestCase):
         self.context.bot.send_message.side_effect=TimeoutError()
         with patch('account_delivery.rpc',side_effect=call),patch('account_delivery.show_card',new=AsyncMock()):await ad.send_delivery(self.context,self.message,data)
         self.assertEqual(calls,['claim','get']);self.assertEqual(self.context.bot.send_message.call_count,1)
+
+    async def test_login_guidance_only_after_committed_delivery(self):
+        request={'id':str(uuid.uuid4()),'state':{'mode':'new'},'sent_message_id':7}
+        result={'request':request}
+        ad._services.login_started=AsyncMock()
+        with patch.object(ad,'rpc',return_value=result),patch.object(ad,'show_card',new=AsyncMock()),patch.object(ad,'retry_followup',new=AsyncMock()):
+            await ad.finish_delivery(self.context,self.message,result)
+        ad._services.login_started.assert_awaited_once_with(self.context,request,7)
+
+    async def test_failed_contract_write_never_starts_guidance(self):
+        request={'id':str(uuid.uuid4()),'state':{'mode':'new'},'sent_message_id':7}
+        ad._services.login_started=AsyncMock()
+        with patch.object(ad,'rpc',side_effect=FinanceError('failed')):
+            with self.assertRaises(FinanceError):await ad.finish_delivery(self.context,self.message,{'request':request})
+        ad._services.login_started.assert_not_awaited()
+
+    async def test_guidance_failure_does_not_repeat_credentials_or_rollback_delivery(self):
+        request={'id':str(uuid.uuid4()),'state':{'mode':'resend'},'sent_message_id':7}
+        result={'request':request}
+        ad._services.login_started=AsyncMock(side_effect=RuntimeError('unavailable'))
+        with patch.object(ad,'rpc',return_value=result) as rpc,patch.object(ad,'show_card',new=AsyncMock()):
+            await ad.finish_delivery(self.context,self.message,result)
+        self.assertEqual(rpc.call_count,1)
+        self.context.bot.send_message.assert_not_awaited()
+
+    async def test_renewal_does_not_start_login_guidance(self):
+        request={'id':str(uuid.uuid4()),'state':{'mode':'renew'},'sent_message_id':7}
+        result={'request':request}
+        ad._services.login_started=AsyncMock()
+        with patch.object(ad,'rpc',return_value=result),patch.object(ad,'show_card',new=AsyncMock()),patch.object(ad,'retry_followup',new=AsyncMock()):
+            await ad.finish_delivery(self.context,self.message,result)
+        ad._services.login_started.assert_not_awaited()

@@ -27,6 +27,7 @@ class DeliveryServices:
     cancel_schedule:object
     invite:object
     identity:object=None
+    login_started:object=None
 
 
 def configure_delivery(config):
@@ -254,6 +255,12 @@ class SimpleMessage:
 async def finish_delivery(context,message,data):
     r=data['request']
     result=await run_io(rpc,'finish',id=r['id'])
+    completed=result['request']
+    if getattr(_services,'login_started',None) and completed['state'].get('mode')!='renew' and completed.get('sent_message_id'):
+        # Start only after the contract/link is committed. Guidance failure
+        # cannot turn a completed delivery into an ambiguous send/retry.
+        try:await _services.login_started(context,completed,completed['sent_message_id'])
+        except Exception:await message.reply_text('⚠️ التسليم مثبت؛ متابعة الدخول تحتاج مراجعة. لا تعد إرسال البيانات.')
     await show_card(message,context,result)
     if r['state'].get('mode')=='resend':return
     await retry_followup(context,message,result)
@@ -411,7 +418,7 @@ async def show_admin(message,context,page=0):
         context.user_data.pop(key,None)
     data=await run_io(rpc,'list')
     text='🔗 تسليم الحسابات\nاستخدم /link رمز_الحساب داخل محادثة المستفيد.\n'
-    rows=[[('➕ تخزين/تجهيز حساب للتسليم','deliveryadmin:add')],[('📝 معاينة وتعديل روابط القالب','deliveryadmin:template')],[('📄 ملف تهيئة التسليم','deliveryadmin:sql')]]
+    rows=[[('➕ تخزين/تجهيز حساب للتسليم','deliveryadmin:add')],[('📝 معاينة وتعديل روابط القالب','deliveryadmin:template')],[('📄 ملف تهيئة التسليم','deliveryadmin:sql')],[('📄 تهيئة متابعة الدخول','deliveryadmin:loginsql')]]
     for a in data['accounts']:
         text+=f"\n{a['email']}\n/link {a['code']}\n{'فعال' if a['enabled'] else 'متوقف'} | السعة {a['capacity']} | المشغول {a['occupancy']['seats']} | المحجوز {a['occupancy']['held']}\n"
         rows.append([('إدارة '+a['email'][:45],'deliveryadmin:account:'+compact(a['id']))])
@@ -440,6 +447,9 @@ async def handle_admin_callback(update,context):
         if action=='sql':
             with Path(__file__).with_name('supabase_account_delivery.sql').open('rb') as document:
                 await context.bot.send_document(chat_id=_services.owner_id,document=document,caption='شغّل ملف تسليم الحسابات بعد ملفات المالية والاشتراكات وخزينة ChatGPT. لا تعِد تهيئة المالية.')
+        elif action=='loginsql':
+            with Path(__file__).with_name('supabase_login_assistance.sql').open('rb') as document:
+                await context.bot.send_document(chat_id=_services.owner_id,document=document,caption='شغّل الملف مرة واحدة في SQL Editor بمشروع المتجر لتفعيل حفظ متابعة الدخول. لا يغيّر المال أو مدد الاشتراكات.')
         elif action in ('add','template'):
             context.user_data['delivery_admin_input']=action
             await q.message.reply_text('أرسل خمسة أسطر:\nالإيميل\nكلمة المرور\nمفتاح TOTP الطويل\nعدد المقاعد\nرمز الربط الإداري' if action=='add' else 'أرسل سطرين: رابط طريقة التسجيل ثم رابط القناة.',reply_markup=keyboard([[('إلغاء ورجوع','deliveryadmin:home')]]))
