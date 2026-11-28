@@ -95,7 +95,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.old = la._services
         la.configure_login(la.LoginServices(self.db, 99, lambda chat: self.accounts,
             lambda accounts: next(a for a in accounts if a['id'] == self.selection),
-            lambda chat, account: True, lambda: False))
+            lambda chat, account: True, lambda: False, lambda chat: True))
         self.context = NS(bot=NS(send_message=AsyncMock()))
         self.bm = NS(chat=NS(id=1), business_connection_id='business', message_id=10)
         self.io = patch.object(la, 'run_io', self.run_io)
@@ -103,6 +103,16 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def run_io(self, fn, *args): return fn(*args)
     def tearDown(self): self.io.stop(); la._services = self.old
+
+    async def test_ineligible_customer_cannot_start_login_or_use_old_picker(self):
+        la._services.eligible = Mock(return_value=False)
+        la._services.accounts = Mock(return_value=self.accounts)
+        self.assertIs(await la.handle_login(self.context, self.bm, text='كود', code_request=True), True)
+        self.assertIs(await la.handle_login(self.context, self.bm, photo=PhotoIntent(intent='email_code', confidence=.99)), True)
+        await la.account_chosen(self.context, self.bm, 1, 'a', 'business')
+        la._services.accounts.assert_not_called()
+        self.context.bot.send_message.assert_not_awaited()
+        self.assertEqual(self.db.rows, [])
     async def send(self, text=None, photo=None):
         result = await la.handle_login(self.context, self.bm, text=text, photo=photo)
         self.bm.message_id += 1

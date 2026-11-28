@@ -123,7 +123,6 @@ class CustomerIntakeTests(unittest.IsolatedAsyncioTestCase):
                 'keyword_match_categories':lambda text:['طلب_كود'] if fast else [],
                 'cancel_pending_customer_text_batch':Mock(),'queue_customer_text_batch':Mock(),
                 'get_customer_totp_accounts':lambda cid:[],'is_live_support_context_active':lambda cid:True,
-                'work_hours_route':AsyncMock(return_value='normal'),
                 'archive_message':Mock(),'notify_owner':notify,'logger':Mock()}
             exec(compile(ast.Module(body=functions,type_ignores=[]),'customer-intake','exec',flags=__future__.annotations.compiler_flag),ns)
             bm=SimpleNamespace(chat=SimpleNamespace(id=1,full_name='Ali',first_name='Ali',username=None),

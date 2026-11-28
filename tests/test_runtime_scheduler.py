@@ -21,7 +21,6 @@ class RuntimeSchedulerTests(unittest.IsolatedAsyncioTestCase):
         names={'suppress_customer_reply_on_owner_arrival','observe_business_update_arrival'}
         selected=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
         ns={'OWNER_USER_ID':99,'datetime':datetime,'timezone':timezone,
-            'is_direct_work_hours_reply':lambda *args:False,'cancel_work_hours_wait':lambda *args:None,
             '_latest_customer_message_ids':{},'_owner_arrival_reply_targets':{},
             '_support_context_until':{},'_support_context_resolved_at':{},
             '_suppressed_auto_reply_keys':set(),'_pending_customer_text_batches':{},'_pending_initial_greetings':{}}

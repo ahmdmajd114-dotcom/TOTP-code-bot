@@ -40,6 +40,7 @@ class LoginServices:
     selected: object
     select: object
     paused: object
+    eligible: object
 
 
 def configure_login(config):
@@ -181,7 +182,8 @@ async def send_note(context, chat_id, account_id):
             return
         row = rows[0]
         accounts = await run_io(_services.accounts, chat_id)
-        if not any(str(a['id']) == account_id for a in accounts):
+        if (not any(str(a['id']) == account_id for a in accounts)
+                or not await run_io(_services.eligible, chat_id)):
             await run_io(lambda: table().update({'note_status': 'skipped'}).eq('id', row['id']).execute())
             return
         await context.bot.send_message(chat_id=chat_id, business_connection_id=row['business_id'], text=INTRO)
@@ -222,6 +224,9 @@ async def handle_login(context, bm, *, text=None, photo=None, code_request=False
     try:
         if await run_io(_services.paused):
             return True
+        if not await run_io(_services.eligible, bm.chat.id):
+            # Leave ordinary messages such as thanks to the general reply policy.
+            return bool(photo or code_request or signal in LOGIN_PHOTOS)
         accounts = await run_io(_services.accounts, bm.chat.id)
         if not accounts:
             return True if photo or code_request else False
@@ -277,7 +282,7 @@ async def account_chosen(context, message, chat_id, account_id, business_id):
     passes through the usual state/permission/retry path.
     """
     try:
-        if await run_io(_services.paused):
+        if await run_io(_services.paused) or not await run_io(_services.eligible, chat_id):
             return
         row = await run_io(load, chat_id, account_id)
         payload = dict(owner_id=_services.owner_id, chat_id=chat_id, account_id=str(account_id),
